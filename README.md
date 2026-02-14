@@ -1,8 +1,9 @@
 # Who is responsible
-
-Schematic by Randall McRee
-PCB layout by Krasimir Kostadinov
-Software mostly from Claude
+```
+Schematic by Randall McRee 
+PCB layout by Krasimir Kostadinov 
+Software mostly from Claude 
+```
 
 # OpenSourceDiffVM-RevB
 
