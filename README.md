@@ -1,3 +1,9 @@
+# Who is responsible
+
+Schematic by Randall McRee
+PCB layout by Krasimir Kostadinov
+Software mostly from Claude
+
 # OpenSourceDiffVM-RevB
 
 A high-resolution differential voltmeter (8.5-9.5 digit) with nanovolt-level sensitivity, based on the Analog Devices article on [low-noise instrumentation amplifiers](https://www.analog.com/en/resources/analog-dialogue/articles/low-noise-inamp-nanovolt-sensitivity.html).
