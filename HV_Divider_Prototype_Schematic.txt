@@ -1,0 +1,403 @@
+================================================================================
+        HV DIVIDER PROTOTYPE SCHEMATIC - ST-1 STRIPBOARD LAYOUT
+================================================================================
+Rev: B (MUX36D04 replaces ADG1411, OPA848 buffer added)
+Date: 2026-01-27
+Board: Busboard ST-1 (4" x 3.25")
+Teensy 4.1 footprint: 3" x 1.5" in lower-left corner
+
+================================================================================
+                          SYSTEM BLOCK DIAGRAM
+================================================================================
+
+    HV INPUT (up to ±5000V)
+         |
+    [F1: 0ADAC0200-BE Fuse, 200mA/1kV]
+         |
+         v
+    +-----------------------------+
+    |  4x CADDOCK 1776-C4815      |
+    |  Serial-Parallel Divider    |
+    |  Pair AB (A||B) in series   |
+    |  with Pair CD (C||D)        |
+    +--------+--------------------+
+             |
+     AB3,AB4,AB5   CD3,CD4,CD5       Tap points
+        |    |    |    |    |    |
+        v    v    v    v    v    v
+    +-----------------------------+
+    |  MUX36D04 (U1)             |
+    |  Dual 4:1 low-leakage mux  |
+    |  MUX_A: selects AB tap     |----→ Teensy Pin 26 (A0)
+    |  MUX_B: selects CD tap     |----→ Teensy Pin 27 (A1)
+    |  DA tied to DB             |      EN hardwired to VDD (active high)
+    +--------+--------------------+
+             |
+             | (Selected taps bridged via DA-DB)
+             |
+             v (CD2 = divider output)
+    +-----------------------------+
+    |  OPA848 (U2)               |
+    |  Unity-gain voltage follower|
+    |  High-Z input, low-Z output|
+    +--------+--------------------+
+             |
+             v
+    +-----------------------------+
+    |  TPD4E1B06 (U3)            |
+    |  ESD Protection (<50pA)    |
+    +--------+--------------------+
+             |
+             v
+    +-----------------------------+
+    |  MUX36D08 (U4)             |
+    |  Input S6 (HVDivider)      |----→ Teensy Pins 5,6,7 (A0,A1,A2)
+    |                             |      EN hardwired to VDD (active high)
+    +--------+--------------------+
+             |
+             v
+        To Preamp (AD8428 chain)
+
+
+================================================================================
+              CADDOCK 1776-C4815 SERIAL-PARALLEL ARRANGEMENT
+================================================================================
+
+The Caddock 1776-C4815 is a 7-terminal precision decade divider.
+
+PHYSICAL ARRANGEMENT (4 dividers: A, B, C, D):
+  - Pair AB: Dividers A and B wired in parallel (all pins tied together)
+  - Pair CD: Dividers C and D wired in parallel (all pins tied together)
+  - Series: AB feeds into CD
+
+Pin connections within pairs:
+  A1-B1, A2-B2, A3-B3, A4-B4, A5-B5, A6-B6, A7-B7  -->  AB1 to AB7
+  C1-D1, C2-D2, C3-D3, C4-D4, C5-D5, C6-D6, C7-D7  -->  CD1 to CD7
+
+SERIES TOPOLOGY:
+
+     HV INPUT ──[FUSE]──┐
+                        │
+                       AB1 (Pair AB input)
+                        │
+                        R
+                        │
+                       AB2 ─────────────────────────────── CD1 (Pair CD input)
+                        │                                   │
+                        R                                   R
+                        │                                   │
+                       AB3 ─── MUX36D04 S1A ──┐            CD3 ─── MUX36D04 S1B
+                        │                     │             │
+                        R                  DA─┴─DB          R
+                        │                (tied together)    │
+                       AB4 ─── MUX36D04 S2A ──┘            CD4 ─── MUX36D04 S2B
+                        │         (only one              │
+                        R          pair active            R
+                        │          at a time)             │
+                       AB5 ─── MUX36D04 S3A               CD5 ─── MUX36D04 S3B
+                        │                                   │
+                        R                                   R
+                        │                                   │
+                       AB6     (unused)                    CD6 (unused)
+                        │                                   │
+                        R                                   R
+                        │                                   │
+                       AB7 ◄──────────────────────────────  CD2 ──► OPA848 ──► TPD4E1B06 ──► MUX S6
+                                (feedback)                  │
+                                                            R
+                                                            │
+                                                           CD7 ──► GND
+
+
+DIVIDER RATIOS (MUX36D04 address selection):
+
+  Address 0 (A1=0, A0=0): S1A-DA-DB-S1B bridges AB3 to CD3 → ÷10   (±50V)
+  Address 1 (A1=0, A0=1): S2A-DA-DB-S2B bridges AB4 to CD4 → ÷100  (±500V)
+  Address 2 (A1=1, A0=0): S3A-DA-DB-S3B bridges AB5 to CD5 → ÷1000 (±5000V)
+  Address 3 (A1=1, A0=1): S4A/S4B spare (NC sources)       → off
+
+Note: Exact ratios depend on Caddock internal resistor values.
+      Calibration required for precision measurements.
+
+
+================================================================================
+                     MUX36D04 DUAL 4:1 MUX (U1)
+================================================================================
+
+Low-leakage dual 4:1 analog multiplexer (<1pA at 25°C).
+Each half selects one of four sources to its drain output.
+EN is active HIGH.
+
+MUX36D04 Pinout (TSSOP-16):
+                    ┌────────────────┐
+        A0  1  ─────┤                ├───── 16  A1
+        EN  2  ─────┤                ├───── 15  GND
+       VSS  3  ─────┤                ├───── 14  VDD
+       S1A  4  ─────┤   MUX36D04    ├───── 13  S1B
+       S2A  5  ─────┤   (TSSOP-16)  ├───── 12  S2B
+       S3A  6  ─────┤                ├───── 11  S3B
+       S4A  7  ─────┤                ├───── 10  S4B
+        DA  8  ─────┤                ├───── 9   DB
+                    └────────────────┘
+
+Signal Connections:
+  MUX_A sources (AB divider taps):
+    Pin 4  (S1A) ────────────► AB3 (÷10 tap)
+    Pin 5  (S2A) ────────────► AB4 (÷100 tap)
+    Pin 6  (S3A) ────────────► AB5 (÷1000 tap)
+    Pin 7  (S4A) ────────────► NC (spare)
+
+  MUX_B sources (CD divider taps):
+    Pin 13 (S1B) ────────────► CD3 (÷10 tap)
+    Pin 12 (S2B) ────────────► CD4 (÷100 tap)
+    Pin 11 (S3B) ────────────► CD5 (÷1000 tap)
+    Pin 10 (S4B) ────────────► NC (spare)
+
+  Drains (tied together to bridge selected taps):
+    Pin 8  (DA) ─────────────┬──────► Pin 9 (DB)
+                             │
+                        (bridge wire)
+
+Control Connections:
+  Pin 1  (A0) ──────────────► Teensy Pin 26 (DIVMUX_A0)
+  Pin 16 (A1) ──────────────► Teensy Pin 27 (DIVMUX_A1)
+  Pin 2  (EN) ──────────────► VDD (+15V, hardwired ON, active high)
+
+Power Connections:
+  Pin 14 (VDD) ─────────────► +15V
+  Pin 3  (VSS) ─────────────► -15V
+  Pin 15 (GND) ─────────────► Ground
+  0.1 µF cap: VDD (pin 14) to GND (pin 15)
+  0.1 µF cap: GND (pin 15) to VSS (pin 3)
+
+
+================================================================================
+                    OPA848 VOLTAGE FOLLOWER (U2)
+================================================================================
+
+Wideband unity-gain buffer isolates divider output impedance
+from MUX36D08 and downstream signal chain.
+
+OPA848 Pinout (SOIC-8):
+                    ┌──────────────┐
+        NC  1  ─────┤              ├───── 8  NC
+       IN-  2  ─────┤              ├───── 7  +VS
+       IN+  3  ─────┤   OPA848    ├───── 6  OUT
+       -VS  4  ─────┤              ├───── 5  NC
+                    └──────────────┘
+
+Signal Connections (unity-gain follower):
+  Pin 3  (IN+) ─────────────► CD2 (divider output node)
+  Pin 2  (IN-) ─────────────► Pin 6 (OUT) (feedback for unity gain)
+  Pin 6  (OUT) ─────────────► TPD4E1B06 Pin 1 (IO1)
+
+Power Connections:
+  Pin 7  (+VS) ─────────────► +15V
+  Pin 4  (-VS) ─────────────► -15V
+  0.1 µF cap: +VS (pin 7) to GND
+  0.1 µF cap: GND to -VS (pin 4)
+  10 µF tantalum: +VS to GND (bulk decoupling)
+
+Unused: Pins 1, 5, 8 → NC
+
+
+================================================================================
+                    TPD4E1B06 ESD PROTECTION (U3)
+================================================================================
+
+4-channel ultra-low leakage ESD protection device.
+Leakage: <50pA at 5V (critical for nanovolt measurements)
+
+TPD4E1B06 Pinout (SOT-363):
+                    ┌────────────────┐
+         IO1   1 ───┤                ├─── 6   VCC
+         IO2   2 ───┤   TPD4E1B06   ├─── 5   IO4
+         GND   3 ───┤                ├─── 4   IO3
+                    └────────────────┘
+
+Connections:
+  Pin 1 (IO1) ────────────► OPA848 output (pin 6)
+                            AND continues to MUX36D08 S6 input
+  Pin 3 (GND) ────────────► Ground
+  Pin 6 (VCC) ────────────► +5V
+  0.1 µF cap: VCC (pin 6) to GND (pin 3)
+
+  Pins 2, 4, 5 → NC
+
+
+================================================================================
+                         FUSE (F1: 0ADAC0200-BE)
+================================================================================
+
+Eaton/Bussmann high-voltage DC fuse.
+Rating: 200mA, 1000VDC
+
+Fuse Placement:
+  HV Input Jack ──────[F1]────────► AB1 (Caddock pair AB input)
+
+Mount fuse in holder external to stripboard with adequate voltage clearance.
+
+
+================================================================================
+                    MUX36D08 (U4, existing in system)
+================================================================================
+
+8:1 low-leakage analog multiplexer. EN is active HIGH.
+
+Connections for HV divider:
+  S6 input ◄──────────────── TPD4E1B06 IO1 / OPA848 output
+
+Control (to Teensy):
+  A0 ────────────────────────► Teensy Pin 5
+  A1 ────────────────────────► Teensy Pin 6
+  A2 ────────────────────────► Teensy Pin 7
+  EN ────────────────────────► VDD (hardwired ON, active high)
+
+MUX Address for S6 (HVDivider): A2=1, A1=0, A0=1 (address = 5)
+Corresponds to InputChannel::HVDivider in firmware.
+
+
+================================================================================
+                      COMPLETE SCHEMATIC DIAGRAM
+================================================================================
+
+                              +15V           -15V           +5V
+                               │              │              │
+    ┌──────────────────────────┼──────────────┼──────────────┼──────────────────┐
+    │                          │              │              │                  │
+HV+ ──[F1: 200mA/1kV]─────────────────────────────────────────────────────────►AB1
+    │                          │              │              │                  │
+    │  ╔═══════════════════════│══════════════│══════════════│════════════════╗ │
+    │  ║     CADDOCK PAIR AB   │              │              │               ║ │
+    │  ║                       │              │              │               ║ │
+    │  ║  AB1──R──AB2──R──AB3──R──AB4──R──AB5──R──AB6──R──AB7               ║ │
+    │  ║               │    │       │       │              ▲                 ║ │
+    │  ╚═══════════════│════│═══════│═══════│══════════════│═════════════════╝ │
+    │                  │    │       │       │              │                   │
+    │                  │  ┌─┴───────┴───────┴─┐           │                   │
+    │                  │  │ MUX36D04 (U1)     │           │                   │
+    │                  │  │ MUX_A:            │           │                   │
+    │                  │  │  S1A=AB3 (÷10)    │           │                   │
+    │                  │  │  S2A=AB4 (÷100)   │           │                   │
+    │                  │  │  S3A=AB5 (÷1000)  │           │                   │
+    │                  │  │  S4A=NC           │           │                   │
+    │                  │  │                   │           │                   │
+    │                  │  │  DA ──── DB       │           │                   │
+    │                  │  │  (tied together)  │           │                   │
+    │                  │  │                   │           │                   │
+    │                  │  │ MUX_B:            │           │                   │
+    │                  │  │  S1B=CD3 (÷10)    │           │                   │
+    │                  │  │  S2B=CD4 (÷100)   │           │                   │
+    │                  │  │  S3B=CD5 (÷1000)  │           │                   │
+    │                  │  │  S4B=NC           │           │                   │
+    │                  │  └─┬───────┬───────┬─┘           │                   │
+    │                  │    │       │       │              │                   │
+    │  ╔═══════════════│════│═══════│═══════│══════════════│═════════════════╗ │
+    │  ║     CADDOCK   │    │       │       │              │     PAIR CD     ║ │
+    │  ║               │    │       │       │              │                 ║ │
+    │  ║  CD1──R──CD2──R──CD3──R──CD4──R──CD5──R──CD6──R──CD7               ║ │
+    │  ║   ▲      │                                        │                ║ │
+    │  ╚═══│══════│════════════════════════════════════════│════════════════╝ │
+    │      │      │                                        │                  │
+    │      │      │                                        ▼                  │
+    │ (AB2→CD1)   │                                      GND                  │
+    │             │                                                           │
+    │             ▼                                                           │
+    │      ┌──────────────┐                                                   │
+    │      │  OPA848 (U2) │  Unity-gain voltage follower                      │
+    │      │  IN+ ← CD2   │  Powered: ±15V                                   │
+    │      │  IN- → OUT   │                                                   │
+    │      └──────┬───────┘                                                   │
+    │             │                                                           │
+    │             ▼                                                           │
+    │      ┌──────────────┐                                                   │
+    │      │ TPD4E1B06    │  ESD Protection                                   │
+    │      │  (U3)        │  Powered: +5V                                     │
+    │      └──────┬───────┘                                                   │
+    │             │                                                           │
+    │             ▼                                                           │
+    │      ┌──────────────┐                                                   │
+    │      │ MUX36D08     │  Input Channel Select                             │
+    │      │  (U4) S6     │  EN hardwired to VDD (active high)                │
+    │      └──────┬───────┘                                                   │
+    │             │                                                           │
+    │             ▼                                                           │
+    │        To Preamp (AD8428 chain)                                         │
+    │                                                                         │
+HV- ──────────────────────────────────────────────────────────────────────► GND
+    │
+   ═╧═ Chassis Ground (safety)
+
+
+    Control Lines (5 total, all to Teensy):
+    ────────────────────────────────────────
+    Teensy Pin 26 ─────────► U1 MUX36D04 A0 (pin 1)
+    Teensy Pin 27 ─────────► U1 MUX36D04 A1 (pin 16)
+    Teensy Pin 5  ─────────► U4 MUX36D08 A0
+    Teensy Pin 6  ─────────► U4 MUX36D08 A1
+    Teensy Pin 7  ─────────► U4 MUX36D08 A2
+
+    Hardwired (no GPIO):
+    U1 MUX36D04 EN (pin 2)  → VDD (+15V, active high)
+    U4 MUX36D08 EN           → VDD (active high)
+
+
+================================================================================
+                         TEENSY PIN ALLOCATION
+================================================================================
+
+Existing Pins (from firmware):
+  Pin 2   - TMUXSEL
+  Pin 3   - CI_TMUXSEL
+  Pin 4   - TMUX_EN
+  Pin 5   - INMUX_A0 (MUX36D08)
+  Pin 6   - INMUX_A1 (MUX36D08)
+  Pin 7   - INMUX_A2 (MUX36D08)
+  Pin 8   - FREE (was INMUX_EN, now hardwired)
+  Pin 9   - ADC Clock (PWM)
+  Pin 10  - DAC CS
+  Pin 11  - SPI MOSI
+  Pin 12  - SPI MISO
+  Pin 13  - SPI SCK
+  Pin 15  - ADC DRDY
+  Pin 24  - DAC Clear
+  Pin 25  - DAC Reset
+  Pin 41  - ADC CS
+
+NEW Pins for MUX36D04:
+  Pin 26  - DIVMUX_A0 (MUX36D04 A0, pin 1)
+  Pin 27  - DIVMUX_A1 (MUX36D04 A1, pin 16)
+
+
+================================================================================
+                         POWER SUPPLY REQUIREMENTS
+================================================================================
+
+MUX36D04 (U1):
+  VDD: +15V (pin 14)
+  VSS: -15V (pin 3)
+  EN:  +15V (pin 2, hardwired active high)
+  GND: 0V   (pin 15)
+
+OPA848 (U2):
+  +VS: +15V (pin 7)
+  -VS: -15V (pin 4)
+
+TPD4E1B06 (U3):
+  VCC: +5V  (pin 6)
+  GND: 0V   (pin 3)
+
+MUX36D08 (U4):
+  EN:  VDD  (hardwired active high)
+  (remaining power from existing system)
+
+Bypass capacitors:
+  0.1 µF: U1 VDD-GND, U1 GND-VSS
+  0.1 µF: U2 +VS-GND, U2 GND-(-VS)
+  10 µF:  U2 +VS-GND (bulk)
+  0.1 µF: U3 VCC-GND
+
+
+================================================================================
+                              END OF SCHEMATIC
+================================================================================

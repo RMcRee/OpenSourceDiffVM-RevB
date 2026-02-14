@@ -1,0 +1,20 @@
+# Claude Code temp files
+tmpclaude-*
+nul
+
+# IDE/build artifacts
+build/
+*.elf
+*.hex
+*.bin
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Claude internal
+.claude/
+
+# KiCad lock files and backups
+*.lck
+*-backups/

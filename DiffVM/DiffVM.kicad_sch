@@ -1,0 +1,140 @@
+(kicad_sch
+	(version 20250114)
+	(generator "eeschema")
+	(generator_version "9.0")
+	(uuid "d8fdd94a-0249-4b24-a31a-8ab0a4bc80c0")
+	(paper "A4")
+	(lib_symbols)
+	(sheet
+		(at 92.456 46.482)
+		(size 49.784 14.224)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "0499df12-e9aa-4c37-aefb-eddf3f29846c")
+		(property "Sheetname" "FrontEnd"
+			(at 92.456 45.7704 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "FrontEnd.kicad_sch"
+			(at 92.456 61.2906 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "DiffVM"
+				(path "/d8fdd94a-0249-4b24-a31a-8ab0a4bc80c0"
+					(page "2")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 93.98 114.3)
+		(size 48.26 15.24)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "1d3b7176-673e-43e9-81b0-2d499f5b8aec")
+		(property "Sheetname" "VRef"
+			(at 93.98 113.5884 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "VRef.kicad_sch"
+			(at 93.98 130.1246 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "DiffVM"
+				(path "/d8fdd94a-0249-4b24-a31a-8ab0a4bc80c0"
+					(page "4")
+				)
+			)
+		)
+	)
+	(sheet
+		(at 93.472 78.74)
+		(size 48.768 16.256)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(stroke
+			(width 0.1524)
+			(type solid)
+		)
+		(fill
+			(color 0 0 0 0.0000)
+		)
+		(uuid "6877b5ae-7658-40b3-8a84-40f34ef8684d")
+		(property "Sheetname" "DAC"
+			(at 93.472 78.0284 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left bottom)
+			)
+		)
+		(property "Sheetfile" "DAC.kicad_sch"
+			(at 93.472 95.5806 0)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left top)
+			)
+		)
+		(instances
+			(project "DiffVM"
+				(path "/d8fdd94a-0249-4b24-a31a-8ab0a4bc80c0"
+					(page "3")
+				)
+			)
+		)
+	)
+	(sheet_instances
+		(path "/"
+			(page "1")
+		)
+	)
+	(embedded_fonts no)
+)

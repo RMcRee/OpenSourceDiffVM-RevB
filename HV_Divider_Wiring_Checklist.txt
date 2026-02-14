@@ -1,0 +1,451 @@
+================================================================================
+     HV DIVIDER PROTOTYPE - STRIPBOARD WIRING CHECKLIST (Rev B)
+================================================================================
+Rev: B (MUX36D04 replaces ADG1411, OPA828 buffer added)
+Date: 2026-01-27
+Board: Busboard ST-1 Stripboard (4" x 3.25", 0.1" pitch)
+       ~40 columns x 32 rows (0.1" pitch)
+
+LAYOUT CONSTRAINTS:
+  - Teensy 4.1: 3" x 1.5" (30 holes x 15 holes) - LOWER LEFT corner
+  - Available area: Upper portion (~17 rows) and right side (~10 columns)
+
+================================================================================
+                          COMPONENT LIST
+================================================================================
+
+Qty   Part Number         Description                        Package
+----  -----------------   ---------------------------------  ---------------
+4     Caddock 1776-C4815  Precision decade divider           7-pin SIP
+1     MUX36D04            Dual 4:1 low-leakage analog mux   SOIC-16
+1     MUX36D08            8:1 low-leakage analog mux        (existing in system)
+1     OPA828              Wideband voltage follower/buffer   SOIC-8
+1     TPD4E1B06DCKR       4-ch ESD protection (<50pA leak)  SOT-363
+1     0ADAC0200-BE        200mA 1000V DC fuse               5x20mm cartridge
+1     Fuse holder         5x20mm panel mount                Chassis mount
+--    Teensy 4.1          Microcontroller (existing)        --
+
+Breakout boards needed (for SMD parts):
+1     SOIC-16 to DIP adapter (for MUX36D04)
+1     SOIC-8 to DIP adapter  (for OPA828)
+1     SOT-363 to DIP adapter (for TPD4E1B06)
+
+Passive components:
+3     0.1 µF ceramic      Bypass caps (MUX36D04, OPA828, TPD4E1B06)
+1     10 µF tantalum      Bulk decoupling for OPA828 supply
+
+
+================================================================================
+                          SYSTEM BLOCK DIAGRAM
+================================================================================
+
+    HV INPUT (up to ±5000V)
+         |
+    [F1: 0ADAC0200-BE Fuse, 200mA/1kV]
+         |
+         v
+    +-----------------------------+
+    |  4x CADDOCK 1776-C4815      |
+    |  Serial-Parallel Divider    |
+    |  Pair AB (A||B) in series   |
+    |  with Pair CD (C||D)        |
+    +--------+--------------------+
+             |
+     AB3,AB4,AB5   CD3,CD4,CD5       Tap points
+        |    |    |    |    |    |
+        v    v    v    v    v    v
+    +-----------------------------+
+    |  MUX36D04 Dual 4:1 Mux     |
+    |  MUX_A: selects AB tap     |----→ Teensy Pin 26 (A0)
+    |  MUX_B: selects CD tap     |----→ Teensy Pin 27 (A1)
+    |  DA tied to DB             |      EN hardwired ON
+    +--------+--------------------+
+             |
+             | (Selected tap bridged)
+             |
+             v (CD2 = divider output)
+    +-----------------------------+
+    |  OPA828 Voltage Follower    |
+    |  Unity gain buffer          |
+    |  High-Z input, low-Z output |
+    +--------+--------------------+
+             |
+             v
+    +-----------------------------+
+    |  TPD4E1B06 ESD Protection   |
+    |  <50pA leakage              |
+    +--------+--------------------+
+             |
+             v
+    +-----------------------------+
+    |  MUX36D08 Input S6          |----→ Teensy Pins 5,6,7 (A0,A1,A2)
+    |  (channel select)           |      EN hardwired ON
+    +--------+--------------------+
+             |
+             v
+        To Preamp (AD8428 chain)
+
+
+================================================================================
+             TEENSY PIN ALLOCATION (5 control lines)
+================================================================================
+
+MUX36D08 (8:1 input mux):
+  Teensy Pin 5  → MUX36D08 A0
+  Teensy Pin 6  → MUX36D08 A1
+  Teensy Pin 7  → MUX36D08 A2
+  MUX36D08 EN   → Hardwired LOW (active low, always enabled)
+
+MUX36D04 (dual 4:1 divider tap select):
+  Teensy Pin 26 → MUX36D04 A0
+  Teensy Pin 27 → MUX36D04 A1
+  MUX36D04 EN   → Hardwired LOW (active low, always enabled)
+
+NOTE: Teensy Pin 8 (was INMUX_EN) is now FREE - EN pins hardwired.
+
+
+================================================================================
+             CADDOCK DIVIDER TOPOLOGY (unchanged from Rev A)
+================================================================================
+
+     HV Input ──[FUSE]──► AB1 ──R── AB2 ──R── AB3 ──R── AB4 ──R── AB5 ──R── AB6 ──R── AB7
+                                │              │         │         │                    ▲
+                                │             tap       tap       tap                   │
+                                │              │         │         │                    │
+                       CD1 ──R── CD2 ──R── CD3 ──R── CD4 ──R── CD5 ──R── CD6 ──R── CD7
+                        ▲       │        tap       tap       tap                   │
+                        │       │         │         │         │                    ▼
+                   (from AB2)   │        MUX36D04 bridges these                  GND
+                                ▼
+                          OUTPUT → OPA828 → TPD4E1B06 → MUX36D08 S6
+
+Pair AB: Dividers A and B, all pins tied (A1-B1, A2-B2, ... A7-B7)
+Pair CD: Dividers C and D, all pins tied (C1-D1, C2-D2, ... C7-D7)
+Series: AB2 → CD1, CD2 → Output AND AB7 (feedback)
+Ground: CD7 → GND
+
+
+================================================================================
+             MUX36D04 DIVIDER TAP MAPPING
+================================================================================
+
+MUX36D04 address selects which divider taps to bridge:
+
+  Address   A1  A0   MUX_A Source   MUX_B Source   Ratio    Range
+  -------   --  --   -----------    -----------    ------   --------
+     0       0   0   AB3            CD3            ÷10      ±50V
+     1       0   1   AB4            CD4            ÷100     ±500V
+     2       1   0   AB5            CD5            ÷1000    ±5000V
+     3       1   1   (spare)        (spare)        --       --
+
+MUX_A Drain (DA) tied to MUX_B Drain (DB) → bridges selected taps.
+EN hardwired LOW (always enabled) → some tap always bridged.
+Use address 3 (spare, unconnected sources) as "off" state.
+
+
+================================================================================
+             MUX36D04 PINOUT (TSSOP-16)
+================================================================================
+
+                    ┌────────────────┐
+        A0  1  ─────┤                ├───── 16  A1
+        EN  2  ─────┤                ├───── 15  GND
+       VSS  3  ─────┤                ├───── 14  VDD
+       S1A  4  ─────┤   MUX36D04    ├───── 13  S1B
+       S2A  5  ─────┤   (TSSOP-16)  ├───── 12  S2B
+       S3A  6  ─────┤                ├───── 11  S3B
+       S4A  7  ─────┤                ├───── 10  S4B
+        DA  8  ─────┤                ├───── 9   DB
+                    └────────────────┘
+
+EN is ACTIVE HIGH: EN=HIGH → switches enabled, EN=LOW → all off.
+Hardwired ON: tie EN to VDD.
+
+
+================================================================================
+             OPA828 PINOUT (SOIC-8, voltage follower)
+================================================================================
+
+                    ┌──────────────┐
+        NC  1  ─────┤              ├───── 8  NC
+       IN-  2  ─────┤              ├───── 7  +VS
+       IN+  3  ─────┤   OPA828     ├───── 6  OUT
+       -VS  4  ─────┤              ├───── 5  NC
+                    └──────────────┘
+
+Voltage follower wiring:
+  IN+ (pin 3) = signal input (from CD2 divider output)
+  IN- (pin 2) = tied to OUT (pin 6) for unity gain
+  OUT (pin 6) = buffered output → TPD4E1B06 → MUX36D08 S6
+
+NOTE: Verify this pinout against the actual OPA828 datasheet before wiring.
+
+
+================================================================================
+             TPD4E1B06 PINOUT (SOT-363)
+================================================================================
+
+                    ┌────────────────┐
+         IO1   1 ───┤                ├─── 6   VCC
+         IO2   2 ───┤   TPD4E1B06   ├─── 5   IO4
+         GND   3 ───┤                ├─── 4   IO3
+                    └────────────────┘
+
+
+================================================================================
+                    WIRING CHECKLIST
+================================================================================
+
+
+--- SECTION 1: CADDOCK PAIR AB (Dividers A and B in parallel) ----------------
+
+  [ ] 1.1  Mount Caddock A (7-pin SIP)
+  [ ] 1.2  Mount Caddock B (7-pin SIP) adjacent to A
+  [ ] 1.3  Wire A1 to B1 → label "AB1" (HV input)
+  [ ] 1.4  Wire A2 to B2 → label "AB2" (series junction)
+  [ ] 1.5  Wire A3 to B3 → label "AB3" (÷10 tap)
+  [ ] 1.6  Wire A4 to B4 → label "AB4" (÷100 tap)
+  [ ] 1.7  Wire A5 to B5 → label "AB5" (÷1000 tap)
+  [ ] 1.8  Wire A6 to B6 → label "AB6" (unused)
+  [ ] 1.9  Wire A7 to B7 → label "AB7" (feedback)
+
+
+--- SECTION 2: CADDOCK PAIR CD (Dividers C and D in parallel) ----------------
+
+  [ ] 2.1  Mount Caddock C (7-pin SIP)
+  [ ] 2.2  Mount Caddock D (7-pin SIP) adjacent to C
+  [ ] 2.3  Wire C1 to D1 → label "CD1" (series junction)
+  [ ] 2.4  Wire C2 to D2 → label "CD2" (OUTPUT)
+  [ ] 2.5  Wire C3 to D3 → label "CD3" (÷10 tap)
+  [ ] 2.6  Wire C4 to D4 → label "CD4" (÷100 tap)
+  [ ] 2.7  Wire C5 to D5 → label "CD5" (÷1000 tap)
+  [ ] 2.8  Wire C6 to D6 → label "CD6" (unused)
+  [ ] 2.9  Wire C7 to D7 → label "CD7" (GND)
+
+
+--- SECTION 3: SERIES CONNECTIONS (AB to CD) ---------------------------------
+
+  [ ] 3.1  Wire AB2 → CD1 (series connection between pairs)
+  [ ] 3.2  Wire CD2 → AB7 (feedback tap)
+  [ ] 3.3  Wire CD7 → GND bus
+
+
+--- SECTION 4: FUSE ----------------------------------------------------------
+
+  [ ] 4.1  Mount fuse holder (external to stripboard, HV-rated wire)
+  [ ] 4.2  Wire HV+ input jack → Fuse holder input
+  [ ] 4.3  Wire Fuse holder output → AB1
+  [ ] 4.4  Install fuse (0ADAC0200-BE, 200mA/1kV)
+
+
+--- SECTION 5: MUX36D04 (Dual 4:1 Divider Tap Select) -----------------------
+
+Mount MUX36D04 on SOIC-16 breakout board.
+
+  Power:
+  [ ] 5.1  Pin 14 (VDD) → +15V
+  [ ] 5.2  Pin 3  (VSS) → -15V
+  [ ] 5.3  Pin 15 (GND) → GND bus
+  [ ] 5.4  Add 0.1 µF cap: VDD to GND (close to pins 14 and 15)
+  [ ] 5.5  Add 0.1 µF cap: GND to VSS (close to pins 15 and 3)
+
+  Enable (hardwired ON, active HIGH):
+  [ ] 5.6  Pin 2  (EN)  → VDD (+15V) (active high = always enabled)
+
+  Address lines (to Teensy):
+  [ ] 5.7  Pin 1  (A0)  → Teensy Pin 26
+  [ ] 5.8  Pin 16 (A1)  → Teensy Pin 27
+
+  MUX_A sources (AB divider taps):
+  [ ] 5.9  Pin 4  (S1A) → AB3 (÷10 tap)
+  [ ] 5.10 Pin 5  (S2A) → AB4 (÷100 tap)
+  [ ] 5.11 Pin 6  (S3A) → AB5 (÷1000 tap)
+  [ ] 5.12 Pin 7  (S4A) → No connection (spare)
+
+  MUX_B sources (CD divider taps):
+  [ ] 5.13 Pin 13 (S1B) → CD3 (÷10 tap)
+  [ ] 5.14 Pin 12 (S2B) → CD4 (÷100 tap)
+  [ ] 5.15 Pin 11 (S3B) → CD5 (÷1000 tap)
+  [ ] 5.16 Pin 10 (S4B) → No connection (spare)
+
+  Drains (tied together):
+  [ ] 5.17 Pin 8  (DA)  → Pin 9 (DB) (bridge wire)
+
+
+--- SECTION 6: OPA828 VOLTAGE FOLLOWER ---------------------------------------
+
+Mount OPA828 on SOIC-8 breakout board.
+
+  Power:
+  [ ] 6.1  Pin 7  (+VS) → +15V
+  [ ] 6.2  Pin 4  (-VS) → -15V
+  [ ] 6.3  Add 0.1 µF cap: +VS to GND (close to pin 7)
+  [ ] 6.4  Add 0.1 µF cap: GND to -VS (close to pin 4)
+  [ ] 6.5  Add 10 µF tantalum: +VS to GND (bulk decoupling)
+
+  Signal (unity gain follower):
+  [ ] 6.6  Pin 3  (IN+) → CD2 (divider output)
+  [ ] 6.7  Pin 2  (IN-) → Pin 6 (OUT) (feedback for unity gain)
+  [ ] 6.8  Pin 6  (OUT) → TPD4E1B06 Pin 1 (IO1)
+
+  Unused pins:
+  [ ] 6.9  Pins 1, 5, 8 → No connection
+
+
+--- SECTION 7: TPD4E1B06 ESD PROTECTION --------------------------------------
+
+Mount TPD4E1B06 on SOT-363 breakout board.
+
+  [ ] 7.1  Pin 1  (IO1) → OPA828 output (pin 6)
+  [ ] 7.2  Pin 3  (GND) → GND bus
+  [ ] 7.3  Pin 6  (VCC) → +5V
+  [ ] 7.4  Add 0.1 µF cap: VCC to GND (close to pins 6 and 3)
+  [ ] 7.5  Pins 2, 4, 5 (IO2, IO3, IO4) → No connection
+
+  Protected output:
+  [ ] 7.6  Pin 1  (IO1) continues to → MUX36D08 S6 input
+           (IO1 is both input from OPA828 and output to MUX36D08)
+
+
+--- SECTION 8: MUX36D08 (8:1 Input Mux, existing in system) -----------------
+
+  Enable (hardwired ON, active HIGH):
+  [ ] 8.1  MUX36D08 EN → VDD (+5V or appropriate supply)
+
+  Address lines (to Teensy):
+  [ ] 8.2  MUX36D08 A0 → Teensy Pin 5
+  [ ] 8.3  MUX36D08 A1 → Teensy Pin 6
+  [ ] 8.4  MUX36D08 A2 → Teensy Pin 7
+
+  HV divider input:
+  [ ] 8.5  MUX36D08 S6 → TPD4E1B06 Pin 1 (IO1) / OPA828 output
+
+
+--- SECTION 9: GROUND BUS ----------------------------------------------------
+
+  [ ] 9.1  Create ground bus on stripboard
+  [ ] 9.2  CD7 → GND bus
+  [ ] 9.3  MUX36D04 pin 15 (GND) → GND bus
+  [ ] 9.5  OPA828 ground reference → GND bus
+  [ ] 9.6  TPD4E1B06 pin 3 (GND) → GND bus
+  [ ] 9.7  MUX36D08 EN → VDD (hardwired ON, active high)
+  [ ] 9.8  HV return (HV-) → GND bus
+  [ ] 9.9  GND bus → Teensy GND
+  [ ] 9.10 GND bus → System/chassis ground
+
+
+--- SECTION 10: POWER SUPPLY -------------------------------------------------
+
+  +15V rail:
+  [ ] 10.1 +15V → MUX36D04 pin 14 (VDD)
+  [ ] 10.2 +15V → MUX36D04 pin 2 (EN) (active high, hardwired ON)
+  [ ] 10.3 +15V → OPA828 pin 7 (+VS)
+
+  -15V rail:
+  [ ] 10.4 -15V → MUX36D04 pin 3 (VSS)
+  [ ] 10.5 -15V → OPA828 pin 4 (-VS)
+
+  +5V rail:
+  [ ] 10.5 +5V → TPD4E1B06 pin 6 (VCC)
+
+
+--- SECTION 11: TEENSY CONTROL WIRES (5 total) --------------------------------
+
+  MUX36D08 (input channel select):
+  [ ] 11.1 Teensy Pin 5  → MUX36D08 A0
+  [ ] 11.2 Teensy Pin 6  → MUX36D08 A1
+  [ ] 11.3 Teensy Pin 7  → MUX36D08 A2
+
+  MUX36D04 (divider tap select):
+  [ ] 11.4 Teensy Pin 26 → MUX36D04 A0 (pin 1)
+  [ ] 11.5 Teensy Pin 27 → MUX36D04 A1 (pin 16)
+
+
+================================================================================
+                    PRE-POWER CHECKS
+================================================================================
+
+  [ ] 12.1  No shorts: +15V to GND (>1MΩ)
+  [ ] 12.2  No shorts: -15V to GND (>1MΩ)
+  [ ] 12.3  No shorts: +15V to -15V (>1MΩ)
+  [ ] 12.4  No shorts: +5V to GND (>1MΩ)
+  [ ] 12.5  No shorts: HV+ to GND (>1MΩ)
+  [ ] 12.6  Verify MUX36D04 orientation on breakout
+  [ ] 12.7  Verify OPA828 orientation on breakout
+  [ ] 12.8  Verify TPD4E1B06 orientation on breakout
+  [ ] 12.9  Verify DA-DB bridge wire on MUX36D04
+  [ ] 12.10 Verify OPA828 feedback (IN- tied to OUT)
+  [ ] 12.11 Fuse installed
+  [ ] 12.12 All bypass caps in place
+
+
+================================================================================
+                    INITIAL POWER-ON TESTS
+================================================================================
+
+Power-on sequence: +5V first, then ±15V, then enable HV.
+
+  [ ] 13.1  Apply +5V only: TPD4E1B06 draws <1mA
+  [ ] 13.2  Apply ±15V: MUX36D04 draws <1mA quiescent
+  [ ] 13.3  Apply ±15V: OPA828 draws quiescent current (~10mA typ)
+  [ ] 13.4  Probe OPA828 output with no input: should be near 0V
+  [ ] 13.5  Set MUX36D04 address to 3 (spare): verify no signal path
+  [ ] 13.6  Set MUX36D04 address to 0: verify AB3-CD3 bridged (<100Ω via DA+DB)
+  [ ] 13.7  Set MUX36D04 address to 1: verify AB4-CD4 bridged
+  [ ] 13.8  Set MUX36D04 address to 2: verify AB5-CD5 bridged
+
+
+================================================================================
+                    DIVIDER RATIO VERIFICATION
+================================================================================
+
+Using known voltage source (e.g., precision 10V calibrator):
+
+  [ ] 14.1  Address 0 (÷10):   Apply 10V → expect ~1V at OPA828 output
+  [ ] 14.2  Address 1 (÷100):  Apply 10V → expect ~100mV at OPA828 output
+  [ ] 14.3  Address 2 (÷1000): Apply 10V → expect ~10mV at OPA828 output
+  [ ] 14.4  Record actual ratios for firmware calibration constants
+
+
+================================================================================
+                    SIGNAL CHAIN INTEGRITY
+================================================================================
+
+  [ ] 15.1  Verify OPA828 output tracks CD2 (divider output)
+  [ ] 15.2  Verify TPD4E1B06 output matches OPA828 output (no clipping)
+  [ ] 15.3  Verify MUX36D08 S6 passes signal to preamp when selected
+  [ ] 15.4  Verify no oscillation on OPA828 (check with scope, >50 MHz BW)
+  [ ] 15.5  Measure leakage: disable MUX36D08, check for signal bleed
+
+
+================================================================================
+                    NOTES & WARNINGS
+================================================================================
+
+HIGH VOLTAGE SAFETY:
+  - Maximum input: ±5000V DC (with ÷1000 divider)
+  - Always use HV probe and proper PPE
+  - Verify HV source is off and discharged before touching
+  - Maintain creepage: >1mm per 100V on stripboard
+  - Keep HV traces well separated from low-voltage circuitry
+
+OPA828 STABILITY:
+  - OPA828 has 1.5 GHz GBW - may oscillate with capacitive loads
+  - Keep output trace to TPD4E1B06/MUX36D08 short
+  - If oscillation occurs, add 10-50Ω series resistor at OPA828 output
+  - Input capacitance of MUX36D04 drains adds to load
+
+MUX36D04 LEAKAGE:
+  - Rated <1pA at 25°C - critical for nanovolt measurements
+  - Avoid flux residue on mux signal pins (clean with IPA)
+  - Temperature affects leakage exponentially - keep cool
+
+STRIPBOARD CONSIDERATIONS:
+  - Cut copper strips between adjacent signal traces to prevent leakage
+  - Consider guard rings around sensitive nodes (CD2, OPA828 input)
+  - Use Teflon standoffs if possible for high-impedance nodes
+
+
+================================================================================
+                           END OF CHECKLIST
+================================================================================

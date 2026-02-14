@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "DiffVM")(type "KiCad")(uri "${KIPRJMOD}/DiffVM.kicad_sym")(options "")(descr ""))
+)

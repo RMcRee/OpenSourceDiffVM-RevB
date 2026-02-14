@@ -1,0 +1,27 @@
+# DiffVM instrument configuration
+# Copy and modify for your setup
+
+port: COM3                    # Serial port (auto-detect if omitted)
+baud: 115200
+
+scan:
+  channels: [Vx, VrefRaw]    # Channels to scan
+  integration: 100            # Chop cycles per reading (~2.5 sec)
+  autostart: true             # Begin scanning on connect
+
+autozero:
+  enabled: true
+  interval: 10                # Sweeps between auto-zero
+
+range: 10                     # HV divider ratio (10/100/1000)
+
+logging:
+  directory: ./logs           # Where to save CSV files
+  filename: "diffvm_{date}_{time}.csv"  # Filename template
+  max_size_mb: 100            # Rotate log at this size
+
+plot:
+  enabled: true               # Show live plot window
+  channels: [Vx]              # Which channels to plot (default: all scanned)
+  window: 300                 # Seconds of data visible in plot
+  y_auto: true                # Auto-scale Y axis

@@ -1,0 +1,228 @@
+(footprint "C_Rect_L7.2mm_W2.5mm_P5.00mm_FKS2_FKP2_MKS2_MKP2"
+	(version 20240108)
+	(generator "pcbnew")
+	(generator_version "8.0")
+	(layer "F.Cu")
+	(descr "C, Rect series, Radial, pin pitch=5.00mm, , length*width=7.2*2.5mm^2, Capacitor, http://www.wima.com/EN/WIMA_FKS_2.pdf")
+	(tags "C Rect series Radial pin pitch 5.00mm  length 7.2mm width 2.5mm Capacitor")
+	(property "Reference" "REF**"
+		(at 2.5 -2.5 0)
+		(layer "F.SilkS")
+		(uuid "99485235-dd3a-438d-a613-cfeadc790584")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "C_Rect_L7.2mm_W2.5mm_P5.00mm_FKS2_FKP2_MKS2_MKP2"
+		(at 2.5 2.5 0)
+		(layer "F.Fab")
+		(uuid "a048a2bd-a353-4764-ba92-306f077fc551")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Footprint" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "d5d81c8a-6da5-4945-af61-7fc6705e38d8")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "71cdee6e-1715-4521-888f-a700c700df74")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" ""
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "814dbaaf-8cee-4dba-80e7-1d3b75e92046")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr through_hole)
+	(fp_line
+		(start -1.22 -1.37)
+		(end -1.22 1.37)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "7b4701db-f253-4483-808d-210152ad2ebe")
+	)
+	(fp_line
+		(start -1.22 -1.37)
+		(end 6.22 -1.37)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "3f53228e-b025-45db-8166-04163f85259c")
+	)
+	(fp_line
+		(start -1.22 1.37)
+		(end 6.22 1.37)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "c4ceea64-931b-408d-a3a0-740e6fd0564f")
+	)
+	(fp_line
+		(start 6.22 -1.37)
+		(end 6.22 1.37)
+		(stroke
+			(width 0.12)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "e867a188-80bc-41cc-80d7-c2d4ed203d84")
+	)
+	(fp_line
+		(start -1.35 -1.5)
+		(end -1.35 1.5)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "6f83f681-7c44-4b0f-8474-d94804d8dc43")
+	)
+	(fp_line
+		(start -1.35 1.5)
+		(end 6.35 1.5)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "f29cbc0b-12ef-4f78-b164-e2063bc3d17b")
+	)
+	(fp_line
+		(start 6.35 -1.5)
+		(end -1.35 -1.5)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "77b9f782-da3d-43b3-859a-bffae9d0467c")
+	)
+	(fp_line
+		(start 6.35 1.5)
+		(end 6.35 -1.5)
+		(stroke
+			(width 0.05)
+			(type solid)
+		)
+		(layer "F.CrtYd")
+		(uuid "6ce55f12-2c7c-4419-8af1-2939a241c460")
+	)
+	(fp_line
+		(start -1.1 -1.25)
+		(end -1.1 1.25)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "3f9322ca-82ce-439c-b961-59c0daa9439c")
+	)
+	(fp_line
+		(start -1.1 1.25)
+		(end 6.1 1.25)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "d2b27170-c38c-4461-a2be-b76f35a57bda")
+	)
+	(fp_line
+		(start 6.1 -1.25)
+		(end -1.1 -1.25)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "b5f48007-5ee2-4c91-a9c8-253043578130")
+	)
+	(fp_line
+		(start 6.1 1.25)
+		(end 6.1 -1.25)
+		(stroke
+			(width 0.1)
+			(type solid)
+		)
+		(layer "F.Fab")
+		(uuid "1d7feb81-155e-4459-9fb0-f791c6fe1942")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 2.5 0 0)
+		(layer "F.Fab")
+		(uuid "003ac5a6-1f3d-45a2-8525-c42bdc5f3fac")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" thru_hole circle
+		(at 0 0)
+		(size 1.6 1.6)
+		(drill 0.8)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers no)
+		(uuid "a6a5df13-e0f4-4ec7-b0de-0382b9d0192a")
+	)
+	(pad "2" thru_hole circle
+		(at 5 0)
+		(size 1.6 1.6)
+		(drill 0.8)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers no)
+		(uuid "40565cdd-b09a-47a4-9daf-f6ba4a1bd388")
+	)
+	(model "${KICAD8_3DMODEL_DIR}/Capacitor_THT.3dshapes/C_Rect_L7.2mm_W2.5mm_P5.00mm_FKS2_FKP2_MKS2_MKP2.wrl"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)
