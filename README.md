@@ -140,4 +140,4 @@ KiCad 8 project files are in `DiffVM/`:
 
 ## License
 
-Open source. See individual component datasheets for their respective terms.
+Licensed under the [CERN Open Hardware Licence Version 2 - Permissive](LICENSE) (CERN-OHL-P v2).
