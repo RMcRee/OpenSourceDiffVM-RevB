@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: CERN-OHL-P-2.0
-# SPDX-FileCopyrightText: 2025 rkm
+# SPDX-FileCopyrightText: Copyright 2025, 2026 Randall K McRee
 """
 DiffVM Companion Script - PC-side interface for OpenSourceDiffVM-RevB
 
