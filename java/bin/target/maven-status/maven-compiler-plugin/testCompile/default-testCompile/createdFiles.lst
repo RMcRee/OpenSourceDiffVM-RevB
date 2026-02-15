@@ -1,0 +1,8 @@
+com\rkm\drift\ReferenceDriftCompensatorTest.class
+com\rkm\sim\DiffVMSimulatorTest.class
+com\rkm\cal\CRC16Test.class
+com\rkm\math\LowerMomentsTest.class
+com\rkm\cal\DacCalibrationTableTest.class
+com\rkm\measurement\BinarySearchDACTest.class
+com\rkm\measurement\ChopMeasurementTest.class
+com\rkm\measurement\VoltageComputerTest.class

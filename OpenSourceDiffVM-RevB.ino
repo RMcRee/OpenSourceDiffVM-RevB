@@ -1061,6 +1061,21 @@ static ScanConfig scanConfig = {
 // clears it on each channel switch. In IDLE mode, chopStats is used instead.
 static LowerMoments channelStats[8];
 
+// Per-channel saved DAC codes, indexed by (uint8_t)InputChannel (0-7).
+// Allows fast channel switching during scanning without a full binary search.
+// On first visit, binarySearchDAC() finds the code; subsequent visits restore it.
+// If the saved code causes overflow (input changed), runOneChopCycle() triggers
+// a fresh search and updates the saved code.
+static int16_t channelDacCode[8];    // Saved DAC code per channel
+static bool    channelDacValid[8];   // True after first successful measurement
+
+void clearChannelDacCodes() {
+  for (int i = 0; i < 8; i++) {
+    channelDacCode[i] = 0;
+    channelDacValid[i] = false;
+  }
+}
+
 // Auto-zero offset in volts, measured by performAutoZero().
 // Subtracted from all voltage results in outputMeasurement() when autoZeroValid is true.
 static double autoZeroOffset = 0.0;
@@ -1223,7 +1238,16 @@ void cmdScanStart() {
   // Switch to first channel
   InputChannel firstCh = scanConfig.channels[0];
   selectInputChannel(firstCh);
-  binarySearchDAC();
+  uint8_t idx = (uint8_t)firstCh;
+  if (channelDacValid[idx]) {
+    // Restore saved DAC code from previous scan
+    setDacCode(channelDacCode[idx]);
+  } else {
+    // First visit: full binary search
+    binarySearchDAC();
+    channelDacCode[idx] = currentDacCode;
+    channelDacValid[idx] = true;
+  }
   channelStats[(uint8_t)firstCh].clear();
 
   // Print CSV header if in CSV mode
@@ -2489,6 +2513,7 @@ void cmdConfigFactory() {
   configAutoStart = false;
   autoZeroOffset = 0.0;
   autoZeroValid = false;
+  clearChannelDacCodes();
   scanState = ScanState::IDLE;
   Serial.println("Factory defaults restored (not saved to EEPROM).");
 }
@@ -2671,6 +2696,9 @@ void setup() {
   // Initialize DAC calibration table with nominal values
   // (will be overwritten if calibration data is loaded)
   initDacCalTable();
+
+  // Initialize per-channel DAC code cache
+  clearChannelDacCodes();
 
   // Initialize reference drift tracking
   initRefTracking();
@@ -2863,6 +2891,9 @@ void loop() {
   LowerMoments &stats = channelStats[(uint8_t)scanCh];
   if (!runOneChopCycle(stats)) {
     chopCycleCount = 0;  // Reset after overflow/DAC change
+    // Save the re-centered DAC code for this channel
+    channelDacCode[(uint8_t)scanCh] = currentDacCode;
+    channelDacValid[(uint8_t)scanCh] = true;
     return;
   }
 
@@ -2895,6 +2926,10 @@ void loop() {
       outputMeasurement(scanCh, stats, currentDacCode);
     }
 
+    // Save DAC code for this channel (for fast restore on next visit)
+    channelDacCode[(uint8_t)scanCh] = currentDacCode;
+    channelDacValid[(uint8_t)scanCh] = true;
+
     // Advance to next channel
     currentScanIndex++;
 
@@ -2919,7 +2954,16 @@ void loop() {
     InputChannel nextCh = scanConfig.channels[currentScanIndex];
     if (nextCh != currentInputChannel) {
       selectInputChannel(nextCh);
-      binarySearchDAC();
+      uint8_t idx = (uint8_t)nextCh;
+      if (channelDacValid[idx]) {
+        // Restore saved DAC code (fast path: only filter settling, no search)
+        setDacCode(channelDacCode[idx]);
+      } else {
+        // First visit to this channel: full binary search
+        binarySearchDAC();
+        channelDacCode[idx] = currentDacCode;
+        channelDacValid[idx] = true;
+      }
     }
     channelStats[(uint8_t)nextCh].clear();
     chopCycleCount = 0;
