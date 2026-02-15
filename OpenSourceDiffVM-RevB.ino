@@ -1,4 +1,9 @@
 /*
+ * SPDX-License-Identifier: CERN-OHL-P-2.0
+ * SPDX-FileCopyrightText: 2025 rkm
+ */
+
+/*
   Teensy 4.x + ADS127L11 + DAC + TMUX chopped measurement
 
   Pin mapping:

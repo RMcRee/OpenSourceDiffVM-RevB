@@ -18,3 +18,17 @@ Thumbs.db
 # KiCad lock files and backups
 *.lck
 *-backups/
+
+# Java build artifacts
+java/target/
+java/.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+
+# Java IDE files
+.idea/
+*.iml
+.project
+.classpath
+.settings/
