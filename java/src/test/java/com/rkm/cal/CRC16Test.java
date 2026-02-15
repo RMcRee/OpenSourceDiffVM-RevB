@@ -1,3 +1,7 @@
+/*
+ * SPDX-License-Identifier: CERN-OHL-P-2.0
+ * SPDX-FileCopyrightText: 2025 rkm
+ */
 package com.rkm.cal;
 
 import org.junit.jupiter.api.Test;
