@@ -19,6 +19,9 @@ Thumbs.db
 *.lck
 *-backups/
 
+# Python
+__pycache__/
+
 # Java build artifacts
 java/target/
 java/.mvn/wrapper/maven-wrapper.jar
