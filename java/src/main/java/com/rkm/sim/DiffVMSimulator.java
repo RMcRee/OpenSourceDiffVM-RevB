@@ -10,6 +10,7 @@ import com.rkm.drift.ReferenceDriftCompensator;
 import com.rkm.hw.SimulatedADC;
 import com.rkm.hw.SimulatedDAC;
 import com.rkm.hw.SimulatedMux;
+import com.rkm.math.AllanDeviation;
 import com.rkm.math.LowerMoments;
 import com.rkm.measurement.AutoZero;
 import com.rkm.measurement.BinarySearchDAC;
@@ -305,4 +306,17 @@ public class DiffVMSimulator {
     public ChopMeasurement getChopMeasurement() { return chopMeasurement; }
     public LowerMoments getChopStats() { return chopStats; }
     public ScanState getScanState() { return scanState; }
+
+    /**
+     * Compute overlapping Allan deviation from collected measurement results.
+     * Uses voltage values and derives tau0 from integration cycles and chop timing.
+     *
+     * @return list of (tau, adev, pairsUsed) at octave-spaced taus
+     */
+    public List<AllanDeviation.Result> computeAllanDeviation() {
+        double[] voltages = results.stream()
+                .mapToDouble(MeasurementResult::voltage).toArray();
+        double tau0 = scanConfig.getIntegrationCycles() * Constants.CHOP_CYCLE_SECONDS;
+        return AllanDeviation.computeOctave(voltages, tau0);
+    }
 }

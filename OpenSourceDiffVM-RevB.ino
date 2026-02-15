@@ -561,6 +561,142 @@ private:
   double max_;
 };
 
+// ================== Allan Deviation (OADEV) Tracker ==================
+//
+// Real-time overlapping Allan deviation computation for voltage stability
+// analysis. Stores a circular buffer of corrected voltage readings and
+// computes OADEV at octave-spaced averaging times on demand.
+//
+// OADEV^2(m) = 1/(2(N-2m)) * SUM (y_bar_{i+m} - y_bar_i)^2
+// where y_bar_i = (1/m) * SUM_{k=0}^{m-1} y_{i+k}
+
+class AllanDeviation {
+public:
+  static constexpr int MAX_READINGS = 4096;  // ~17 min at tau0=0.26s (32 KB)
+  static constexpr int MAX_TAUS = 12;        // octave taus: m=1,2,4,...,2048
+
+  AllanDeviation() { clear(); }
+
+  void clear() {
+    head_ = 0;
+    count_ = 0;
+  }
+
+  void addReading(double voltage) {
+    readings_[head_] = voltage;
+    head_ = (head_ + 1) % MAX_READINGS;
+    if (count_ < MAX_READINGS) count_++;
+  }
+
+  int readingCount() const { return count_; }
+
+  // Get OADEV for octave index k (tau = 2^k * tau0)
+  // Returns NaN if insufficient data
+  double getAdev(int octave) const {
+    int m = 1 << octave;
+    return computeForM(m);
+  }
+
+  double getTau(int octave, double tau0) const {
+    return (double)(1 << octave) * tau0;
+  }
+
+  int numOctaves() const {
+    int maxOctaves = 0;
+    int m = 1;
+    while (m <= count_ / 3 && maxOctaves < MAX_TAUS) {
+      maxOctaves++;
+      m *= 2;
+    }
+    return maxOctaves;
+  }
+
+  void printResults(double tau0) const {
+    if (count_ < 3) {
+      Serial.println("Need at least 3 readings for Allan deviation.");
+      return;
+    }
+    Serial.print("Allan Deviation (");
+    Serial.print(count_);
+    Serial.print(" readings, tau0=");
+    Serial.print(tau0, 4);
+    Serial.println("s)");
+    Serial.println("  tau (s)      OADEV          pairs");
+    Serial.println("  ----------   ------------   -----");
+
+    int nOct = numOctaves();
+    for (int k = 0; k < nOct; k++) {
+      int m = 1 << k;
+      double ad = computeForM(m);
+      if (std::isnan(ad)) break;
+
+      double tau = (double)m * tau0;
+      int pairs = count_ - 2 * m;
+
+      char adBuf[24];
+      formatVoltage(ad, adBuf, sizeof(adBuf), 3);
+
+      Serial.print("  ");
+      if (tau < 10.0) Serial.print(' ');
+      if (tau < 100.0) Serial.print(' ');
+      Serial.print(tau, 3);
+      Serial.print("      ");
+      Serial.print(adBuf);
+      // Pad to align pairs column
+      int adLen = strlen(adBuf);
+      for (int p = adLen; p < 14; p++) Serial.print(' ');
+      Serial.println(pairs);
+    }
+  }
+
+private:
+  double readings_[MAX_READINGS];
+  int head_;      // next write position
+  int count_;     // total readings stored (up to MAX_READINGS)
+
+  // Linearize circular buffer index: oldest reading is at index 0
+  double reading(int i) const {
+    // oldest = head_ - count_, wrapped
+    int idx = (head_ - count_ + i + MAX_READINGS) % MAX_READINGS;
+    return readings_[idx];
+  }
+
+  double computeForM(int m) const {
+    if (m < 1 || count_ < 2 * m + 1) {
+      return std::numeric_limits<double>::quiet_NaN();
+    }
+
+    // Compute prefix sums over linearized readings
+    // To avoid allocating a big array, compute block sums on the fly
+    // using a sliding window approach
+    int pairs = count_ - 2 * m;
+
+    // Compute initial two block sums: block1 = sum[0..m-1], block2 = sum[m..2m-1]
+    double block1 = 0.0;
+    double block2 = 0.0;
+    for (int k = 0; k < m; k++) {
+      block1 += reading(k);
+      block2 += reading(m + k);
+    }
+
+    double sumSq = 0.0;
+    double diff = (block2 - block1) / m;
+    sumSq += diff * diff;
+
+    // Slide both blocks forward
+    for (int i = 1; i < pairs; i++) {
+      // Remove oldest element from each block, add new element
+      block1 += reading(i + m - 1) - reading(i - 1);
+      block2 += reading(i + 2 * m - 1) - reading(i + m - 1);
+      diff = (block2 - block1) / m;
+      sumSq += diff * diff;
+    }
+
+    double avar = sumSq / (2.0 * pairs);
+    return std::sqrt(avar);
+  }
+};
+
 // -------- DAC (DAC) register addresses (3-bit) --------
 static constexpr uint8_t DAC_ADDRESS       = 0b001;
 static constexpr uint8_t DAC_ADDR_CTRL     = 0b010;
@@ -1020,6 +1156,9 @@ HalfCycleResult acquireHalfCycle() {
 // Statistics accumulator for chopped measurements
 LowerMoments chopStats;
 
+// Allan deviation tracker for voltage stability analysis
+static AllanDeviation allanDev;
+
 // ================== Scan & Logging Configuration ==================
 //
 // These structures control the channel scanning state machine in loop() and
@@ -1239,6 +1378,7 @@ void cmdScanStart() {
   currentScanIndex = 0;
   scanCycleCount = 0;
   chopCycleCount = 0;
+  allanDev.clear();
 
   // Switch to first channel
   InputChannel firstCh = scanConfig.channels[0];
@@ -1419,8 +1559,28 @@ void printHelp() {
   Serial.println("config factory      Reset to factory defaults");
   Serial.println("config autostart on|off  Auto-start scanning on boot");
   Serial.println("config show         Show saved vs current config");
+  Serial.println("adev [clear]          Show Allan deviation (or clear history)");
   Serial.println("help                Show this help");
   Serial.println("=======================\n");
+}
+
+// Compute measurement interval (tau0) in seconds for current integration setting
+static double computeTau0() {
+  return (double)scanConfig.integrationCycles / EST_FSPS
+         * (DISCARD_SAMPLES + GOOD_SAMPLES + 1) * 2;
+}
+
+void cmdAdev(const char* arg) {
+  if (arg && strcasecmp(arg, "clear") == 0) {
+    allanDev.clear();
+    Serial.println("Allan deviation history cleared.");
+    return;
+  }
+  if (allanDev.readingCount() < 3) {
+    Serial.println("Need at least 3 readings for Allan deviation.");
+    return;
+  }
+  allanDev.printResults(computeTau0());
 }
 
 // Forward declarations for config commands (implemented in EEPROM section)
@@ -1514,6 +1674,8 @@ void processCommand(char* line) {
       cmdConfigAutostart(arg2);
     } else if (strcasecmp(arg1, "show") == 0) cmdConfigShow();
     else Serial.println("Usage: config save|load|factory|autostart|show");
+  } else if (strcasecmp(cmd, "adev") == 0) {
+    cmdAdev(arg1);
   } else if (strcasecmp(cmd, "help") == 0) {
     printHelp();
   } else {
@@ -2519,6 +2681,7 @@ void cmdConfigFactory() {
   autoZeroOffset = 0.0;
   autoZeroValid = false;
   clearChannelDacCodes();
+  allanDev.clear();
   scanState = ScanState::IDLE;
   Serial.println("Factory defaults restored (not saved to EEPROM).");
 }
@@ -2604,6 +2767,9 @@ void outputMeasurement(InputChannel channel, LowerMoments &stats, int16_t dacCod
 
   double driftPpb = (refCorrection - 1.0) * 1e9;
 
+  // Feed corrected voltage to Allan deviation tracker
+  allanDev.addReading(vxCorrected);
+
   switch (scanConfig.outputMode) {
     case OutputMode::CSV:
       printCsvRow(channel, vxCorrected, vxUncertainty,
@@ -2663,6 +2829,26 @@ void outputMeasurement(InputChannel channel, LowerMoments &stats, int16_t dacCod
         Serial.print("  zero: offset=");
         Serial.print(autoZeroOffset * 1e9, 1);
         Serial.println(" nV");
+      }
+
+      if (allanDev.readingCount() >= 3) {
+        double tau0 = computeTau0();
+        Serial.print("  adev: ");
+        int printed = 0;
+        for (int k = 0; k < allanDev.numOctaves() && printed < 6; k++) {
+          double ad = allanDev.getAdev(k);
+          if (!std::isnan(ad)) {
+            char adBuf[24];
+            formatVoltage(ad, adBuf, sizeof(adBuf), 3);
+            Serial.print("tau=");
+            Serial.print(allanDev.getTau(k, tau0), 1);
+            Serial.print("s:");
+            Serial.print(adBuf);
+            Serial.print("  ");
+            printed++;
+          }
+        }
+        Serial.println();
       }
       break;
     }

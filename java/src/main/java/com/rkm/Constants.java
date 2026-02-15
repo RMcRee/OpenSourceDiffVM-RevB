@@ -79,6 +79,11 @@ public final class Constants {
     };
     public static final int REF_STEP_LEN = REF_STEP_RESPONSE.length;  // 81
 
+    // ---- Chop cycle timing ----
+    // One chop cycle = 2 half-cycles, each with (DISCARD + GOOD + settle) samples
+    public static final double CHOP_CYCLE_SECONDS =
+            (DISCARD_SAMPLES + GOOD_SAMPLES + 1) * 2.0 / EST_FSPS;  // ~0.00256 s
+
     // ---- Scanning ----
     public static final int SCAN_SETTLE_CYCLES = 5;
     public static final int MAX_SCAN_CHANNELS = 7;
