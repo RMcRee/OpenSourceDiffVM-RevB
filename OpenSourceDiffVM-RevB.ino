@@ -29,6 +29,15 @@ struct HalfCycleResult {
   bool overflow;
 };
 class LowerMoments;
+class ScopedInstrumentState;
+class InputMuxDriver;
+class DividerMuxDriver;
+class ChopperDriver;
+class DacDriver;
+class AdcDriver;
+class DacCalibrationTable;
+class IOutputFormatter;
+struct MeasurementData;
 struct SavedConfig;
 
 // ---------------- POST Configuration ----------------
@@ -115,9 +124,6 @@ enum class InputChannel : uint8_t {
   Spare4    = 7,  // S8: Spare input
 };
 
-// Track current input selection
-static InputChannel currentInputChannel = InputChannel::Vx;
-
 // ---------------- HV Divider Ratio Selection (MUX36D04) ----------------
 // Caddock 1776-C4815 serial-parallel arrangement with MUX36D04 tap selection
 // The 1:10 divider is hardwired always in circuit for safety (no HV transients).
@@ -128,9 +134,6 @@ enum class DividerRatio : uint8_t {
   Div1000 = 2,  // CD5-AB5 bridged: 10k arm || 1M, ±5000V range
   GND     = 3,  // Ground connection for zero calibration
 };
-
-// Track current divider ratio selection
-static DividerRatio currentDividerRatio = DividerRatio::Div10;
 
 // ---------------- Voltage Divider Ratios ----------------
 // Calculated ratios for Caddock 1776-C4815 serial-parallel divider
@@ -209,145 +212,53 @@ static uint32_t refSampleCounter = 0;                  // Counter for periodic s
 static bool refTrackingInitialized = false;            // True after first reference measurement
 
 // ---------------- DAC Calibration Table ----------------
-// 16384-point calibration table for DAC INL correction
+// Encapsulates the 16384-point calibration table for DAC INL correction.
 // Index: (dacCode + 32768) >> 2 gives 14-bit index (0..16383)
 // Value: actual voltage at that code (measured against ADR1001 references)
-// If not calibrated, table contains nominal values
-static constexpr size_t DAC_CAL_TABLE_SIZE = 16384;
-static double dacCalTable[DAC_CAL_TABLE_SIZE];  // Populated at calibration time
-static bool dacCalTableValid = false;           // True after calibration
+class DacCalibrationTable {
+public:
+  static constexpr size_t TABLE_SIZE = 16384;
 
-// Initialize DAC calibration table with nominal (uncalibrated) values
-void initDacCalTable() {
-  for (size_t i = 0; i < DAC_CAL_TABLE_SIZE; i++) {
-    // Convert table index back to DAC code
-    int16_t code = (int16_t)((i << 2) - 32768);
-    // Nominal voltage = code × LSB
-    dacCalTable[i] = (double)code * DAC_LSB_V;
-  }
-  dacCalTableValid = false;  // Mark as uncalibrated (using nominal values)
-}
+  DacCalibrationTable() { initNominal(); }
 
-// Look up calibrated DAC voltage for a given code
-// Uses linear interpolation between calibration points
-double dacCodeToVoltage(int16_t code) {
-  if (!dacCalTableValid) {
-    // No calibration: use nominal linear conversion
-    return (double)code * DAC_LSB_V;
+  void initNominal() {
+    for (size_t i = 0; i < TABLE_SIZE; i++) {
+      int16_t code = (int16_t)((i << 2) - 32768);
+      table_[i] = (double)code * DAC_LSB_V;
+    }
+    valid_ = false;
   }
 
-  // Convert code to table index (14-bit, 0..16383)
-  uint16_t idx = ((uint16_t)(code + 32768)) >> 2;
-
-  // Clamp to valid range
-  if (idx >= DAC_CAL_TABLE_SIZE - 1) {
-    return dacCalTable[DAC_CAL_TABLE_SIZE - 1];
+  double codeToVoltage(int16_t code) const {
+    if (!valid_) {
+      return (double)code * DAC_LSB_V;
+    }
+    uint16_t idx = ((uint16_t)(code + 32768)) >> 2;
+    if (idx >= TABLE_SIZE - 1) {
+      return table_[TABLE_SIZE - 1];
+    }
+    uint8_t frac = ((uint16_t)(code + 32768)) & 0x03;
+    double v0 = table_[idx];
+    double v1 = table_[idx + 1];
+    return v0 + (v1 - v0) * (double)frac / 4.0;
   }
 
-  // Linear interpolation between adjacent calibration points
-  // The fractional part comes from the 2 LSBs we shifted away
-  uint8_t frac = ((uint16_t)(code + 32768)) & 0x03;  // 0..3
-  double v0 = dacCalTable[idx];
-  double v1 = dacCalTable[idx + 1];
-  return v0 + (v1 - v0) * (double)frac / 4.0;
-}
-
-// Store a calibration point (called during DAC calibration procedure)
-void setDacCalPoint(int16_t code, double measuredVoltage) {
-  uint16_t idx = ((uint16_t)(code + 32768)) >> 2;
-  if (idx < DAC_CAL_TABLE_SIZE) {
-    dacCalTable[idx] = measuredVoltage;
-  }
-}
-
-// Mark calibration table as valid after full calibration
-void markDacCalValid() {
-  dacCalTableValid = true;
-}
-
-// ---------------- Voltage Divider Scale Factors ----------------
-// Returns the divider ratio for the current input channel
-// For Vx and references, ratio is 1.0 (no division)
-double getInputDividerRatio(InputChannel channel) {
-  // For HV divider channel, ratio depends on MUX36D04 address state
-  if (channel == InputChannel::HVDivider) {
-    switch (currentDividerRatio) {
-      case DividerRatio::Div10:   return DIVIDER_RATIO_10;    // ÷10
-      case DividerRatio::Div100:  return DIVIDER_RATIO_100;   // ÷100
-      case DividerRatio::Div1000: return DIVIDER_RATIO_1000;  // ÷1000
-      case DividerRatio::GND:     return DIVIDER_RATIO_10;    // GND cal uses base ÷10
-      default:                    return DIVIDER_RATIO_10;    // Default to ÷10
+  void setPoint(int16_t code, double measuredVoltage) {
+    uint16_t idx = ((uint16_t)(code + 32768)) >> 2;
+    if (idx < TABLE_SIZE) {
+      table_[idx] = measuredVoltage;
     }
   }
-  return 1.0;  // No division for other channels
-}
 
-// ---------------- MUX36D04 HV Divider Tap Control ----------------
+  void markValid() { valid_ = true; }
+  bool isValid() const { return valid_; }
 
-/**
- * Initialize MUX36D04 address pins.
- * EN is hardwired to VDD (active high, always enabled).
- * Call this in setup() before using selectDividerRatio().
- */
-void initDividerControl() {
-  pinMode(PIN_DIVMUX_A0, OUTPUT);
-  pinMode(PIN_DIVMUX_A1, OUTPUT);
+private:
+  double table_[TABLE_SIZE];
+  bool valid_ = false;
+};
 
-  // Default to Div10 (address 0) - mux bypassed, only hardwired 1:10 divider
-  digitalWrite(PIN_DIVMUX_A0, LOW);
-  digitalWrite(PIN_DIVMUX_A1, LOW);
-
-  currentDividerRatio = DividerRatio::Div10;
-}
-
-/**
- * Select HV divider ratio via MUX36D04 address lines.
- * The 1:10 divider is always in circuit (hardwired for safety).
- * Higher ratios bridge additional parallel resistance via the mux.
- * Also switches MUX36D08 to HVDivider channel.
- *
- * Address mapping:
- *   0 (A1=0, A0=0): Mux bypassed → ÷10 only (hardwired)
- *   1 (A1=0, A0=1): CD4-AB4 bridged → ÷100 (100k || 1M)
- *   2 (A1=1, A0=0): CD5-AB5 bridged → ÷1000 (10k || 1M)
- *   3 (A1=1, A0=1): Ground connection → zero calibration
- *
- * @param ratio The desired divider ratio
- */
-void selectDividerRatio(DividerRatio ratio) {
-  uint8_t addr = static_cast<uint8_t>(ratio);  // Enum values match addresses directly
-
-  digitalWriteFast(PIN_DIVMUX_A0, (addr & 0x01) ? HIGH : LOW);
-  digitalWriteFast(PIN_DIVMUX_A1, (addr & 0x02) ? HIGH : LOW);
-
-  currentDividerRatio = ratio;
-
-  // Switch MUX36D08 to HVDivider channel (always, since divider is always in circuit)
-  selectInputChannel(InputChannel::HVDivider);
-
-  // Allow MUX36D04 and signal path to settle
-  delayMicroseconds(INMUX_SETTLE_US);
-}
-
-/**
- * Get current divider ratio setting.
- */
-DividerRatio getDividerRatio() {
-  return currentDividerRatio;
-}
-
-/**
- * Get human-readable name for a divider ratio.
- */
-const char* getDividerRatioName(DividerRatio ratio) {
-  switch (ratio) {
-    case DividerRatio::Div10:   return "÷10 (±50V)";
-    case DividerRatio::Div100:  return "÷100 (±500V)";
-    case DividerRatio::Div1000: return "÷1000 (±5kV)";
-    case DividerRatio::GND:     return "GND (cal)";
-    default:                    return "Unknown";
-  }
-}
+static DacCalibrationTable dacCalTable;
 
 // ---------------- Precision Voltage Computation ----------------
 /**
@@ -368,7 +279,7 @@ const char* getDividerRatioName(DividerRatio ratio) {
  */
 double computeInputVoltage(double adcMean, int16_t dacCode, InputChannel channel) {
   // Step 1: Get DAC voltage (with optional calibration lookup)
-  double dacVoltage = dacCodeToVoltage(dacCode);
+  double dacVoltage = dacCalTable.codeToVoltage(dacCode);
 
   // Step 2: Convert ADC counts to voltage at preamp input
   // ADC reads (Vx - DAC) × PREAMP_GAIN, so:
@@ -448,10 +359,6 @@ int formatVoltage(double voltage, char* buf, size_t bufLen, int sigDigits = 9) {
   return snprintf(buf, bufLen, "%.*f %s", decimals, scaledV, unit);
 }
 
-// ---------------- DAC State ----------------
-// 16-bit DAC in two's complement mode: 0x0000 = 0V, 0x7FFF = +full scale, 0x8000 = -full scale
-static int16_t currentDacCode = 0;  // Track current DAC setting
-
 // Estimated sample period for FILTER=11000b (OSR 32*100 = 3200)
 static constexpr float    OSR_TOTAL         = 3200.0f;
 static constexpr float    EST_FSPS          = ADC_FMOD_HZ / OSR_TOTAL;     // ~3906.25 SPS
@@ -487,8 +394,122 @@ static constexpr uint8_t CMD_STOP    = 0x0A;
 static inline void csLow(uint8_t pin)  { digitalWriteFast(pin, LOW); }
 static inline void csHigh(uint8_t pin) { digitalWriteFast(pin, HIGH); }
 
-// chopping value
-volatile bool tmux_sel_state = LOW;
+// ================== Hardware Driver Classes ==================
+// Each driver owns its GPIO pins and hardware state.
+// Method bodies are defined out-of-line where the free functions used to be.
+
+// -------- InputMuxDriver (MUX36S08) --------
+class InputMuxDriver {
+public:
+  void begin();
+  void select(InputChannel ch);
+  InputChannel current() const { return current_; }
+private:
+  InputChannel current_ = InputChannel::Vx;
+};
+static InputMuxDriver inputMux;
+
+// -------- DividerMuxDriver (MUX36D04) --------
+class DividerMuxDriver {
+public:
+  void begin();
+  void select(DividerRatio ratio);
+  DividerRatio current() const { return current_; }
+private:
+  DividerRatio current_ = DividerRatio::Div10;
+};
+static DividerMuxDriver divMux;
+
+// -------- ChopperDriver (TMUX7234) --------
+class ChopperDriver {
+public:
+  void begin();
+  void toggle();
+  bool state() const { return state_; }
+  void setState(bool s) { state_ = s; digitalWriteFast(PIN_TMUXSEL, s ? HIGH : LOW); }
+private:
+  volatile bool state_ = false;
+};
+static ChopperDriver chopper;
+
+// -------- DacDriver (AD5760) --------
+class DacDriver {
+public:
+  void begin();
+  void setCode(int16_t code);
+  void setCodeFast(int16_t code);  // No filter settling — for binary search only
+  int16_t currentCode() const { return currentCode_; }
+
+  // Low-level (used by POST / calibration)
+  void writeCode(uint16_t code);
+  void writeControl(bool sdoDis, bool offsBin, bool tri, bool gnd, bool rbuf);
+
+private:
+  void write24(uint32_t frame);
+  void writeClearCode(uint16_t code);
+  void softCtrl(bool doReset, bool doClr, bool doLdac);
+  static uint32_t calculateSettleTime(int32_t stepSize);
+  int16_t currentCode_ = 0;
+};
+static DacDriver dac;
+
+// -------- AdcDriver (ADS127L11) --------
+class AdcDriver {
+public:
+  void begin();
+  void initAndConfigure();
+  void command(uint8_t cmd);
+  void writeReg(uint8_t addr, uint8_t val);
+  uint8_t readReg(uint8_t addr);
+  bool waitDrdy(uint32_t timeout_us = 1000);
+  bool readSample24(int32_t &sample);
+private:
+  uint8_t xfer(uint8_t v);
+};
+static AdcDriver adc;
+
+// ================== DividerMuxDriver method implementations ==================
+
+void DividerMuxDriver::begin() {
+  pinMode(PIN_DIVMUX_A0, OUTPUT);
+  pinMode(PIN_DIVMUX_A1, OUTPUT);
+  digitalWrite(PIN_DIVMUX_A0, LOW);
+  digitalWrite(PIN_DIVMUX_A1, LOW);
+  current_ = DividerRatio::Div10;
+}
+
+void DividerMuxDriver::select(DividerRatio ratio) {
+  uint8_t addr = static_cast<uint8_t>(ratio);
+  digitalWriteFast(PIN_DIVMUX_A0, (addr & 0x01) ? HIGH : LOW);
+  digitalWriteFast(PIN_DIVMUX_A1, (addr & 0x02) ? HIGH : LOW);
+  current_ = ratio;
+  inputMux.select(InputChannel::HVDivider);
+  delayMicroseconds(INMUX_SETTLE_US);
+}
+
+// ---------------- Voltage Divider Scale Factors ----------------
+double getInputDividerRatio(InputChannel channel) {
+  if (channel == InputChannel::HVDivider) {
+    switch (divMux.current()) {
+      case DividerRatio::Div10:   return DIVIDER_RATIO_10;
+      case DividerRatio::Div100:  return DIVIDER_RATIO_100;
+      case DividerRatio::Div1000: return DIVIDER_RATIO_1000;
+      case DividerRatio::GND:     return DIVIDER_RATIO_10;
+      default:                    return DIVIDER_RATIO_10;
+    }
+  }
+  return 1.0;
+}
+
+const char* getDividerRatioName(DividerRatio ratio) {
+  switch (ratio) {
+    case DividerRatio::Div10:   return "÷10 (±50V)";
+    case DividerRatio::Div100:  return "÷100 (±500V)";
+    case DividerRatio::Div1000: return "÷1000 (±5kV)";
+    case DividerRatio::GND:     return "GND (cal)";
+    default:                    return "Unknown";
+  }
+}
 
 //
 // LowerMoments
@@ -697,15 +718,37 @@ private:
   }
 };
 
+// -------- RAII State Guard --------
+// Saves and restores input channel + DAC code on scope exit.
+// Guarantees restore even on early returns or overflow aborts.
+class ScopedInstrumentState {
+public:
+  ScopedInstrumentState()
+    : savedChannel_(inputMux.current()),
+      savedDac_(dac.currentCode()) {}
+
+  ~ScopedInstrumentState() {
+    inputMux.select(savedChannel_);
+    dac.setCode(savedDac_);
+  }
+
+  ScopedInstrumentState(const ScopedInstrumentState&) = delete;
+  ScopedInstrumentState& operator=(const ScopedInstrumentState&) = delete;
+
+private:
+  InputChannel savedChannel_;
+  int16_t savedDac_;
+};
+
 // -------- DAC (DAC) register addresses (3-bit) --------
 static constexpr uint8_t DAC_ADDRESS       = 0b001;
 static constexpr uint8_t DAC_ADDR_CTRL     = 0b010;
 static constexpr uint8_t DAC_ADDR_CLEAR    = 0b011;
 static constexpr uint8_t DAC_ADDR_SOFTCTRL = 0b100;
 
-// Low-level: write a 24-bit frame
-static void DAC_write24(uint32_t frame)
-{
+// ================== DacDriver method implementations ==================
+
+void DacDriver::write24(uint32_t frame) {
   SPI.beginTransaction(dacSpiSettings);
   digitalWrite(PIN_CS_DAC, LOW);
   SPI.transfer((frame >> 16) & 0xFF);
@@ -715,51 +758,38 @@ static void DAC_write24(uint32_t frame)
   SPI.endTransaction();
 }
 
-// DAC register + Clearcode register use 16-bit data in DB19..DB4 (lower 4 bits don't care)
-static void DAC_writeCode(uint16_t code)
-{
+void DacDriver::writeCode(uint16_t code) {
   const uint32_t rw   = 0u;
   const uint32_t addr = DAC_ADDRESS;
-  const uint32_t data = (uint32_t)code << 4;           // aligns into DB19..DB4
+  const uint32_t data = (uint32_t)code << 4;
   const uint32_t frame = (rw << 23) | (addr << 20) | (data & 0xFFFFF);
-  DAC_write24(frame);
+  write24(frame);
 }
 
-static void DAC_writeClearCode(uint16_t code)
-{
+void DacDriver::writeClearCode(uint16_t code) {
   const uint32_t rw   = 0u;
   const uint32_t addr = DAC_ADDR_CLEAR;
-  const uint32_t data = (uint32_t)code << 4;           // aligns into DB19..DB4
+  const uint32_t data = (uint32_t)code << 4;
   const uint32_t frame = (rw << 23) | (addr << 20) | (data & 0xFFFFF);
-  DAC_write24(frame);
+  write24(frame);
 }
 
-// Control register uses named bits down in DB5..DB1 (no <<4 here)
-static void DAC_writeControl(
-  bool sdoDisable,     // SDODIS (DB5)
-  bool offsetBinary,   // BIN/2sC (DB4) : 0=two's complement, 1=offset binary
-  bool dacTriState,    // DACTRI (DB3)
-  bool opGndClamp,     // OPGND  (DB2)
-  bool rbufUnityMode   // RBUF   (DB1) : 0 = gain-of-two config mode, 1 = unity mode (default)
-)
-{
+void DacDriver::writeControl(bool sdoDisable, bool offsetBinary,
+                              bool dacTriState, bool opGndClamp, bool rbufUnityMode) {
   uint32_t data = 0;
   data |= (uint32_t)(sdoDisable   ? 1 : 0) << 5;
   data |= (uint32_t)(offsetBinary ? 1 : 0) << 4;
   data |= (uint32_t)(dacTriState  ? 1 : 0) << 3;
   data |= (uint32_t)(opGndClamp   ? 1 : 0) << 2;
   data |= (uint32_t)(rbufUnityMode? 1 : 0) << 1;
-  // DB0 reserved = 0; other reserved bits = 0
 
   const uint32_t rw   = 0u;
   const uint32_t addr = DAC_ADDR_CTRL;
   const uint32_t frame = (rw << 23) | (addr << 20) | (data & 0xFFFFF);
-  DAC_write24(frame);
+  write24(frame);
 }
 
-// Software control uses bits at DB2..DB0 (no <<4 here)
-static void DAC_softCtrl(bool doReset, bool doClr, bool doLdac)
-{
+void DacDriver::softCtrl(bool doReset, bool doClr, bool doLdac) {
   uint32_t data = 0;
   data |= (uint32_t)(doReset ? 1 : 0) << 2;
   data |= (uint32_t)(doClr   ? 1 : 0) << 1;
@@ -768,95 +798,46 @@ static void DAC_softCtrl(bool doReset, bool doClr, bool doLdac)
   const uint32_t rw   = 0u;
   const uint32_t addr = DAC_ADDR_SOFTCTRL;
   const uint32_t frame = (rw << 23) | (addr << 20) | (data & 0xFFFFF);
-  DAC_write24(frame);
+  write24(frame);
 }
 
-// Assumes: VREFP=5V, VREFN=0V, and you want "2x mode" => gain-of-two configuration (RBUF=0).
-void initDAC_2xMode()
-{
-  // Optional: software reset (handy if RESET pin isn’t used)
-  DAC_softCtrl(true, false, false);
+void DacDriver::begin() {
+  softCtrl(true, false, false);  // Software reset
   delayMicroseconds(10);
-
-  // Program clearcode (choose what CLR should force the DAC to)
-  // With two’s complement coding, code 0x0000 is a sensible “zero code”.
-  DAC_writeClearCode(0x0000);
-
-  // Preload a known DAC code before enabling output (keeps output deterministic)
-  DAC_writeCode(0x0000);
-
-  // Configure control register:
-  // - SDODIS=0 (keep SDO enabled)
-  // - BIN/2sC=0 (two’s complement)
-  // - DACTRI=0 (normal)
-  // - OPGND=0 (remove ground clamp)
-  // - RBUF=0 (gain-of-two configuration mode)
-  DAC_writeControl(
-    /*sdoDisable=*/false,
-    /*offsetBinary=*/false,
-    /*dacTriState=*/false,
-    /*opGndClamp=*/false,
-    /*rbufUnityMode=*/false   // <-- 2x / gain-of-two config
-  );
-
-  // If your LDAC pin is tied HIGH, you can force an update via software LDAC pulse.
-  // In our case LDAC is tied low so this is not necessary.
-  //DAC_softCtrl(false, false, true);
+  writeClearCode(0x0000);
+  writeCode(0x0000);
+  writeControl(false, false, false, false, false);  // 2x / gain-of-two config
 }
 
 // ================== Input Mux Control (MUX36S08) ==================
 
 /**
  * Initialize input mux GPIO pins.
- * Call this in setup() before using selectInputChannel().
+ * Call this in setup() before using inputMux.select().
  */
-void initInputMux() {
+// ================== InputMuxDriver method implementations ==================
+
+void InputMuxDriver::begin() {
   pinMode(PIN_INMUX_A0, OUTPUT);
   pinMode(PIN_INMUX_A1, OUTPUT);
   pinMode(PIN_INMUX_A2, OUTPUT);
-  // EN is hardwired to VDD (active high, always enabled)
-
-  // Select Vx (address 0)
   digitalWrite(PIN_INMUX_A0, LOW);
   digitalWrite(PIN_INMUX_A1, LOW);
   digitalWrite(PIN_INMUX_A2, LOW);
-  currentInputChannel = InputChannel::Vx;
+  current_ = InputChannel::Vx;
 }
 
-/**
- * Select input channel on the MUX36S08.
- * Waits for mux settling before returning.
- *
- * @param channel The input channel to select
- */
-void selectInputChannel(InputChannel channel) {
-  if (channel == currentInputChannel) {
-    return;  // Already selected, no action needed
-  }
+void InputMuxDriver::select(InputChannel channel) {
+  if (channel == current_) return;
 
   uint8_t addr = static_cast<uint8_t>(channel);
-
-  // Set address lines
   digitalWriteFast(PIN_INMUX_A0, (addr & 0x01) ? HIGH : LOW);
   digitalWriteFast(PIN_INMUX_A1, (addr & 0x02) ? HIGH : LOW);
   digitalWriteFast(PIN_INMUX_A2, (addr & 0x04) ? HIGH : LOW);
-
-  currentInputChannel = channel;
-
-  // Wait for mux and signal path to settle
+  current_ = channel;
   delayMicroseconds(INMUX_SETTLE_US);
 }
 
-/**
- * Get the current input channel.
- */
-InputChannel getInputChannel() {
-  return currentInputChannel;
-}
-
-/**
- * Get human-readable name for an input channel.
- */
 const char* getInputChannelName(InputChannel channel) {
   switch (channel) {
     case InputChannel::Vx:        return "Vx (±5V)";
@@ -871,49 +852,33 @@ const char* getInputChannelName(InputChannel channel) {
   }
 }
 
-// ================== DAC Functions ==================
+// ================== DacDriver continued ==================
 
-/**
- * Calculate DAC filter settling time based on step size.
- * Uses sqrt scaling to maintain constant absolute error (~1 µV target).
- *
- * Formula: settle_ms = 80 + 220 × sqrt(stepSize / 32768)
- *
- * This gives:
- *   - 100 codes (15 mV):    ~92 ms
- *   - 1000 codes (153 mV):  ~118 ms
- *   - 10000 codes (1.5 V):  ~201 ms
- *   - 32768 codes (5 V):    ~300 ms
- */
-uint32_t calculateDacSettleTime(int32_t stepSize) {
+uint32_t DacDriver::calculateSettleTime(int32_t stepSize) {
   if (stepSize <= 0) return 0;
-
-  // Clamp to maximum step size
   if (stepSize > 32768) stepSize = 32768;
-
-  // sqrt scaling: additional time proportional to sqrt(step_size)
-  // Scale factor: (MAX - MIN) / sqrt(32768) ≈ 220 / 181 ≈ 1.215
   const float scale = (float)(DAC_SETTLE_MAX_MS - DAC_SETTLE_MIN_MS) / sqrtf(32768.0f);
   uint32_t additionalMs = (uint32_t)(scale * sqrtf((float)stepSize));
-
   return DAC_SETTLE_MIN_MS + additionalMs;
 }
 
-// Set DAC to a specific code, track it, and wait for filter to settle
-void setDacCode(int16_t code) {
-  if (code == currentDacCode) {
-    return;  // No change, no settling needed
-  }
+void DacDriver::setCode(int16_t code) {
+  if (code == currentCode_) return;
 
-  int32_t stepSize = abs((int32_t)code - (int32_t)currentDacCode);
-  currentDacCode = code;
-  DAC_writeCode((uint16_t)code);
+  int32_t stepSize = abs((int32_t)code - (int32_t)currentCode_);
+  currentCode_ = code;
+  writeCode((uint16_t)code);
 
-  // Wait for Bessel filter to settle (time depends on step size)
-  uint32_t settleMs = calculateDacSettleTime(stepSize);
+  uint32_t settleMs = calculateSettleTime(stepSize);
   if (settleMs > 0) {
     delay(settleMs);
   }
+}
+
+void DacDriver::setCodeFast(int16_t code) {
+  currentCode_ = code;
+  writeCode((uint16_t)code);
+  delay(5);  // ~5 ms: enough for ADC to see coarse signal, not full filter settle
 }
 
 // Check if sample indicates overflow
@@ -929,11 +894,13 @@ inline bool isOverflow(int32_t sample) {
   return isOverflowPositive(sample) || isOverflowNegative(sample);
 }
 
-// Read a single ADC sample for DAC adjustment (with settling)
-int32_t readSettledSample() {
+// Read a single ADC sample for DAC adjustment (with settling).
+// Returns true on success, false on ADC timeout.
+bool readSettledSample(int32_t &sample) {
   delayMicroseconds(SETTLE_US);
-  (void)adcReadSample24();  // discard one
-  return adcReadSample24();
+  int32_t discard;
+  if (!adc.readSample24(discard)) return false;  // discard one
+  return adc.readSample24(sample);
 }
 
 /**
@@ -957,9 +924,9 @@ bool binarySearchDAC() {
 
   // Force TMUXSEL=LOW so ADC reads (Vx - DAC) * gain
   // This ensures consistent search direction regardless of prior mux state
-  // Use chop() to switch properly with CI_TMUXSEL sequence
-  if (tmux_sel_state == HIGH) {
-    chop();  // Toggle HIGH -> LOW using charge-injection-minimizing sequence
+  // Use chopper.toggle() to switch properly with CI_TMUXSEL sequence
+  if (chopper.state()) {
+    chopper.toggle();  // Toggle HIGH -> LOW using charge-injection-minimizing sequence
   }
 
   // Search bounds constrained to 14-bit boundaries (multiples of 4)
@@ -973,9 +940,13 @@ bool binarySearchDAC() {
   for (int iter = 0; iter < MAX_ITERATIONS; iter++) {
     // Compute midpoint and align to 14-bit boundary (multiple of 4)
     mid = ((low + high) / 2) & ~3;
-    setDacCode((int16_t)mid);  // Includes 250ms filter settling delay
+    dac.setCodeFast((int16_t)mid);  // Fast write — no full filter settle
 
-    int32_t sample = readSettledSample();
+    int32_t sample;
+    if (!readSettledSample(sample)) {
+      Serial.println("DAC: ADC timeout during binary search.");
+      return false;
+    }
 
     Serial.print("  iter=");
     Serial.print(iter);
@@ -991,7 +962,8 @@ bool binarySearchDAC() {
       // Vx < DAC, decrease DAC
       high = mid - 4;  // Previous 14-bit boundary
     } else {
-      // In range - success
+      // Converged — now do full settle at final code for clean integration
+      dac.setCode((int16_t)mid);
       Serial.print("DAC: Converged at code ");
       Serial.print(mid);
       Serial.println(" (14-bit aligned)");
@@ -1007,114 +979,90 @@ bool binarySearchDAC() {
   return false;
 }
 
-// End DAC code
-uint8_t adcXfer(uint8_t v) { return SPI.transfer(v); }
+// ================== AdcDriver method implementations ==================
 
-void adcCommand(uint8_t cmd) {
+uint8_t AdcDriver::xfer(uint8_t v) { return SPI.transfer(v); }
+
+void AdcDriver::command(uint8_t cmd) {
   SPI.beginTransaction(adcSpiSettings);
   csLow(PIN_CS_ADC);
-  adcXfer(cmd);
+  xfer(cmd);
   csHigh(PIN_CS_ADC);
   SPI.endTransaction();
   delayMicroseconds(2);
 }
 
-void adcWriteReg(uint8_t addr, uint8_t value) {
+void AdcDriver::writeReg(uint8_t addr, uint8_t value) {
   SPI.beginTransaction(adcSpiSettings);
   csLow(PIN_CS_ADC);
-  adcXfer(OPCODE_WREG | (addr & 0x1F));
-  adcXfer(0x00); // write 1 register (count-1)
-  adcXfer(value);
+  xfer(OPCODE_WREG | (addr & 0x1F));
+  xfer(0x00);
+  xfer(value);
   csHigh(PIN_CS_ADC);
   SPI.endTransaction();
   delayMicroseconds(2);
 }
 
-uint8_t adcReadReg(uint8_t addr) {
+uint8_t AdcDriver::readReg(uint8_t addr) {
   SPI.beginTransaction(adcSpiSettings);
   csLow(PIN_CS_ADC);
-  adcXfer(OPCODE_RREG | (addr & 0x1F));
-  adcXfer(0x00); // read 1 register (count-1)
-  uint8_t v = adcXfer(0x00);
+  xfer(OPCODE_RREG | (addr & 0x1F));
+  xfer(0x00);
+  uint8_t v = xfer(0x00);
   csHigh(PIN_CS_ADC);
   SPI.endTransaction();
   delayMicroseconds(2);
   return v;
 }
 
-// Blocking wait for DRDY active (assumes DRDY goes LOW when data ready).
-// Note: elapsedMicros is a Teensy-specific class that automatically tracks
-// elapsed time using hardware timers. It starts counting at initialization
-// and increments in the background - no manual update needed.
-bool waitForDrdyLow(uint32_t timeout_us) {
-  elapsedMicros t = 0;  // Auto-incrementing timer, starts at 0
+bool AdcDriver::waitDrdy(uint32_t timeout_us) {
+  elapsedMicros t = 0;
   while (t < timeout_us) {
     if (digitalReadFast(PIN_ADC_DRDY) == LOW) return true;
   }
   return false;
 }
 
-// Read one 24-bit sample frame.
-int32_t adcReadSample24() {
-  if (!waitForDrdyLow(1000)) {
-    return INT32_MIN;
+bool AdcDriver::readSample24(int32_t &sample) {
+  if (!waitDrdy(1000)) {
+    sample = 0;
+    return false;
   }
 
   SPI.beginTransaction(adcSpiSettings);
   csLow(PIN_CS_ADC);
 
-  uint8_t b2 = adcXfer(0x00);
-  uint8_t b1 = adcXfer(0x00);
-  uint8_t b0 = adcXfer(0x00);
+  uint8_t b2 = xfer(0x00);
+  uint8_t b1 = xfer(0x00);
+  uint8_t b0 = xfer(0x00);
 
   csHigh(PIN_CS_ADC);
   SPI.endTransaction();
 
-  int32_t raw = (int32_t)((uint32_t)b2 << 16 | (uint32_t)b1 << 8 | (uint32_t)b0);
-
-  // Sign-extend 24-bit to 32-bit
-  if (raw & 0x00800000) raw |= 0xFF000000;
-  return raw;
+  sample = (int32_t)((uint32_t)b2 << 16 | (uint32_t)b1 << 8 | (uint32_t)b0);
+  if (sample & 0x00800000) sample |= 0xFF000000;
+  return true;
 }
 
-/**
- * @brief This method is called to switch (aka chop) the inputs to the instrumentation amplifier.
- *
- * It performs the core control logic:
- * 1. Pulses the CI_TMUXSEL pin HIGH.
- * 2. Toggles the state of the TMUXSEL pin.
- * 3. Pulses the CI_TMUXSEL pin LOW.
- * This sequence minimizes charge injection. Hopefully.
- */
-void chop() {
-    // --- Step 1 & 2: Pulse the CI_TMUXSEL pin ---
-  // Use digitalWriteFast for minimum latency.
-  digitalWriteFast(PIN_CI_TMUXSEL, HIGH);
-  delayMicroseconds(PULSE_WIDTH_US); // This brief delay is acceptable in an ISR.
-  // --- Step 3: Toggle the main switch select state ---
-  tmux_sel_state = !tmux_sel_state; // Invert the state
-  digitalWriteFast(PIN_TMUXSEL, tmux_sel_state);
-  delayMicroseconds(PULSE_WIDTH_US);
-  digitalWriteFast(PIN_CI_TMUXSEL, LOW);
+void AdcDriver::begin() {
+  analogWriteFrequency(PIN_CLK_ADC, 25000000);
+  analogWrite(PIN_CLK_ADC, 128);
 }
 
-// ---------------- ADC configuration ----------------
-void adcInitAndConfigure() {
-  adcCommand(CMD_RESET);
+void AdcDriver::initAndConfigure() {
+  command(CMD_RESET);
   delay(5);
 
-  // CONFIG3: DELAY[7:5]=000, FILTER[4:0]=11000
   const uint8_t delayCode  = 0b000;
   const uint8_t filterCode = 0b11000;
   const uint8_t config3 = (delayCode << 5) | (filterCode & 0x1F);
-  adcWriteReg(REG_CONFIG3, config3);
+  writeReg(REG_CONFIG3, config3);
 
-  // CONFIG4: external clock; other bits use defaults of 0.
   const uint8_t config4 = (1u << 7);
-  adcWriteReg(REG_CONFIG4, config4);
+  writeReg(REG_CONFIG4, config4);
 
-  uint8_t r3 = adcReadReg(REG_CONFIG3);
-  uint8_t r4 = adcReadReg(REG_CONFIG4);
+  uint8_t r3 = readReg(REG_CONFIG3);
+  uint8_t r4 = readReg(REG_CONFIG4);
 
   Serial.print("ADC CONFIG3 set/read: 0x"); Serial.print(config3, HEX);
   Serial.print(" / 0x"); Serial.println(r3, HEX);
@@ -1122,24 +1070,48 @@ void adcInitAndConfigure() {
   Serial.print("ADC CONFIG4 set/read: 0x"); Serial.print(config4, HEX);
   Serial.print(" / 0x"); Serial.println(r4, HEX);
 
-  adcCommand(CMD_START);
+  command(CMD_START);
+}
+
+// ================== ChopperDriver method implementations ==================
+
+void ChopperDriver::begin() {
+  pinMode(PIN_TMUX_EN, OUTPUT);
+  pinMode(PIN_TMUXSEL, OUTPUT);
+  pinMode(PIN_CI_TMUXSEL, OUTPUT);
+  digitalWrite(PIN_TMUXSEL, LOW);
+  digitalWrite(PIN_CI_TMUXSEL, LOW);
+  digitalWriteFast(PIN_TMUX_EN, LOW);
+  state_ = false;
+}
+
+void ChopperDriver::toggle() {
+  digitalWriteFast(PIN_CI_TMUXSEL, HIGH);
+  delayMicroseconds(PULSE_WIDTH_US);
+  state_ = !state_;
+  digitalWriteFast(PIN_TMUXSEL, state_);
+  delayMicroseconds(PULSE_WIDTH_US);
+  digitalWriteFast(PIN_CI_TMUXSEL, LOW);
 }
 
 // ---------------- Chopped acquisition ----------------
 
-// Collect samples for one half-cycle, detect overflow on first sample
+// Collect samples for one half-cycle, detect overflow on first sample.
+// Sets result.overflow on ADC overflow OR timeout.
 HalfCycleResult acquireHalfCycle() {
   HalfCycleResult result = {0, false};
 
   delayMicroseconds(SETTLE_US);
 
   // Discard initial samples after settling
+  int32_t discard;
   for (uint8_t i = 0; i < DISCARD_SAMPLES; i++) {
-    (void)adcReadSample24();
+    if (!adc.readSample24(discard)) { result.overflow = true; return result; }
   }
 
   // Read first good sample and check for overflow
-  int32_t firstSample = adcReadSample24();
+  int32_t firstSample;
+  if (!adc.readSample24(firstSample)) { result.overflow = true; return result; }
   if (isOverflow(firstSample)) {
     result.overflow = true;
     return result;
@@ -1148,7 +1120,9 @@ HalfCycleResult acquireHalfCycle() {
 
   // Accumulate remaining good samples
   for (uint8_t i = 1; i < GOOD_SAMPLES; i++) {
-    result.sum += adcReadSample24();
+    int32_t s;
+    if (!adc.readSample24(s)) { result.overflow = true; return result; }
+    result.sum += s;
   }
   return result;
 }
@@ -1166,78 +1140,82 @@ static AllanDeviation allanDev;
 
 static constexpr int MAX_SCAN_CHANNELS = 7;  // GND excluded (used only for auto-zero)
 
-/**
- * Output format for measurement results. Mutually exclusive; selected by
- * "log start", "plot start", and "log stop"/"plot stop" serial commands.
- * Checked by outputMeasurement() and the scanning state machine in loop().
- */
 enum class OutputMode : uint8_t {
   Human,    // Default: multi-line human-readable text with SI prefixes
   CSV,      // Machine-readable CSV, one row per channel per integration period
   Plotter,  // Arduino Serial Plotter compatible: "label:value\t..." per line
 };
 
-/**
- * User-configurable scanning parameters. Stored in the global `scanConfig`
- * and persisted to EEPROM inside SavedConfig. Modified by serial commands
- * (scan add/remove, integrate, autozero, log/plot start/stop).
- */
 struct ScanConfig {
-  InputChannel channels[MAX_SCAN_CHANNELS];  // Ordered list of channels to scan
-  int count;                    // Number of channels in scan list (0 = scan disabled)
-  int integrationCycles;        // Chop cycles to accumulate per channel before reporting
-  bool autoZeroEnabled;         // If true, periodically measure GND to track offset
-  int autoZeroInterval;         // Full scan sweeps between auto-zero measurements
-  OutputMode outputMode;        // Current serial output format
+  InputChannel channels[MAX_SCAN_CHANNELS];
+  int count;
+  int integrationCycles;
+  bool autoZeroEnabled;
+  int autoZeroInterval;
+  OutputMode outputMode;
 };
 
-static ScanConfig scanConfig = {
-  .channels = { InputChannel::Vx },
-  .count = 1,
-  .integrationCycles = 100,
-  .autoZeroEnabled = true,
-  .autoZeroInterval = 10,
-  .outputMode = OutputMode::Human,
+enum class ScanState : uint8_t { ONE_CHANNEL, SCANNING };
+
+static constexpr int SCAN_SETTLE_CYCLES = 5;
+
+// Encapsulates all scanning state: configuration, per-channel stats,
+// DAC code cache, auto-zero, and the ONE_CHANNEL/SCANNING state machine.
+class ScanController {
+public:
+  ScanController() { clearDacCache(); }
+
+  // Configuration (public for EEPROM save/load and command handlers)
+  ScanConfig config = {
+    .channels = { InputChannel::Vx },
+    .count = 1,
+    .integrationCycles = 100,
+    .autoZeroEnabled = true,
+    .autoZeroInterval = 10,
+    .outputMode = OutputMode::Human,
+  };
+
+  // State queries
+  ScanState state() const { return state_; }
+  bool isScanning() const { return state_ == ScanState::SCANNING; }
+  bool isOneChannel() const { return state_ == ScanState::ONE_CHANNEL; }
+
+  void start() { state_ = ScanState::SCANNING; currentScanIndex_ = 0; scanCycleCount_ = 0; chopCycleCount_ = 0; }
+  void stop()  { state_ = ScanState::ONE_CHANNEL; }
+
+  // Per-channel statistics
+  LowerMoments& channelStats(uint8_t idx) { return channelStats_[idx]; }
+
+  // Per-channel DAC code cache
+  int16_t channelDacCode(uint8_t idx) const { return channelDacCode_[idx]; }
+  bool    channelDacValid(uint8_t idx) const { return channelDacValid_[idx]; }
+  void    setChannelDac(uint8_t idx, int16_t code) { channelDacCode_[idx] = code; channelDacValid_[idx] = true; }
+  void    clearDacCache() { for (int i = 0; i < 8; i++) { channelDacCode_[i] = 0; channelDacValid_[i] = false; } }
+
+  // Auto-zero
+  double autoZeroOffset = 0.0;
+  bool autoZeroValid = false;
+
+  // Scan loop state
+  int currentScanIndex() const { return currentScanIndex_; }
+  void setCurrentScanIndex(int i) { currentScanIndex_ = i; }
+  int scanCycleCount() const { return scanCycleCount_; }
+  void incScanCycleCount() { scanCycleCount_++; }
+  int chopCycleCount() const { return chopCycleCount_; }
+  void setChopCycleCount(int c) { chopCycleCount_ = c; }
+  void incChopCycleCount() { chopCycleCount_++; }
+
+private:
+  ScanState state_ = ScanState::ONE_CHANNEL;
+  int currentScanIndex_ = 0;
+  int scanCycleCount_ = 0;
+  int chopCycleCount_ = 0;
+  LowerMoments channelStats_[8];
+  int16_t channelDacCode_[8];
+  bool channelDacValid_[8];
 };
 
-// Per-channel statistics, indexed by (uint8_t)InputChannel (0-7).
-// In SCANNING mode, loop() accumulates into channelStats[currentChannel] and
-// clears it on each channel switch. In IDLE mode, chopStats is used instead.
-static LowerMoments channelStats[8];
-
-// Per-channel saved DAC codes, indexed by (uint8_t)InputChannel (0-7).
-// Allows fast channel switching during scanning without a full binary search.
-// On first visit, binarySearchDAC() finds the code; subsequent visits restore it.
-// If the saved code causes overflow (input changed), runOneChopCycle() triggers
-// a fresh search and updates the saved code.
-static int16_t channelDacCode[8];    // Saved DAC code per channel
-static bool    channelDacValid[8];   // True after first successful measurement
-
-void clearChannelDacCodes() {
-  for (int i = 0; i < 8; i++) {
-    channelDacCode[i] = 0;
-    channelDacValid[i] = false;
-  }
-}
-
-// Auto-zero offset in volts, measured by performAutoZero().
-// Subtracted from all voltage results in outputMeasurement() when autoZeroValid is true.
-static double autoZeroOffset = 0.0;
-static bool autoZeroValid = false;
-
-/**
- * Scanning state machine states. Governs the two main branches in loop():
- *   IDLE     - continuous measurement on currentInputChannel using chopStats
- *   SCANNING - cycles through scanConfig.channels[], uses channelStats[]
- *
- * Transitions: cmdScanStart() → SCANNING, cmdScanStop() → IDLE
- */
-enum class ScanState : uint8_t { IDLE, SCANNING };
-static ScanState scanState = ScanState::IDLE;
-static int currentScanIndex = 0;   // Index into scanConfig.channels[] during SCANNING
-static int scanCycleCount = 0;     // Full sweeps completed; used for auto-zero scheduling
-static int chopCycleCount = 0;     // Chop cycles on current channel; includes settling
-static constexpr int SCAN_SETTLE_CYCLES = 5;  // Chop cycles discarded after channel switch
+static ScanController scanner;
 
 // ================== Serial Command Interface ==================
 
@@ -1267,7 +1245,7 @@ bool parseChannelName(const char* name, InputChannel &ch) {
 
 /**
  * Get short channel name string without range/description suffix.
- * Used by printCsvRow() and printPlotterLine() where compact names are needed.
+ * Used by CsvFormatter and PlotterFormatter where compact names are needed.
  * Compare with getInputChannelName() which returns descriptive names like "Vx (±5V)".
  *
  * @param channel  Input channel enum value
@@ -1299,22 +1277,27 @@ void cmdScanAdd(const char* arg) {
     Serial.println("'. Use: Vx, GND, VrefRaw, Spare1-4, HVDivider");
     return;
   }
+  // GND is reserved for auto-zero, not meaningful as a scan channel
+  if (ch == InputChannel::GND) {
+    Serial.println("ERROR: GND cannot be added to scan list (use 'autozero on' instead).");
+    return;
+  }
   // Check for duplicates
-  for (int i = 0; i < scanConfig.count; i++) {
-    if (scanConfig.channels[i] == ch) {
+  for (int i = 0; i < scanner.config.count; i++) {
+    if (scanner.config.channels[i] == ch) {
       Serial.println("Channel already in scan list.");
       return;
     }
   }
-  if (scanConfig.count >= MAX_SCAN_CHANNELS) {
+  if (scanner.config.count >= MAX_SCAN_CHANNELS) {
     Serial.println("ERROR: Scan list full (max 7 channels).");
     return;
   }
-  scanConfig.channels[scanConfig.count++] = ch;
+  scanner.config.channels[scanner.config.count++] = ch;
   Serial.print("Added ");
   Serial.print(getChannelShortName(ch));
   Serial.print(" to scan list (");
-  Serial.print(scanConfig.count);
+  Serial.print(scanner.config.count);
   Serial.println(" channels).");
 }
 
@@ -1326,13 +1309,13 @@ void cmdScanRemove(const char* arg) {
     Serial.println("'");
     return;
   }
-  for (int i = 0; i < scanConfig.count; i++) {
-    if (scanConfig.channels[i] == ch) {
+  for (int i = 0; i < scanner.config.count; i++) {
+    if (scanner.config.channels[i] == ch) {
       // Shift remaining channels down
-      for (int j = i; j < scanConfig.count - 1; j++) {
-        scanConfig.channels[j] = scanConfig.channels[j + 1];
+      for (int j = i; j < scanner.config.count - 1; j++) {
+        scanner.config.channels[j] = scanner.config.channels[j + 1];
       }
-      scanConfig.count--;
+      scanner.config.count--;
       Serial.print("Removed ");
       Serial.print(getChannelShortName(ch));
       Serial.println(" from scan list.");
@@ -1344,15 +1327,15 @@ void cmdScanRemove(const char* arg) {
 
 void cmdScanList() {
   Serial.print("Scan list (");
-  Serial.print(scanConfig.count);
+  Serial.print(scanner.config.count);
   Serial.println(" channels):");
-  for (int i = 0; i < scanConfig.count; i++) {
+  for (int i = 0; i < scanner.config.count; i++) {
     Serial.print("  ");
     Serial.print(i + 1);
     Serial.print(". ");
-    Serial.println(getInputChannelName(scanConfig.channels[i]));
+    Serial.println(getInputChannelName(scanner.config.channels[i]));
   }
-  if (scanConfig.count == 0) {
+  if (scanner.config.count == 0) {
     Serial.println("  (empty)");
   }
 }
@@ -1370,33 +1353,27 @@ void cmdScanList() {
  * After this, loop() enters the SCANNING branch on each iteration.
  */
 void cmdScanStart() {
-  if (scanConfig.count == 0) {
+  if (scanner.config.count == 0) {
     Serial.println("ERROR: Scan list is empty. Add channels first.");
     return;
   }
-  scanState = ScanState::SCANNING;
-  currentScanIndex = 0;
-  scanCycleCount = 0;
-  chopCycleCount = 0;
+  scanner.start();
   allanDev.clear();
 
   // Switch to first channel
-  InputChannel firstCh = scanConfig.channels[0];
-  selectInputChannel(firstCh);
+  InputChannel firstCh = scanner.config.channels[0];
+  inputMux.select(firstCh);
   uint8_t idx = (uint8_t)firstCh;
-  if (channelDacValid[idx]) {
-    // Restore saved DAC code from previous scan
-    setDacCode(channelDacCode[idx]);
+  if (scanner.channelDacValid(idx)) {
+    dac.setCode(scanner.channelDacCode(idx));
   } else {
-    // First visit: full binary search
     binarySearchDAC();
-    channelDacCode[idx] = currentDacCode;
-    channelDacValid[idx] = true;
+    scanner.setChannelDac(idx, dac.currentCode());
   }
-  channelStats[(uint8_t)firstCh].clear();
+  scanner.channelStats(idx).clear();
 
   // Print CSV header if in CSV mode
-  if (scanConfig.outputMode == OutputMode::CSV) {
+  if (scanner.config.outputMode == OutputMode::CSV) {
     printCsvHeader();
   }
 
@@ -1404,31 +1381,31 @@ void cmdScanStart() {
 }
 
 void cmdScanStop() {
-  scanState = ScanState::IDLE;
-  chopCycleCount = 0;
+  scanner.stop();
+  scanner.setChopCycleCount(0);
   Serial.println("Scanning stopped.");
 }
 
 void cmdLogStart() {
-  scanConfig.outputMode = OutputMode::CSV;
+  scanner.config.outputMode = OutputMode::CSV;
   Serial.println("CSV logging enabled.");
-  if (scanState == ScanState::SCANNING) {
+  if (scanner.isScanning()) {
     printCsvHeader();
   }
 }
 
 void cmdLogStop() {
-  scanConfig.outputMode = OutputMode::Human;
+  scanner.config.outputMode = OutputMode::Human;
   Serial.println("CSV logging disabled, human-readable output restored.");
 }
 
 void cmdPlotStart() {
-  scanConfig.outputMode = OutputMode::Plotter;
+  scanner.config.outputMode = OutputMode::Plotter;
   Serial.println("Serial Plotter output enabled.");
 }
 
 void cmdPlotStop() {
-  scanConfig.outputMode = OutputMode::Human;
+  scanner.config.outputMode = OutputMode::Human;
   Serial.println("Serial Plotter output disabled, human-readable output restored.");
 }
 
@@ -1438,7 +1415,7 @@ void cmdIntegrate(const char* arg) {
     Serial.println("ERROR: Integration cycles must be 10-10000.");
     return;
   }
-  scanConfig.integrationCycles = n;
+  scanner.config.integrationCycles = n;
   Serial.print("Integration set to ");
   Serial.print(n);
   Serial.print(" chop cycles (~");
@@ -1448,10 +1425,10 @@ void cmdIntegrate(const char* arg) {
 
 void cmdAutoZero(const char* arg) {
   if (strcasecmp(arg, "on") == 0) {
-    scanConfig.autoZeroEnabled = true;
+    scanner.config.autoZeroEnabled = true;
     Serial.println("Auto-zero enabled.");
   } else if (strcasecmp(arg, "off") == 0) {
-    scanConfig.autoZeroEnabled = false;
+    scanner.config.autoZeroEnabled = false;
     Serial.println("Auto-zero disabled.");
   } else {
     Serial.println("Usage: autozero on|off");
@@ -1464,7 +1441,7 @@ void cmdAutoZeroInterval(const char* arg) {
     Serial.println("ERROR: Auto-zero interval must be 1-1000 scan sweeps.");
     return;
   }
-  scanConfig.autoZeroInterval = n;
+  scanner.config.autoZeroInterval = n;
   Serial.print("Auto-zero interval set to ");
   Serial.print(n);
   Serial.println(" scan sweeps.");
@@ -1474,15 +1451,15 @@ void cmdRange(const char* arg) {
   int r = atoi(arg);
   switch (r) {
     case 10:
-      selectDividerRatio(DividerRatio::Div10);
+      divMux.select(DividerRatio::Div10);
       Serial.println("Range set to +/-50V (div 10).");
       break;
     case 100:
-      selectDividerRatio(DividerRatio::Div100);
+      divMux.select(DividerRatio::Div100);
       Serial.println("Range set to +/-500V (div 100).");
       break;
     case 1000:
-      selectDividerRatio(DividerRatio::Div1000);
+      divMux.select(DividerRatio::Div1000);
       Serial.println("Range set to +/-5kV (div 1000).");
       break;
     default:
@@ -1495,42 +1472,42 @@ void printStatus() {
   Serial.println("\n=== DiffVM Status ===");
 
   Serial.print("State: ");
-  Serial.println(scanState == ScanState::SCANNING ? "SCANNING" : "IDLE");
+  Serial.println(scanner.isScanning() ? "SCANNING" : "ONE_CHANNEL");
 
   Serial.print("Output mode: ");
-  switch (scanConfig.outputMode) {
+  switch (scanner.config.outputMode) {
     case OutputMode::Human:  Serial.println("Human-readable"); break;
     case OutputMode::CSV:    Serial.println("CSV logging"); break;
     case OutputMode::Plotter: Serial.println("Serial Plotter"); break;
   }
 
   Serial.print("Integration: ");
-  Serial.print(scanConfig.integrationCycles);
+  Serial.print(scanner.config.integrationCycles);
   Serial.println(" chop cycles");
 
   Serial.print("Auto-zero: ");
-  Serial.print(scanConfig.autoZeroEnabled ? "ON" : "OFF");
+  Serial.print(scanner.config.autoZeroEnabled ? "ON" : "OFF");
   Serial.print(", interval=");
-  Serial.print(scanConfig.autoZeroInterval);
+  Serial.print(scanner.config.autoZeroInterval);
   Serial.println(" sweeps");
 
-  if (autoZeroValid) {
+  if (scanner.autoZeroValid) {
     Serial.print("Auto-zero offset: ");
-    Serial.print(autoZeroOffset * 1e9, 1);
+    Serial.print(scanner.autoZeroOffset * 1e9, 1);
     Serial.println(" nV");
   }
 
   Serial.print("Current channel: ");
-  Serial.println(getInputChannelName(currentInputChannel));
+  Serial.println(getInputChannelName(inputMux.current()));
 
   Serial.print("Current DAC code: ");
-  Serial.println(currentDacCode);
+  Serial.println(dac.currentCode());
 
   Serial.print("Divider ratio: ");
-  Serial.println(getDividerRatioName(currentDividerRatio));
+  Serial.println(getDividerRatioName(divMux.current()));
 
   Serial.print("DAC calibration: ");
-  Serial.println(dacCalTableValid ? "CALIBRATED" : "nominal");
+  Serial.println(dacCalTable.isValid() ? "CALIBRATED" : "nominal");
 
   cmdScanList();
   Serial.println("=====================\n");
@@ -1566,7 +1543,7 @@ void printHelp() {
 
 // Compute measurement interval (tau0) in seconds for current integration setting
 static double computeTau0() {
-  return (double)scanConfig.integrationCycles / EST_FSPS
+  return (double)scanner.config.integrationCycles / EST_FSPS
          * (DISCARD_SAMPLES + GOOD_SAMPLES + 1) * 2;
 }
 
@@ -1621,7 +1598,7 @@ void processCommand(char* line) {
     } else if (strcasecmp(arg1, "list") == 0) {
       cmdScanList();
     } else if (strcasecmp(arg1, "clear") == 0) {
-      scanConfig.count = 0;
+      scanner.config.count = 0;
       Serial.println("Scan list cleared.");
     } else if (strcasecmp(arg1, "start") == 0) {
       cmdScanStart();
@@ -1659,9 +1636,9 @@ void processCommand(char* line) {
   } else if (strcasecmp(cmd, "zero") == 0) {
     Serial.println("Performing zero calibration...");
     performAutoZero();
-    if (autoZeroValid) {
+    if (scanner.autoZeroValid) {
       Serial.print("Zero offset: ");
-      Serial.print(autoZeroOffset * 1e9, 1);
+      Serial.print(scanner.autoZeroOffset * 1e9, 1);
       Serial.println(" nV");
     }
   } else if (strcasecmp(cmd, "config") == 0) {
@@ -1719,14 +1696,14 @@ bool postTestAdcComm() {
   Serial.print("POST: ADC Comm... ");
 
   // Read device ID register
-  uint8_t devId = adcReadReg(REG_DEV_ID);
+  uint8_t devId = adc.readReg(REG_DEV_ID);
 
   // Write a test value to CONFIG1, read it back
   const uint8_t testVal = 0x55;
-  uint8_t origVal = adcReadReg(REG_CONFIG1);
-  adcWriteReg(REG_CONFIG1, testVal);
-  uint8_t readBack = adcReadReg(REG_CONFIG1);
-  adcWriteReg(REG_CONFIG1, origVal);  // Restore original
+  uint8_t origVal = adc.readReg(REG_CONFIG1);
+  adc.writeReg(REG_CONFIG1, testVal);
+  uint8_t readBack = adc.readReg(REG_CONFIG1);
+  adc.writeReg(REG_CONFIG1, origVal);  // Restore original
 
   bool pass = (readBack == testVal);
 
@@ -1857,14 +1834,16 @@ bool postTestSignalChain() {
   Serial.print("POST: Signal Chain... ");
 
   // Set DAC to 0V (code 0x0000 in two's complement mode)
-  setDacCode(0);  // Includes 250ms filter settling delay
+  dac.setCode(0);  // Includes 250ms filter settling delay
 
   // Discard first sample, read a few and average
-  (void)adcReadSample24();
+  int32_t s;
+  if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
   int64_t sum = 0;
   const int numSamples = 5;
   for (int i = 0; i < numSamples; i++) {
-    sum += adcReadSample24();
+    if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
+    sum += s;
   }
   int32_t avg = sum / numSamples;
 
@@ -1901,22 +1880,25 @@ bool postTestPolarity() {
   Serial.print("POST: Polarity... ");
 
   // Ensure TMUXSEL=LOW so ADC reads (Vx - DAC) * gain
-  if (tmux_sel_state == HIGH) {
-    chop();
+  if (chopper.state()) {
+    chopper.toggle();
   }
 
   // Set DAC to 0, measure
-  setDacCode(0);  // Includes 250ms filter settling delay
-  (void)adcReadSample24();
-  int32_t adcAt0 = adcReadSample24();
+  dac.setCode(0);  // Includes 250ms filter settling delay
+  int32_t adcAt0, adcAt1000, discard;
+  if (!adc.readSample24(discard) || !adc.readSample24(adcAt0)) {
+    Serial.println("FAIL (ADC timeout)"); return false;
+  }
 
   // Set DAC to +1000 (small positive step), measure
-  setDacCode(1000);  // Includes 250ms filter settling delay
-  (void)adcReadSample24();
-  int32_t adcAt1000 = adcReadSample24();
+  dac.setCode(1000);  // Includes 250ms filter settling delay
+  if (!adc.readSample24(discard) || !adc.readSample24(adcAt1000)) {
+    Serial.println("FAIL (ADC timeout)"); return false;
+  }
 
   // Restore DAC
-  setDacCode(0);
+  dac.setCode(0);
 
   // With TMUXSEL=LOW: ADC = (Vx - DAC) * gain
   // If we increase DAC (and Vx stays same), ADC should decrease
@@ -1952,24 +1934,27 @@ bool postTestChopSymmetry() {
   Serial.print("POST: Chop Symmetry... ");
 
   // Set DAC to a known value
-  setDacCode(0);  // Includes 250ms filter settling delay
+  dac.setCode(0);  // Includes 250ms filter settling delay
 
   // Ensure TMUXSEL=LOW, measure (Vx - DAC) * gain
-  if (tmux_sel_state == HIGH) {
-    chop();
+  if (chopper.state()) {
+    chopper.toggle();
   }
   delayMicroseconds(SETTLE_US);  // Mux settling (300µs)
-  (void)adcReadSample24();
-  int32_t phase1 = adcReadSample24();
+  int32_t phase1, phase2, discard;
+  if (!adc.readSample24(discard) || !adc.readSample24(phase1)) {
+    Serial.println("FAIL (ADC timeout)"); return false;
+  }
 
   // Switch to TMUXSEL=HIGH, measure (DAC - Vx) * gain
-  chop();
+  chopper.toggle();
   delayMicroseconds(SETTLE_US);  // Mux settling (300µs)
-  (void)adcReadSample24();
-  int32_t phase2 = adcReadSample24();
+  if (!adc.readSample24(discard) || !adc.readSample24(phase2)) {
+    Serial.println("FAIL (ADC timeout)"); return false;
+  }
 
   // Switch back
-  chop();
+  chopper.toggle();
 
   // Check symmetry: phase1 ≈ -phase2
   // Sum should be near zero (they cancel)
@@ -2015,27 +2000,26 @@ bool postTestChopSymmetry() {
  */
 bool postTestInputMux() {
   Serial.print("POST: Input Mux... ");
-
-  // Save current channel
-  InputChannel savedChannel = getInputChannel();
+  ScopedInstrumentState guard;
 
   // Switch to GND
-  selectInputChannel(InputChannel::GND);
+  inputMux.select(InputChannel::GND);
 
   // Set DAC to 0V for this test
-  setDacCode(0);
+  dac.setCode(0);
 
   // Measure
-  (void)adcReadSample24();
+  int32_t s;
+  if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
   int64_t sum = 0;
   const int numSamples = 5;
   for (int i = 0; i < numSamples; i++) {
-    sum += adcReadSample24();
+    if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
+    sum += s;
   }
   int32_t avg = sum / numSamples;
 
-  // Restore original channel
-  selectInputChannel(savedChannel);
+  // guard restores channel + DAC on scope exit
 
   // With GND selected and DAC at 0V, ADC should read near zero
   // Allow for preamp offset (chopping not running during this test)
@@ -2063,29 +2047,27 @@ bool postTestInputMux() {
  */
 bool postTestReferences() {
   Serial.print("POST: Reference... ");
-
-  // Save current channel
-  InputChannel savedChannel = getInputChannel();
+  ScopedInstrumentState guard;
 
   // Set DAC to ~5V to match the expected reference voltage
   const int16_t dacAt5V = 32764;  // Near +5V, 14-bit aligned
-  setDacCode(dacAt5V);
+  dac.setCode(dacAt5V);
 
   // Measure the raw reference average (J3)
-  selectInputChannel(InputChannel::VrefRaw);
+  inputMux.select(InputChannel::VrefRaw);
   delayMicroseconds(SETTLE_US);
 
-  (void)adcReadSample24();
+  int32_t s;
+  if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
   int64_t sum = 0;
   const int numSamples = 5;
   for (int i = 0; i < numSamples; i++) {
-    sum += adcReadSample24();
+    if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
+    sum += s;
   }
   int32_t reading = sum / numSamples;
 
-  // Restore original channel and DAC
-  selectInputChannel(savedChannel);
-  setDacCode(0);
+  // guard restores channel + DAC on scope exit
 
   // With DAC at ~5V and VrefRaw at ~5V, the ADC should read near zero
   // (the difference × 2000 gain). Allow up to 25% of full scale for
@@ -2116,13 +2098,11 @@ bool postTestReferences() {
  */
 bool postTestZero() {
   Serial.print("POST: Zero Cal... ");
-
-  // Save current state
-  InputChannel savedChannel = getInputChannel();
+  ScopedInstrumentState guard;
 
   // Switch to GND input and set DAC to 0V
-  selectInputChannel(InputChannel::GND);
-  setDacCode(0);
+  inputMux.select(InputChannel::GND);
+  dac.setCode(0);
 
   // Accumulate chopped measurements for accurate zero reading
   LowerMoments zeroStats;
@@ -2130,22 +2110,20 @@ bool postTestZero() {
 
   for (int i = 0; i < numIterations; i++) {
     HalfCycleResult rA = acquireHalfCycle();
-    chop();
+    chopper.toggle();
     HalfCycleResult rB = acquireHalfCycle();
-    chop();
+    chopper.toggle();
 
     if (rA.overflow || rB.overflow) {
       Serial.println("FAIL (overflow during zero measurement)");
-      selectInputChannel(savedChannel);
-      return false;
+      return false;  // guard restores state
     }
 
     double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
     zeroStats.accumulate(demod);
   }
 
-  // Restore original channel
-  selectInputChannel(savedChannel);
+  // guard restores channel + DAC on scope exit
 
   // Convert mean to nanovolts at input
   double zeroMean = zeroStats.mean();
@@ -2225,32 +2203,27 @@ void initRefTracking() {
  * the previous state.
  */
 void measureFilterError() {
-  // Save current state
-  InputChannel savedChannel = currentInputChannel;
-  int16_t savedDac = currentDacCode;
+  ScopedInstrumentState guard;
 
   // Switch to raw reference input
-  selectInputChannel(InputChannel::VrefRaw);
+  inputMux.select(InputChannel::VrefRaw);
 
   // Set DAC to ~5V to measure against the reference
-  setDacCode(REF_MEASURE_DAC_CODE);
+  dac.setCode(REF_MEASURE_DAC_CODE);
 
   // Accumulate multiple chopped measurements for stability
   LowerMoments refStats;
 
   for (int i = 0; i < REF_MEASURE_ITERATIONS; i++) {
     HalfCycleResult rA = acquireHalfCycle();
-    chop();
+    chopper.toggle();
     HalfCycleResult rB = acquireHalfCycle();
-    chop();
+    chopper.toggle();
 
     // Check for overflow (shouldn't happen if references are working)
     if (rA.overflow || rB.overflow) {
       Serial.println("WARNING: Overflow during reference measurement!");
-      // Restore state and abort
-      selectInputChannel(savedChannel);
-      setDacCode(savedDac);
-      return;
+      return;  // guard restores state
     }
 
     // Demodulate and accumulate
@@ -2283,10 +2256,7 @@ void measureFilterError() {
   filterHistoryIdx = (filterHistoryIdx + 1) % FILTER_HISTORY_SIZE;
 
   refTrackingInitialized = true;
-
-  // Restore previous state
-  selectInputChannel(savedChannel);
-  setDacCode(savedDac);
+  // guard restores channel + DAC on scope exit
 }
 
 /**
@@ -2362,118 +2332,170 @@ double getRefCorrectionFactor() {
 }
 
 // ================== CSV / Plotter Output ==================
+// ================== Output Formatting (Strategy Pattern) ==================
 //
-// Three output backends, selected by OutputMode in scanConfig:
-//   Human   - multi-line text with SI prefixes (outputMeasurement, Human case)
-//   CSV     - printCsvHeader() + printCsvRow() per measurement
-//   Plotter - plotterBeginLine/AddChannel/EndLine() per scan sweep
+// Three output backends, selected by OutputMode in scanner.config:
+//   Human   - multi-line text with SI prefixes
+//   CSV     - header + comma-separated values per measurement
+//   Plotter - tab-separated label:value pairs for Arduino Serial Plotter
 //
-// All output is routed through outputMeasurement() except for multi-channel
-// Plotter mode, which is assembled directly in the SCANNING branch of loop()
-// because it needs to collect all channels into a single tab-separated line.
+// All single-channel/ONE_CHANNEL output is routed through outputMeasurement(),
+// which delegates to the active formatter via getFormatter(). Multi-channel
+// Plotter mode is assembled directly in the SCANNING branch of loop() using
+// beginSweep()/formatMeasurement()/endSweep().
 
-/**
- * Print CSV column header. Called once by cmdScanStart() and cmdLogStart()
- * when CSV mode is active, so the host can parse column names.
- */
+struct MeasurementData {
+  InputChannel channel;
+  double voltage;
+  double uncertainty;
+  double adcMean;
+  double adcStdDev;
+  double count;
+  int16_t dacCode;
+  double driftPpb;
+  double adcMin;
+  double adcMax;
+};
+
+class IOutputFormatter {
+public:
+  virtual ~IOutputFormatter() = default;
+  virtual void formatMeasurement(const MeasurementData& data) = 0;
+  virtual void beginSweep() {}
+  virtual void endSweep() {}
+};
+
+class HumanFormatter : public IOutputFormatter {
+public:
+  void formatMeasurement(const MeasurementData& data) override {
+    char vxBuf[32], uncBuf[32];
+    formatVoltage(data.voltage, vxBuf, sizeof(vxBuf), 9);
+    formatVoltage(data.uncertainty, uncBuf, sizeof(uncBuf), 3);
+
+    Serial.print("Vx = ");
+    Serial.print(vxBuf);
+    Serial.print(" +/- ");
+    Serial.print(uncBuf);
+    Serial.print(" (n=");
+    Serial.print(data.count, 0);
+    Serial.print(", DAC=");
+    Serial.print(data.dacCode);
+    Serial.print(", range=");
+    Serial.print(getInputChannelName(data.channel));
+    Serial.println(")");
+
+    Serial.print("  raw: mean=");
+    Serial.print(data.adcMean, 3);
+    Serial.print(", sd=");
+    Serial.print(data.adcStdDev, 3);
+    Serial.print(", min=");
+    Serial.print(data.adcMin, 3);
+    Serial.print(", max=");
+    Serial.println(data.adcMax, 3);
+
+    double filterErr = predictFilterError();
+    Serial.print("  drift: filterErr=");
+    Serial.print(filterErr * 1e9, 1);
+    Serial.print(" nV, driftRate=");
+    Serial.print(estimatedDriftRate * 1e9, 3);
+    Serial.print(" nV/s, correction=");
+    Serial.print(data.driftPpb, 3);
+    Serial.println(" ppb");
+
+    if (scanner.autoZeroValid) {
+      Serial.print("  zero: offset=");
+      Serial.print(scanner.autoZeroOffset * 1e9, 1);
+      Serial.println(" nV");
+    }
+
+    if (allanDev.readingCount() >= 3) {
+      double tau0 = computeTau0();
+      Serial.print("  adev: ");
+      int printed = 0;
+      for (int k = 0; k < allanDev.numOctaves() && printed < 6; k++) {
+        double ad = allanDev.getAdev(k);
+        if (!std::isnan(ad)) {
+          char adBuf[24];
+          formatVoltage(ad, adBuf, sizeof(adBuf), 3);
+          Serial.print("tau=");
+          Serial.print(allanDev.getTau(k, tau0), 1);
+          Serial.print("s:");
+          Serial.print(adBuf);
+          Serial.print("  ");
+          printed++;
+        }
+      }
+      Serial.println();
+    }
+  }
+};
+
 void printCsvHeader() {
   Serial.println("# timestamp_ms,channel,voltage_V,uncertainty_V,stddev_counts,mean_counts,n,dac_code,drift_ppb");
 }
 
-/**
- * Print one CSV data row for a completed channel measurement.
- * Called by outputMeasurement() when outputMode == CSV.
- *
- * Format: timestamp_ms,channel,voltage_V,uncertainty_V,stddev_counts,mean_counts,n,dac_code,drift_ppb
- * All values comma-separated with no spaces, suitable for direct import into
- * spreadsheets or the PC companion script (tools/diffvm.py DataLogger).
- *
- * @param voltage      Corrected voltage in volts (drift + auto-zero applied)
- * @param uncertainty  Standard deviation in volts at the input terminal
- * @param driftPpb     Reference drift correction magnitude in parts-per-billion
- */
-void printCsvRow(InputChannel channel, double voltage, double uncertainty,
-                 double stddevCounts, double meanCounts, int n,
-                 int16_t dacCode, double driftPpb) {
-  Serial.print(millis());
-  Serial.print(',');
-  Serial.print(getChannelShortName(channel));
-  Serial.print(',');
-  Serial.print(voltage, 12);  // Full precision in scientific notation
-  Serial.print(',');
-  Serial.print(uncertainty, 12);
-  Serial.print(',');
-  Serial.print(stddevCounts, 3);
-  Serial.print(',');
-  Serial.print(meanCounts, 3);
-  Serial.print(',');
-  Serial.print(n);
-  Serial.print(',');
-  Serial.print(dacCode);
-  Serial.print(',');
-  Serial.print(driftPpb, 3);
-  Serial.println();
-}
-
-/**
- * Emit one channel's data in Arduino Serial Plotter format ("label:value").
- * Called by plotterAddChannel() to build a tab-separated line.
- *
- * Arduino IDE 2.x Serial Plotter parses "label:value\tlabel:value\n" lines
- * and plots each unique label as a separate trace with auto-legend.
- *
- * When singleChannel is true, appends a second trace "label_sd:value" so
- * the plotter shows both the measurement and its uncertainty.
- *
- * @param singleChannel  If true, append stddev as a second trace
- */
-void printPlotterLine(InputChannel channel, double voltage, double stddev,
-                      bool singleChannel) {
-  Serial.print(getChannelShortName(channel));
-  Serial.print(':');
-  Serial.print(voltage, 12);
-  if (singleChannel) {
-    Serial.print('\t');
-    Serial.print(getChannelShortName(channel));
-    Serial.print("_sd:");
-    Serial.print(stddev, 12);
+class CsvFormatter : public IOutputFormatter {
+public:
+  void formatMeasurement(const MeasurementData& data) override {
+    Serial.print(millis());
+    Serial.print(',');
+    Serial.print(getChannelShortName(data.channel));
+    Serial.print(',');
+    Serial.print(data.voltage, 12);
+    Serial.print(',');
+    Serial.print(data.uncertainty, 12);
+    Serial.print(',');
+    Serial.print(data.adcStdDev, 3);
+    Serial.print(',');
+    Serial.print(data.adcMean, 3);
+    Serial.print(',');
+    Serial.print((int)data.count);
+    Serial.print(',');
+    Serial.print(data.dacCode);
+    Serial.print(',');
+    Serial.print(data.driftPpb, 3);
+    Serial.println();
   }
-}
+};
 
-// Plotter line assembly state. The three functions below are used together
-// to build one plotter output line across multiple channels:
-//
-//   In loop() SCANNING branch (multi-channel):
-//     plotterBeginLine()                       — at first channel
-//     plotterAddChannel(ch1, v1, sd1, false)   — for each channel
-//     plotterAddChannel(ch2, v2, sd2, false)
-//     plotterEndLine()                         — after last channel
-//
-//   In outputMeasurement() (single-channel or IDLE):
-//     plotterBeginLine() → plotterAddChannel() → plotterEndLine()
-
-static bool plotterLineStarted = false;
-
-/** Reset line state. Call before the first plotterAddChannel() of a new line. */
-void plotterBeginLine() {
-  plotterLineStarted = false;
-}
-
-/** Append one channel to the current plotter line. Inserts tab separator
- *  between channels. Delegates to printPlotterLine() for formatting. */
-void plotterAddChannel(InputChannel channel, double voltage, double stddev,
-                       bool singleChannel) {
-  if (plotterLineStarted) {
-    Serial.print('\t');
+class PlotterFormatter : public IOutputFormatter {
+public:
+  void formatMeasurement(const MeasurementData& data) override {
+    if (lineStarted_) Serial.print('\t');
+    Serial.print(getChannelShortName(data.channel));
+    Serial.print(':');
+    Serial.print(data.voltage, 12);
+    bool singleChannel = scanner.config.count <= 1 || scanner.isOneChannel();
+    if (singleChannel) {
+      Serial.print('\t');
+      Serial.print(getChannelShortName(data.channel));
+      Serial.print("_sd:");
+      Serial.print(data.uncertainty, 12);
+    }
+    lineStarted_ = true;
   }
-  printPlotterLine(channel, voltage, stddev, singleChannel);
-  plotterLineStarted = true;
-}
 
-/** Terminate the current plotter line with a newline. */
-void plotterEndLine() {
-  Serial.println();
-  plotterLineStarted = false;
+  void beginSweep() override { lineStarted_ = false; }
+
+  void endSweep() override {
+    Serial.println();
+    lineStarted_ = false;
+  }
+
+private:
+  bool lineStarted_ = false;
+};
+
+static HumanFormatter humanFmt;
+static CsvFormatter csvFmt;
+static PlotterFormatter plotterFmt;
+
+IOutputFormatter& getFormatter() {
+  switch (scanner.config.outputMode) {
+    case OutputMode::CSV:     return csvFmt;
+    case OutputMode::Plotter: return plotterFmt;
+    default:                  return humanFmt;
+  }
 }
 
 // ================== Auto-Zero ==================
@@ -2483,13 +2505,13 @@ void plotterEndLine() {
  *
  * Called by:
  *   - processCommand() on "zero" command (immediate manual calibration)
- *   - loop() SCANNING branch every scanConfig.autoZeroInterval sweeps
+ *   - loop() SCANNING branch every scanner.config.autoZeroInterval sweeps
  *
  * Procedure:
  *   1. Save current input channel and DAC code
  *   2. Switch mux to GND, run binarySearchDAC() to find DAC null point
  *   3. Run 20 chopped measurement cycles to determine offset
- *   4. Store result in autoZeroOffset (volts); set autoZeroValid = true
+ *   4. Store result in scanner.autoZeroOffset (volts); set scanner.autoZeroValid = true
  *   5. Restore original channel and DAC code
  *
  * The measured offset is subtracted from all subsequent voltage readings
@@ -2501,13 +2523,11 @@ void plotterEndLine() {
  * normal measurements are paused.
  */
 void performAutoZero() {
-  // Save current state
-  InputChannel savedChannel = currentInputChannel;
-  int16_t savedDac = currentDacCode;
+  ScopedInstrumentState guard;
 
   // Switch to GND
-  selectInputChannel(InputChannel::GND);
-  setDacCode(0);
+  inputMux.select(InputChannel::GND);
+  dac.setCode(0);
 
   // Run binary search for GND (should converge quickly near 0)
   binarySearchDAC();
@@ -2518,15 +2538,13 @@ void performAutoZero() {
 
   for (int i = 0; i < numIterations; i++) {
     HalfCycleResult rA = acquireHalfCycle();
-    chop();
+    chopper.toggle();
     HalfCycleResult rB = acquireHalfCycle();
-    chop();
+    chopper.toggle();
 
     if (rA.overflow || rB.overflow) {
       Serial.println("WARNING: Overflow during auto-zero!");
-      selectInputChannel(savedChannel);
-      setDacCode(savedDac);
-      return;
+      return;  // guard restores state
     }
 
     double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
@@ -2534,12 +2552,9 @@ void performAutoZero() {
   }
 
   // Compute zero offset
-  autoZeroOffset = computeInputVoltage(gndStats.mean(), currentDacCode, InputChannel::GND);
-  autoZeroValid = true;
-
-  // Restore previous state
-  selectInputChannel(savedChannel);
-  setDacCode(savedDac);
+  scanner.autoZeroOffset = computeInputVoltage(gndStats.mean(), dac.currentCode(), InputChannel::GND);
+  scanner.autoZeroValid = true;
+  // guard restores channel + DAC on scope exit
 }
 
 // ================== EEPROM Configuration ==================
@@ -2592,15 +2607,15 @@ uint16_t crc16(const uint8_t* data, size_t len) {
 /**
  * Save current runtime configuration to EEPROM.
  * Called by processCommand() on "config save". Serializes scanConfig,
- * configAutoStart, and currentDividerRatio into a SavedConfig blob
+ * configAutoStart, and divider ratio into a SavedConfig blob
  * with magic number and CRC16, then writes byte-by-byte to EEPROM.
  */
 void cmdConfigSave() {
   SavedConfig saved;
   saved.magic = EEPROM_MAGIC;
-  saved.scanConfig = scanConfig;
+  saved.scanConfig = scanner.config;
   saved.autoStart = configAutoStart;
-  saved.dividerRatio = currentDividerRatio;
+  saved.dividerRatio = divMux.current();
 
   // Compute checksum over everything except the checksum field itself
   saved.checksum = crc16((const uint8_t*)&saved, offsetof(SavedConfig, checksum));
@@ -2647,10 +2662,10 @@ bool loadConfigFromEEPROM(SavedConfig &saved) {
  * Copies scanConfig, sets configAutoStart, and adjusts divider ratio if changed.
  */
 void applyConfig(const SavedConfig &saved) {
-  scanConfig = saved.scanConfig;
+  scanner.config = saved.scanConfig;
   configAutoStart = saved.autoStart;
-  if (saved.dividerRatio != currentDividerRatio) {
-    selectDividerRatio(saved.dividerRatio);
+  if (saved.dividerRatio != divMux.current()) {
+    divMux.select(saved.dividerRatio);
   }
 }
 
@@ -2671,18 +2686,18 @@ void cmdConfigLoad() {
  * Stops any active scan and invalidates the auto-zero offset.
  */
 void cmdConfigFactory() {
-  scanConfig.channels[0] = InputChannel::Vx;
-  scanConfig.count = 1;
-  scanConfig.integrationCycles = 100;
-  scanConfig.autoZeroEnabled = true;
-  scanConfig.autoZeroInterval = 10;
-  scanConfig.outputMode = OutputMode::Human;
+  scanner.config.channels[0] = InputChannel::Vx;
+  scanner.config.count = 1;
+  scanner.config.integrationCycles = 100;
+  scanner.config.autoZeroEnabled = true;
+  scanner.config.autoZeroInterval = 10;
+  scanner.config.outputMode = OutputMode::Human;
   configAutoStart = false;
-  autoZeroOffset = 0.0;
-  autoZeroValid = false;
-  clearChannelDacCodes();
+  scanner.autoZeroOffset = 0.0;
+  scanner.autoZeroValid = false;
+  scanner.clearDacCache();
   allanDev.clear();
-  scanState = ScanState::IDLE;
+  scanner.stop();
   Serial.println("Factory defaults restored (not saved to EEPROM).");
 }
 
@@ -2731,18 +2746,10 @@ void cmdConfigShow() {
 
 /**
  * Compute corrected voltage and output a single channel measurement result.
- * Central output function: all three output modes (Human, CSV, Plotter) are
- * routed through here, except multi-channel Plotter which is assembled
- * directly in loop()'s SCANNING branch.
+ * Delegates formatting to the active IOutputFormatter selected by outputMode.
  *
- * Called by:
- *   - loop() IDLE branch: every integrationCycles with chopStats
- *   - loop() SCANNING branch: after each channel completes integration
- *
- * Voltage computation pipeline:
- *   1. computeInputVoltage() — DAC code + ADC mean → raw voltage
- *   2. getRefCorrectionFactor() — multiply by reference drift correction
- *   3. Subtract autoZeroOffset if valid
+ * Multi-channel Plotter mode is assembled directly in loop()'s SCANNING
+ * branch using beginSweep()/formatMeasurement()/endSweep().
  *
  * @param channel  Which input channel was measured
  * @param stats    LowerMoments accumulator with the measurement data
@@ -2752,160 +2759,71 @@ void outputMeasurement(InputChannel channel, LowerMoments &stats, int16_t dacCod
   double adcMean = stats.mean();
   double adcStdDev = stats.standardDeviation();
 
-  // Compute voltage
   double vxRaw = computeInputVoltage(adcMean, dacCode, channel);
   double vxUncertainty = computeInputUncertainty(adcStdDev, channel);
 
-  // Apply reference drift correction
   double refCorrection = getRefCorrectionFactor();
   double vxCorrected = vxRaw * refCorrection;
-
-  // Apply auto-zero correction if valid
-  if (autoZeroValid) {
-    vxCorrected -= autoZeroOffset;
+  if (scanner.autoZeroValid) {
+    vxCorrected -= scanner.autoZeroOffset;
   }
 
   double driftPpb = (refCorrection - 1.0) * 1e9;
 
-  // Feed corrected voltage to Allan deviation tracker
   allanDev.addReading(vxCorrected);
 
-  switch (scanConfig.outputMode) {
-    case OutputMode::CSV:
-      printCsvRow(channel, vxCorrected, vxUncertainty,
-                  adcStdDev, adcMean, (int)stats.count(),
-                  dacCode, driftPpb);
-      break;
+  MeasurementData data{channel, vxCorrected, vxUncertainty,
+                       adcMean, adcStdDev, stats.count(),
+                       dacCode, driftPpb, stats.getMin(), stats.getMax()};
 
-    case OutputMode::Plotter:
-      // Plotter output is handled at the scan-sweep level for multi-channel
-      // For single-channel or IDLE mode, output directly
-      if (scanState == ScanState::IDLE || scanConfig.count <= 1) {
-        plotterBeginLine();
-        plotterAddChannel(channel, vxCorrected, vxUncertainty,
-                          scanConfig.count <= 1);
-        plotterEndLine();
-      }
-      // Multi-channel plotter is assembled in the scanning state machine
-      break;
-
-    case OutputMode::Human:
-    default: {
-      char vxBuf[32], uncBuf[32];
-      formatVoltage(vxCorrected, vxBuf, sizeof(vxBuf), 9);
-      formatVoltage(vxUncertainty, uncBuf, sizeof(uncBuf), 3);
-
-      Serial.print("Vx = ");
-      Serial.print(vxBuf);
-      Serial.print(" +/- ");
-      Serial.print(uncBuf);
-      Serial.print(" (n=");
-      Serial.print(stats.count(), 0);
-      Serial.print(", DAC=");
-      Serial.print(dacCode);
-      Serial.print(", range=");
-      Serial.print(getInputChannelName(channel));
-      Serial.println(")");
-
-      Serial.print("  raw: mean=");
-      Serial.print(adcMean, 3);
-      Serial.print(", sd=");
-      Serial.print(adcStdDev, 3);
-      Serial.print(", min=");
-      Serial.print(stats.getMin(), 3);
-      Serial.print(", max=");
-      Serial.println(stats.getMax(), 3);
-
-      double filterErr = predictFilterError();
-      Serial.print("  drift: filterErr=");
-      Serial.print(filterErr * 1e9, 1);
-      Serial.print(" nV, driftRate=");
-      Serial.print(estimatedDriftRate * 1e9, 3);
-      Serial.print(" nV/s, correction=");
-      Serial.print(driftPpb, 3);
-      Serial.println(" ppb");
-
-      if (autoZeroValid) {
-        Serial.print("  zero: offset=");
-        Serial.print(autoZeroOffset * 1e9, 1);
-        Serial.println(" nV");
-      }
-
-      if (allanDev.readingCount() >= 3) {
-        double tau0 = computeTau0();
-        Serial.print("  adev: ");
-        int printed = 0;
-        for (int k = 0; k < allanDev.numOctaves() && printed < 6; k++) {
-          double ad = allanDev.getAdev(k);
-          if (!std::isnan(ad)) {
-            char adBuf[24];
-            formatVoltage(ad, adBuf, sizeof(adBuf), 3);
-            Serial.print("tau=");
-            Serial.print(allanDev.getTau(k, tau0), 1);
-            Serial.print("s:");
-            Serial.print(adBuf);
-            Serial.print("  ");
-            printed++;
-          }
-        }
-        Serial.println();
-      }
-      break;
-    }
-  }
+  IOutputFormatter& fmt = getFormatter();
+  fmt.beginSweep();
+  fmt.formatMeasurement(data);
+  fmt.endSweep();
 }
 
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 2000) {}
 
-  // Configure all pins
+  // Configure ADC pins
   pinMode(PIN_CS_ADC,     OUTPUT);
+  csHigh(PIN_CS_ADC);
+  pinMode(PIN_ADC_DRDY,   INPUT);
+
+  // Configure DAC pins
   pinMode(PIN_CS_DAC,     OUTPUT);
+  csHigh(PIN_CS_DAC);
   pinMode(PIN_DAC_RESET,  OUTPUT);
   pinMode(PIN_DAC_CLEAR,  OUTPUT);
-  pinMode(PIN_ADC_DRDY,   INPUT); // no pullup needed, dedicated output from adc to teensy
-  pinMode(PIN_TMUX_EN,    OUTPUT);
-  pinMode(PIN_TMUXSEL,    OUTPUT);
-  pinMode(PIN_CI_TMUXSEL, OUTPUT);
+  digitalWrite(PIN_DAC_RESET, HIGH);
+  digitalWrite(PIN_DAC_CLEAR, HIGH);
 
-  // Set initial pin states
-  csHigh(PIN_CS_ADC);
-  csHigh(PIN_CS_DAC);
-  digitalWrite(PIN_DAC_RESET, HIGH);  // Keep DAC out of reset
-  digitalWrite(PIN_DAC_CLEAR, HIGH);  // Keep DAC clear inactive (active low)
-  digitalWrite(PIN_TMUXSEL, LOW);
-  digitalWrite(PIN_CI_TMUXSEL, LOW);
-  digitalWriteFast(PIN_TMUX_EN, LOW);
-
-  // Initialize input multiplexer (MUX36S08)
-  initInputMux();
-
-  // Initialize HV divider ratio control (MUX36D04)
-  initDividerControl();
+  // Initialize hardware drivers
+  chopper.begin();
+  inputMux.begin();
+  divMux.begin();
 
   // Initialize DAC calibration table with nominal values
-  // (will be overwritten if calibration data is loaded)
-  initDacCalTable();
+  dacCalTable.initNominal();
 
   // Initialize per-channel DAC code cache
-  clearChannelDacCodes();
+  scanner.clearDacCache();
 
   // Initialize reference drift tracking
   initRefTracking();
 
   // Set external clock for ADS127L11
-  analogWriteFrequency(PIN_CLK_ADC, 25000000);
-  analogWrite(PIN_CLK_ADC, 128);
+  adc.begin();
 
   // Initialize SPI before using it
   SPI.begin();
 
   // Initialize DAC (SPI must be ready first)
-  initDAC_2xMode();
+  dac.begin();
 
   Serial.println("Starting ADC init...");
-  adcInitAndConfigure();
+  adc.initAndConfigure();
 
   // Enable the mux
   digitalWriteFast(PIN_TMUX_EN, HIGH);
@@ -2952,7 +2870,7 @@ void setup() {
   Serial.print(ADC_LSB_V / PREAMP_GAIN * 1e9, 3);
   Serial.println(" nV/count");
   Serial.print("DAC cal table: ");
-  Serial.println(dacCalTableValid ? "CALIBRATED" : "nominal (uncalibrated)");
+  Serial.println(dacCalTable.isValid() ? "CALIBRATED" : "nominal (uncalibrated)");
   Serial.println("====================================\n");
 
   // Load saved configuration from EEPROM (if valid)
@@ -2968,7 +2886,7 @@ void setup() {
   printStatus();
 
   // Auto-start scanning if configured
-  if (configAutoStart && scanConfig.count > 0) {
+  if (configAutoStart && scanner.config.count > 0) {
     Serial.println("Auto-starting scan...");
     cmdScanStart();
   }
@@ -2979,12 +2897,12 @@ void setup() {
 /**
  * Execute one complete chop cycle and accumulate the demodulated result.
  *
- * Called by loop() on every iteration (both IDLE and SCANNING modes).
+ * Called by loop() on every iteration (both ONE_CHANNEL and SCANNING modes).
  * Encapsulates the core measurement sequence that was previously inline in loop():
  *   1. acquireHalfCycle() — phase A (current TMUX state)
- *   2. chop() — toggle TMUX with charge-injection minimization
+ *   2. chopper.toggle() — toggle TMUX with charge-injection minimization
  *   3. acquireHalfCycle() — phase B (opposite TMUX state)
- *   4. chop() — restore original state for next cycle
+ *   4. chopper.toggle() — restore original state for next cycle
  *   5. Demodulate: (sumA - sumB) / (2 × GOOD_SAMPLES) → cancels offset/1/f
  *   6. Accumulate into stats
  *
@@ -2992,7 +2910,7 @@ void setup() {
  * the DAC and clears stats since the measurement baseline changed.
  *
  * @param stats  LowerMoments accumulator to add the demodulated sample to.
- *               In IDLE mode this is chopStats; in SCANNING mode it's
+ *               In ONE_CHANNEL mode this is chopStats; in SCANNING mode it's
  *               channelStats[currentChannel].
  * @return       true if measurement succeeded, false if overflow occurred
  *               (caller should skip output and retry on next loop iteration)
@@ -3006,18 +2924,18 @@ bool runOneChopCycle(LowerMoments &stats) {
     return false;
   }
 
-  chop();
+  chopper.toggle();
 
   HalfCycleResult resultB = acquireHalfCycle();
 
   if (resultB.overflow) {
-    chop();  // Return to original state
+    chopper.toggle();  // Return to original state
     binarySearchDAC();
     stats.clear();
     return false;
   }
 
-  chop();
+  chopper.toggle();
 
   double demodulated = (double)(resultA.sum - resultB.sum) / (2.0 * GOOD_SAMPLES);
   stats.accumulate(demodulated);
@@ -3032,13 +2950,13 @@ bool runOneChopCycle(LowerMoments &stats) {
  *   2. Reference drift tracking — measureFilterError() every ~1 second
  *   3. State machine branch:
  *
- *   IDLE mode:
+ *   ONE_CHANNEL mode:
  *     - Measures currentInputChannel continuously using chopStats
  *     - Outputs a reading every integrationCycles via outputMeasurement()
  *     - Stats accumulate indefinitely (not cleared between outputs)
  *
  *   SCANNING mode:
- *     - Cycles through scanConfig.channels[0..count-1]
+ *     - Cycles through scanner.config.channels[0..count-1]
  *     - For each channel:
  *         a. Switch mux + binarySearchDAC() (on channel change)
  *         b. Discard SCAN_SETTLE_CYCLES chop cycles for settling
@@ -3059,104 +2977,108 @@ void loop() {
     measureFilterError();
   }
 
-  // ---- IDLE MODE: measure current channel continuously ----
-  if (scanState == ScanState::IDLE) {
+  // ---- ONE_CHANNEL MODE: measure current channel continuously ----
+  if (scanner.isOneChannel()) {
     if (!runOneChopCycle(chopStats)) {
       return;  // Overflow handled, restart
     }
 
-    // Output every integrationCycles
-    static int idleCounter = 0;
-    if (++idleCounter >= scanConfig.integrationCycles) {
-      idleCounter = 0;
-      outputMeasurement(currentInputChannel, chopStats, currentDacCode);
-      // Don't clear stats in IDLE mode - accumulates continuously
+    // Output every integrationCycles, then clear for fixed-window integration
+    static int loopCounter = 0;
+    if (++loopCounter >= scanner.config.integrationCycles) {
+      loopCounter = 0;
+      outputMeasurement(inputMux.current(), chopStats, dac.currentCode());
+      chopStats.clear();
     }
     return;
   }
 
   // ---- SCANNING MODE ----
-  InputChannel scanCh = scanConfig.channels[currentScanIndex];
+  InputChannel scanCh = scanner.config.channels[scanner.currentScanIndex()];
 
   // Run one chop cycle on the current channel
-  LowerMoments &stats = channelStats[(uint8_t)scanCh];
+  LowerMoments &stats = scanner.channelStats((uint8_t)scanCh);
   if (!runOneChopCycle(stats)) {
-    chopCycleCount = 0;  // Reset after overflow/DAC change
+    scanner.setChopCycleCount(0);  // Reset after overflow/DAC change
     // Save the re-centered DAC code for this channel
-    channelDacCode[(uint8_t)scanCh] = currentDacCode;
-    channelDacValid[(uint8_t)scanCh] = true;
+    scanner.setChannelDac((uint8_t)scanCh, dac.currentCode());
     return;
   }
 
-  chopCycleCount++;
+  scanner.incChopCycleCount();
 
   // Discard initial settling cycles after channel switch
-  if (chopCycleCount <= SCAN_SETTLE_CYCLES) {
+  if (scanner.chopCycleCount() <= SCAN_SETTLE_CYCLES) {
     stats.clear();
     return;
   }
 
   // Check if integration is complete for this channel
-  if (chopCycleCount >= scanConfig.integrationCycles + SCAN_SETTLE_CYCLES) {
+  if (scanner.chopCycleCount() >= scanner.config.integrationCycles + SCAN_SETTLE_CYCLES) {
     // Output this channel's result
     // For multi-channel plotter mode, we buffer all channels and print one line per sweep
-    if (scanConfig.outputMode == OutputMode::Plotter && scanConfig.count > 1) {
-      // Compute voltage for plotter
+    if (scanner.config.outputMode == OutputMode::Plotter && scanner.config.count > 1) {
+      // Multi-channel plotter: assemble one tab-separated line per sweep
       double adcMean = stats.mean();
       double adcStdDev = stats.standardDeviation();
-      double vxRaw = computeInputVoltage(adcMean, currentDacCode, scanCh);
+      double vxRaw = computeInputVoltage(adcMean, dac.currentCode(), scanCh);
       double refCorrection = getRefCorrectionFactor();
       double vxCorrected = vxRaw * refCorrection;
-      if (autoZeroValid) vxCorrected -= autoZeroOffset;
+      if (scanner.autoZeroValid) vxCorrected -= scanner.autoZeroOffset;
       double vxUncertainty = computeInputUncertainty(adcStdDev, scanCh);
+      double driftPpb = (refCorrection - 1.0) * 1e9;
 
-      if (currentScanIndex == 0) plotterBeginLine();
-      plotterAddChannel(scanCh, vxCorrected, vxUncertainty, false);
-      if (currentScanIndex == scanConfig.count - 1) plotterEndLine();
+      MeasurementData data{scanCh, vxCorrected, vxUncertainty,
+                           adcMean, adcStdDev, stats.count(),
+                           dac.currentCode(), driftPpb,
+                           stats.getMin(), stats.getMax()};
+
+      IOutputFormatter& fmt = getFormatter();
+      if (scanner.currentScanIndex() == 0) fmt.beginSweep();
+      fmt.formatMeasurement(data);
+      if (scanner.currentScanIndex() == scanner.config.count - 1) fmt.endSweep();
     } else {
-      outputMeasurement(scanCh, stats, currentDacCode);
+      outputMeasurement(scanCh, stats, dac.currentCode());
     }
 
     // Save DAC code for this channel (for fast restore on next visit)
-    channelDacCode[(uint8_t)scanCh] = currentDacCode;
-    channelDacValid[(uint8_t)scanCh] = true;
+    scanner.setChannelDac((uint8_t)scanCh, dac.currentCode());
 
     // Advance to next channel
-    currentScanIndex++;
+    scanner.setCurrentScanIndex(scanner.currentScanIndex() + 1);
 
-    if (currentScanIndex >= scanConfig.count) {
+    if (scanner.currentScanIndex() >= scanner.config.count) {
       // Completed one full sweep
-      currentScanIndex = 0;
-      scanCycleCount++;
+      scanner.setCurrentScanIndex(0);
+      scanner.incScanCycleCount();
 
       // Check if auto-zero is due
-      if (scanConfig.autoZeroEnabled &&
-          (scanCycleCount % scanConfig.autoZeroInterval) == 0) {
+      if (scanner.config.autoZeroEnabled &&
+          (scanner.scanCycleCount() % scanner.config.autoZeroInterval) == 0) {
         performAutoZero();
-        if (autoZeroValid && scanConfig.outputMode == OutputMode::Human) {
+        if (scanner.autoZeroValid && scanner.config.outputMode == OutputMode::Human) {
           Serial.print("  [auto-zero: offset=");
-          Serial.print(autoZeroOffset * 1e9, 1);
+          Serial.print(scanner.autoZeroOffset * 1e9, 1);
           Serial.println(" nV]");
         }
       }
     }
 
     // Switch to next channel
-    InputChannel nextCh = scanConfig.channels[currentScanIndex];
-    if (nextCh != currentInputChannel) {
-      selectInputChannel(nextCh);
+    InputChannel nextCh = scanner.config.channels[scanner.currentScanIndex()];
+    if (nextCh != inputMux.current()) {
+      inputMux.select(nextCh);
       uint8_t idx = (uint8_t)nextCh;
-      if (channelDacValid[idx]) {
+      if (scanner.channelDacValid(idx)) {
         // Restore saved DAC code (fast path: only filter settling, no search)
-        setDacCode(channelDacCode[idx]);
+        dac.setCode(scanner.channelDacCode(idx));
       } else {
         // First visit to this channel: full binary search
         binarySearchDAC();
-        channelDacCode[idx] = currentDacCode;
-        channelDacValid[idx] = true;
+        scanner.setChannelDac(idx, dac.currentCode());
       }
     }
-    channelStats[(uint8_t)nextCh].clear();
-    chopCycleCount = 0;
+    scanner.channelStats((uint8_t)nextCh).clear();
+    scanner.setChopCycleCount(0);
   }
 }
