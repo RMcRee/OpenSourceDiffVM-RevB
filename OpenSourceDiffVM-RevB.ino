@@ -20,6 +20,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 #include <EEPROM.h>
+#include <LittleFS.h>
 
 // ---------------- Forward Declarations ----------------
 // Types must be declared before Arduino auto-generates function prototypes
@@ -36,6 +37,7 @@ class ChopperDriver;
 class DacDriver;
 class AdcDriver;
 class DacCalibrationTable;
+class CalibrationStore;
 class IOutputFormatter;
 struct MeasurementData;
 struct SavedConfig;
@@ -139,9 +141,14 @@ enum class DividerRatio : uint8_t {
 // Calculated ratios for Caddock 1776-C4815 serial-parallel divider
 // Segments: 10M, 1.1111M, 101.01K, 10.01K (4 dividers as 2 parallel pairs in series)
 // MUX path = Rseg/2 + Rseg/2 + 250Ω; base 1M arm = 1.1111M (always in circuit)
-static constexpr double DIVIDER_RATIO_10   = 10.0;      // ±50V: mux bypassed
-static constexpr double DIVIDER_RATIO_100  = 108.76;    // ±500V: 1.1111M || 101.26K
-static constexpr double DIVIDER_RATIO_1000 = 984.65;    // ±5kV: 1.1111M || 10.26K
+// Runtime-mutable for in-situ calibration; defaults match calculated values.
+// Use 'cal set div10/div100/div1000 <v>' to adjust; 'cal factory' to reset.
+static constexpr double DIVIDER_RATIO_10_DEFAULT   = 10.0;
+static constexpr double DIVIDER_RATIO_100_DEFAULT  = 108.76;
+static constexpr double DIVIDER_RATIO_1000_DEFAULT = 984.65;
+static double DIVIDER_RATIO_10   = DIVIDER_RATIO_10_DEFAULT;    // ±50V: mux bypassed
+static double DIVIDER_RATIO_100  = DIVIDER_RATIO_100_DEFAULT;   // ±500V: 1.1111M || 101.26K
+static double DIVIDER_RATIO_1000 = DIVIDER_RATIO_1000_DEFAULT;  // ±5kV: 1.1111M || 10.26K
 
 // ---------------- Overflow Detection ----------------
 // 24-bit ADC full scale: ±8,388,607. Use 90% threshold for overflow detection.
@@ -162,7 +169,9 @@ static constexpr double DAC_FSR_CODES   = 65536.0;                       // 2^16
 static constexpr double DAC_LSB_V       = (2.0 * DAC_VREF) / DAC_FSR_CODES;  // ~152.6 µV/LSB
 
 // Preamp: 4× AD8428 in cascade, total gain = 2000
-static constexpr double PREAMP_GAIN     = 2000.0;
+// Runtime-mutable for in-situ calibration. Use 'cal set gain <v>' to adjust.
+static constexpr double PREAMP_GAIN_DEFAULT = 2000.0;
+static double PREAMP_GAIN = PREAMP_GAIN_DEFAULT;
 
 // ---------------- Reference Drift Compensation ----------------
 // The DAC reference comes from a filtered average of three ADR1001 references.
@@ -252,6 +261,11 @@ public:
 
   void markValid() { valid_ = true; }
   bool isValid() const { return valid_; }
+
+  // Raw table access for CalibrationStore flash I/O
+  double* rawTable() { return table_; }
+  const double* rawTable() const { return table_; }
+  friend class CalibrationStore;
 
 private:
   double table_[TABLE_SIZE];
@@ -1506,6 +1520,15 @@ void printStatus() {
   Serial.print("Divider ratio: ");
   Serial.println(getDividerRatioName(divMux.current()));
 
+  Serial.print("Preamp gain: ");
+  Serial.println(PREAMP_GAIN, 4);
+  Serial.print("Divider ratios: ÷10=");
+  Serial.print(DIVIDER_RATIO_10, 4);
+  Serial.print("  ÷100=");
+  Serial.print(DIVIDER_RATIO_100, 4);
+  Serial.print("  ÷1000=");
+  Serial.println(DIVIDER_RATIO_1000, 4);
+
   Serial.print("DAC calibration: ");
   Serial.println(dacCalTable.isValid() ? "CALIBRATED" : "nominal");
 
@@ -1537,6 +1560,15 @@ void printHelp() {
   Serial.println("config autostart on|off  Auto-start scanning on boot");
   Serial.println("config show         Show saved vs current config");
   Serial.println("adev [clear]          Show Allan deviation (or clear history)");
+  Serial.println("cal status            Show calibration flash status and current values");
+  Serial.println("cal save              Save constants + DAC table to flash");
+  Serial.println("cal load              Reload constants + DAC table from flash");
+  Serial.println("cal erase             Erase calibration files from flash");
+  Serial.println("cal set gain <v>      Set PREAMP_GAIN (e.g. 1998.5)");
+  Serial.println("cal set div10 <v>     Set DIVIDER_RATIO_10");
+  Serial.println("cal set div100 <v>    Set DIVIDER_RATIO_100");
+  Serial.println("cal set div1000 <v>   Set DIVIDER_RATIO_1000");
+  Serial.println("cal factory           Reset cal constants to factory defaults (RAM)");
   Serial.println("help                Show this help");
   Serial.println("=======================\n");
 }
@@ -1567,6 +1599,9 @@ void cmdConfigFactory();
 void cmdConfigAutostart(const char* arg);
 void cmdConfigShow();
 
+// cmdCal() is defined after CalibrationStore (further below); forward declare here.
+void cmdCal(const char* arg1, const char* arg2, const char* arg3);
+
 /**
  * Parse and execute a complete command line from the serial buffer.
  * Called by processSerialCommands() when a newline is received.
@@ -1586,6 +1621,7 @@ void processCommand(char* line) {
   char* cmd = strtok(line, " \t");
   char* arg1 = strtok(NULL, " \t");
   char* arg2 = strtok(NULL, " \t");
+  char* arg3 = strtok(NULL, " \t");
 
   if (strcasecmp(cmd, "scan") == 0) {
     if (!arg1) { Serial.println("Usage: scan add|remove|list|clear|start|stop"); return; }
@@ -1653,6 +1689,8 @@ void processCommand(char* line) {
     else Serial.println("Usage: config save|load|factory|autostart|show");
   } else if (strcasecmp(cmd, "adev") == 0) {
     cmdAdev(arg1);
+  } else if (strcasecmp(cmd, "cal") == 0) {
+    cmdCal(arg1, arg2, arg3);
   } else if (strcasecmp(cmd, "help") == 0) {
     printHelp();
   } else {
@@ -2604,6 +2642,321 @@ uint16_t crc16(const uint8_t* data, size_t len) {
   return crc;
 }
 
+// ================== CalibrationStore ==================
+// Persists DAC calibration table and preamp/divider constants to LittleFS
+// flash (512 KB partition on Teensy 4.1 QSPI flash).
+
+static constexpr uint32_t CAL_CONSTS_MAGIC = 0xCA1C0001UL;  // "CALC" v1
+static constexpr uint32_t CAL_TABLE_MAGIC  = 0xDACC0001UL;  // "DACC" v1
+static constexpr uint32_t CAL_LFS_SIZE     = 512UL * 1024UL; // 512 KB partition
+
+class CalibrationStore {
+public:
+  // Mount LittleFS_Program; format if first use. Returns true on success.
+  bool begin() {
+    if (!fs_.begin(CAL_LFS_SIZE)) {
+      return false;
+    }
+    mounted_ = true;
+    return true;
+  }
+
+  bool isMounted() const { return mounted_; }
+
+  // Write preampGain + divider ratios to /cal_consts.bin
+  // Format: [4] magic [2] version [8×4=32] four doubles [2] CRC16 = 40 bytes
+  bool saveConstants() {
+    if (!mounted_) return false;
+    File f = fs_.open("/cal_consts.bin", FILE_WRITE);
+    if (!f) return false;
+
+    uint8_t buf[40];
+    size_t pos = 0;
+
+    uint32_t magic = CAL_CONSTS_MAGIC;
+    memcpy(buf + pos, &magic, 4); pos += 4;
+    uint16_t ver = 1;
+    memcpy(buf + pos, &ver, 2); pos += 2;
+    memcpy(buf + pos, &PREAMP_GAIN, 8); pos += 8;
+    memcpy(buf + pos, &DIVIDER_RATIO_10, 8); pos += 8;
+    memcpy(buf + pos, &DIVIDER_RATIO_100, 8); pos += 8;
+    memcpy(buf + pos, &DIVIDER_RATIO_1000, 8); pos += 8;
+    uint16_t crc = crc16(buf, pos);
+    memcpy(buf + pos, &crc, 2); pos += 2;
+
+    f.write(buf, pos);
+    f.close();
+    return true;
+  }
+
+  // Read constants from /cal_consts.bin and apply them if valid.
+  bool loadConstants() {
+    if (!mounted_) return false;
+    File f = fs_.open("/cal_consts.bin", FILE_READ);
+    if (!f) return false;
+
+    uint8_t buf[40];
+    size_t n = f.read(buf, sizeof(buf));
+    f.close();
+    if (n < 40) return false;
+
+    uint32_t magic; memcpy(&magic, buf, 4);
+    if (magic != CAL_CONSTS_MAGIC) return false;
+
+    uint16_t storedCrc; memcpy(&storedCrc, buf + 38, 2);
+    if (crc16(buf, 38) != storedCrc) return false;
+
+    double pg, d10, d100, d1000;
+    memcpy(&pg,    buf + 6,  8);
+    memcpy(&d10,   buf + 14, 8);
+    memcpy(&d100,  buf + 22, 8);
+    memcpy(&d1000, buf + 30, 8);
+
+    // Sanity bounds: refuse obviously wrong values
+    if (pg < 100.0 || pg > 100000.0) return false;
+    if (d10 < 1.0  || d10 > 100.0)   return false;
+    if (d100 < 10.0 || d100 > 10000.0) return false;
+    if (d1000 < 100.0 || d1000 > 100000.0) return false;
+
+    PREAMP_GAIN       = pg;
+    DIVIDER_RATIO_10  = d10;
+    DIVIDER_RATIO_100 = d100;
+    DIVIDER_RATIO_1000 = d1000;
+    return true;
+  }
+
+  // Write dacCalTable to /dac_table.bin using streaming to avoid 131 KB buffer.
+  // Format: [4] magic [2] version [1] valid [1] reserved [131072] table [2] CRC16
+  bool saveTable() {
+    if (!mounted_) return false;
+    if (!dacCalTable.isValid()) {
+      Serial.println("cal save: DAC table not valid; not saving table.");
+      return false;
+    }
+    File f = fs_.open("/dac_table.bin", FILE_WRITE);
+    if (!f) return false;
+
+    uint16_t crc = 0xFFFF; // Running CRC16
+
+    // Header (8 bytes)
+    uint8_t hdr[8];
+    uint32_t magic = CAL_TABLE_MAGIC;
+    memcpy(hdr, &magic, 4);
+    uint16_t ver = 1; memcpy(hdr + 4, &ver, 2);
+    hdr[6] = 1;  // valid flag
+    hdr[7] = 0;  // reserved
+    // Update CRC over header
+    for (int i = 0; i < 8; i++) {
+      crc ^= hdr[i];
+      for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+    }
+    f.write(hdr, 8);
+
+    // Stream table in 512-byte (64 double) chunks
+    static constexpr size_t CHUNK = 512;
+    uint8_t chunk[CHUNK];
+    const uint8_t* tableBytes = reinterpret_cast<const uint8_t*>(dacCalTable.rawTable());
+    size_t totalBytes = DacCalibrationTable::TABLE_SIZE * sizeof(double);
+
+    for (size_t offset = 0; offset < totalBytes; offset += CHUNK) {
+      size_t sz = min((size_t)CHUNK, totalBytes - offset);
+      memcpy(chunk, tableBytes + offset, sz);
+      for (size_t i = 0; i < sz; i++) {
+        crc ^= chunk[i];
+        for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+      }
+      f.write(chunk, sz);
+    }
+
+    // Write final CRC
+    uint8_t crcBuf[2];
+    memcpy(crcBuf, &crc, 2);
+    f.write(crcBuf, 2);
+    f.close();
+    return true;
+  }
+
+  // Read dacCalTable from /dac_table.bin; only applies if CRC valid.
+  bool loadTable() {
+    if (!mounted_) return false;
+    File f = fs_.open("/dac_table.bin", FILE_READ);
+    if (!f) return false;
+
+    // Read and validate header
+    uint8_t hdr[8];
+    if (f.read(hdr, 8) != 8) { f.close(); return false; }
+
+    uint32_t magic; memcpy(&magic, hdr, 4);
+    if (magic != CAL_TABLE_MAGIC) { f.close(); return false; }
+    if (hdr[6] != 1) { f.close(); return false; } // valid flag
+
+    uint16_t crc = 0xFFFF;
+    for (int i = 0; i < 8; i++) {
+      crc ^= hdr[i];
+      for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+    }
+
+    // Stream table data into dacCalTable
+    static constexpr size_t CHUNK = 512;
+    uint8_t chunk[CHUNK];
+    uint8_t* tableBytes = reinterpret_cast<uint8_t*>(dacCalTable.rawTable());
+    size_t totalBytes = DacCalibrationTable::TABLE_SIZE * sizeof(double);
+    size_t offset = 0;
+
+    while (offset < totalBytes) {
+      size_t sz = min((size_t)CHUNK, totalBytes - offset);
+      int got = f.read(chunk, sz);
+      if (got != (int)sz) { f.close(); return false; }
+      memcpy(tableBytes + offset, chunk, sz);
+      for (size_t i = 0; i < sz; i++) {
+        crc ^= chunk[i];
+        for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+      }
+      offset += sz;
+    }
+
+    // Read and check stored CRC
+    uint8_t crcBuf[2];
+    if (f.read(crcBuf, 2) != 2) { f.close(); return false; }
+    f.close();
+
+    uint16_t storedCrc; memcpy(&storedCrc, crcBuf, 2);
+    if (crc != storedCrc) {
+      dacCalTable.initNominal(); // revert to safe state
+      return false;
+    }
+
+    dacCalTable.markValid();
+    return true;
+  }
+
+  // Remove both calibration files from flash.
+  bool eraseAll() {
+    if (!mounted_) return false;
+    bool ok = true;
+    if (fs_.exists("/cal_consts.bin")) ok &= fs_.remove("/cal_consts.bin");
+    if (fs_.exists("/dac_table.bin"))  ok &= fs_.remove("/dac_table.bin");
+    return ok;
+  }
+
+  // Load constants and table from flash. Called from setup().
+  bool autoLoad() {
+    bool ok = false;
+    if (loadConstants()) {
+      Serial.println("  Cal constants: loaded from flash.");
+      ok = true;
+    } else {
+      Serial.println("  Cal constants: not found or invalid; using defaults.");
+    }
+    if (loadTable()) {
+      Serial.println("  DAC cal table: loaded from flash (CALIBRATED).");
+      ok = true;
+    } else {
+      Serial.println("  DAC cal table: not found or invalid; using nominal.");
+    }
+    return ok;
+  }
+
+  // Print status of calibration flash.
+  void printStatus() {
+    Serial.println("--- Calibration Flash ---");
+    if (!mounted_) {
+      Serial.println("  Flash: NOT MOUNTED");
+      return;
+    }
+    Serial.println("  Flash: mounted (LittleFS_Program 512 KB)");
+    Serial.print("  /cal_consts.bin: ");
+    Serial.println(fs_.exists("/cal_consts.bin") ? "present" : "absent");
+    Serial.print("  /dac_table.bin:  ");
+    Serial.println(fs_.exists("/dac_table.bin") ? "present" : "absent");
+    Serial.print("  PREAMP_GAIN:      "); Serial.println(PREAMP_GAIN, 6);
+    Serial.print("  DIVIDER_RATIO_10: "); Serial.println(DIVIDER_RATIO_10, 6);
+    Serial.print("  DIVIDER_RATIO_100: "); Serial.println(DIVIDER_RATIO_100, 6);
+    Serial.print("  DIVIDER_RATIO_1000: "); Serial.println(DIVIDER_RATIO_1000, 6);
+    Serial.print("  DAC cal table:    ");
+    Serial.println(dacCalTable.isValid() ? "CALIBRATED" : "nominal");
+  }
+
+private:
+  LittleFS_Program fs_;
+  bool mounted_ = false;
+};
+
+static CalibrationStore calStore;
+
+/**
+ * Handle 'cal' command and subcommands.
+ * Defined here (after CalibrationStore) so calStore is fully typed.
+ */
+void cmdCal(const char* arg1, const char* arg2, const char* arg3) {
+  if (!arg1) {
+    Serial.println("Usage: cal status|save|load|erase|set|factory");
+    return;
+  }
+
+  if (strcasecmp(arg1, "status") == 0) {
+    calStore.printStatus();
+
+  } else if (strcasecmp(arg1, "save") == 0) {
+    Serial.println("Saving cal constants to flash...");
+    if (calStore.saveConstants()) Serial.println("  Constants: saved.");
+    else Serial.println("  Constants: FAILED.");
+    Serial.println("Saving DAC table to flash...");
+    if (calStore.saveTable()) Serial.println("  DAC table: saved.");
+    // saveTable() prints reason if not valid
+
+  } else if (strcasecmp(arg1, "load") == 0) {
+    Serial.println("Loading cal from flash...");
+    calStore.autoLoad();
+
+  } else if (strcasecmp(arg1, "erase") == 0) {
+    if (calStore.eraseAll()) Serial.println("Calibration files erased.");
+    else Serial.println("Erase failed (flash not mounted?).");
+
+  } else if (strcasecmp(arg1, "factory") == 0) {
+    PREAMP_GAIN        = PREAMP_GAIN_DEFAULT;
+    DIVIDER_RATIO_10   = DIVIDER_RATIO_10_DEFAULT;
+    DIVIDER_RATIO_100  = DIVIDER_RATIO_100_DEFAULT;
+    DIVIDER_RATIO_1000 = DIVIDER_RATIO_1000_DEFAULT;
+    Serial.println("Cal constants reset to factory defaults (RAM only).");
+    Serial.println("Use 'cal save' to persist, or reboot to revert if saved.");
+
+  } else if (strcasecmp(arg1, "set") == 0) {
+    if (!arg2 || !arg3) {
+      Serial.println("Usage: cal set gain|div10|div100|div1000 <value>");
+      return;
+    }
+    double val = atof(arg3);
+    if (val == 0.0) {
+      Serial.println("Error: value must be non-zero.");
+      return;
+    }
+    if (strcasecmp(arg2, "gain") == 0) {
+      if (val < 100.0 || val > 100000.0) { Serial.println("Error: gain out of range [100, 100000]."); return; }
+      PREAMP_GAIN = val;
+      Serial.print("PREAMP_GAIN set to "); Serial.println(PREAMP_GAIN, 6);
+    } else if (strcasecmp(arg2, "div10") == 0) {
+      if (val < 1.0 || val > 100.0) { Serial.println("Error: div10 out of range [1, 100]."); return; }
+      DIVIDER_RATIO_10 = val;
+      Serial.print("DIVIDER_RATIO_10 set to "); Serial.println(DIVIDER_RATIO_10, 6);
+    } else if (strcasecmp(arg2, "div100") == 0) {
+      if (val < 10.0 || val > 10000.0) { Serial.println("Error: div100 out of range [10, 10000]."); return; }
+      DIVIDER_RATIO_100 = val;
+      Serial.print("DIVIDER_RATIO_100 set to "); Serial.println(DIVIDER_RATIO_100, 6);
+    } else if (strcasecmp(arg2, "div1000") == 0) {
+      if (val < 100.0 || val > 100000.0) { Serial.println("Error: div1000 out of range [100, 100000]."); return; }
+      DIVIDER_RATIO_1000 = val;
+      Serial.print("DIVIDER_RATIO_1000 set to "); Serial.println(DIVIDER_RATIO_1000, 6);
+    } else {
+      Serial.println("Unknown cal set parameter. Use: gain, div10, div100, div1000");
+    }
+    Serial.println("(Use 'cal save' to persist to flash.)");
+
+  } else {
+    Serial.println("Unknown cal subcommand. Use: status, save, load, erase, set, factory");
+  }
+}
+
 /**
  * Save current runtime configuration to EEPROM.
  * Called by processCommand() on "config save". Serializes scanConfig,
@@ -2807,6 +3160,15 @@ void setup() {
   // Initialize DAC calibration table with nominal values
   dacCalTable.initNominal();
 
+  // Mount calibration flash and restore persisted values
+  Serial.println("Mounting calibration flash...");
+  if (calStore.begin()) {
+    Serial.println("Calibration flash: mounted.");
+    calStore.autoLoad();
+  } else {
+    Serial.println("WARNING: Calibration flash unavailable; using defaults.");
+  }
+
   // Initialize per-channel DAC code cache
   scanner.clearDacCache();
 
@@ -2872,6 +3234,7 @@ void setup() {
   Serial.print("DAC cal table: ");
   Serial.println(dacCalTable.isValid() ? "CALIBRATED" : "nominal (uncalibrated)");
   Serial.println("====================================\n");
+  calStore.printStatus();
 
   // Load saved configuration from EEPROM (if valid)
   SavedConfig savedCfg;
