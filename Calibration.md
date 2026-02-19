@@ -99,16 +99,38 @@ for a nV-level instrument. With the table, the error is limited by ADC noise dur
 returns `false`). If a previous `cal save` was run with a valid table, it is automatically
 restored from LittleFS flash on boot.
 
-**Remaining gap:** There is no firmware command to *build* the table. Actions needed:
-1. Implement a calibration build procedure (firmware command or `diffvm.py` script) that:
-   - Sweeps DAC codes (every 4 codes, or all 65,536 for higher resolution)
-   - For each code: sets DAC, waits for settling, performs a chopped measurement against GND
-     (to get the actual DAC output voltage, since the ADC measures `Vx − V_dac`)
-   - Stores `measuredVoltage` via `dacCalTable.setPoint(code, measuredVoltage)` and calls
-     `dacCalTable.markValid()` when complete
-   - Calls `cal save` to persist the completed table to flash
-2. **Until the build procedure is implemented**, all measurements use uncalibrated nominal
-   DAC values and are limited to ~±10 DAC LSB (±1.5 mV) absolute accuracy.
+**Build commands (implemented):**
+
+`cal build dac` — automatic anchor calibration (no external source needed):
+- Switches to the GND input; binary-searches DAC to zero-crossing; sweeps ±2 table entries
+  around the convergence code (5 entries total); measures actual V_dac at each code.
+- Switches to VrefRaw (~5 V); binary-searches DAC; sweeps ±2 entries around that code.
+- Marks the table valid and saves to flash automatically.
+- Coverage: ~5 points near 0 V + ~5 points near 5 V. Corrects DAC zero offset and full-scale
+  gain. Duration: < 5 seconds.
+
+`cal point <voltage>` — capture a single entry from a known external voltage applied to Vx:
+- User applies an accurate known voltage to the Vx input terminal.
+- Firmware binary-searches DAC to lock onto the applied voltage.
+- Accumulates 20 chopped measurements; stores `V_dac = V_known − ADC_residual/PREAMP_GAIN`
+  at the current DAC code.
+- Repeat at different voltages across ±5 V to fill in the full table.
+- Call `cal save` when finished to persist the updated table.
+
+**Typical workflow:**
+```
+cal build dac              # Quick auto-cal at 0 V and 5 V anchors; saves automatically
+# (optional: apply external source at multiple voltages for full-range INL correction)
+cal point 1.000000         # Apply 1.000000 V to Vx, then run this
+cal point 2.000000         # Apply 2.000000 V to Vx, then run this
+# ... repeat at -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5 V etc.
+cal save                   # Persist all point entries to flash
+```
+
+**Measurement window constraint:** The preamp clips when |Vx − V_dac| > ~1 mV. Each `cal point`
+call can only store one table entry (the code the DAC locked to). To cover the full ±5 V range,
+~16,380 separate measurements would be needed — in practice, a `diffvm.py` script stepping an
+external calibrated source handles this automatically.
 
 **Firmware constants used (nominal table initialization):**
 ```cpp
@@ -389,7 +411,7 @@ specification).
 
 | Calibration Item | Persisted? | Location | Notes |
 |---|---|---|---|
-| DAC calibration table | **Yes** | LittleFS flash (512 KB) | Persisted by `cal save`; restored on boot. Build the table first (CAL-02 procedure TBD). |
+| DAC calibration table | **Yes** | LittleFS flash (512 KB) | Persisted by `cal save`; restored on boot. Build with `cal build dac` (auto) or `cal point <v>` (external source). |
 | Preamp gain (PREAMP_GAIN) | **Yes** | LittleFS flash | Persisted by `cal save`; adjust via `cal set gain <v>`. |
 | HV divider ratios | **Yes** | LittleFS flash | Persisted by `cal save`; adjust via `cal set div10/div100/div1000 <v>`. |
 | Auto-zero offset | **No** | RAM only | Lost on reboot; run `zero` after every boot. |
@@ -397,9 +419,10 @@ specification).
 | Scan configuration, divider ratio, auto-start | Yes | EEPROM | Persisted by `config save`; restored on boot. |
 
 **Flash persistence status:** DAC calibration table, preamp gain, and divider ratios are
-now persisted to LittleFS (512 KB partition on Teensy 4.1 QSPI flash) via `cal save`.
-The main remaining gap is the CAL-02 build procedure — once a command to sweep and
-measure the DAC table is implemented, the full calibration round-trip will be complete.
+persisted to LittleFS (512 KB partition on Teensy 4.1 QSPI flash) via `cal save`.
+The CAL-02 build procedure is implemented: `cal build dac` provides automatic anchor
+calibration; `cal point <v>` enables full-range INL correction with an external source.
+The full calibration round-trip is now complete.
 
 ---
 

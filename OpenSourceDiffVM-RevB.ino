@@ -220,6 +220,11 @@ static double estimatedDriftRate = 0.0;                // Reference drift rate (
 static uint32_t refSampleCounter = 0;                  // Counter for periodic sampling
 static bool refTrackingInitialized = false;            // True after first reference measurement
 
+// ---------------- DAC Calibration Build Constants ----------------
+static constexpr int CAL_BUILD_CYCLES = 5;   // Chop cycles per table entry during auto build
+static constexpr int CAL_POINT_CYCLES = 20;  // Chop cycles per cal point capture
+static constexpr int CAL_BUILD_WINDOW = 2;   // Table entries swept each side of anchor (±2 = 5 total)
+
 // ---------------- DAC Calibration Table ----------------
 // Encapsulates the 16384-point calibration table for DAC INL correction.
 // Index: (dacCode + 32768) >> 2 gives 14-bit index (0..16383)
@@ -1569,6 +1574,8 @@ void printHelp() {
   Serial.println("cal set div100 <v>    Set DIVIDER_RATIO_100");
   Serial.println("cal set div1000 <v>   Set DIVIDER_RATIO_1000");
   Serial.println("cal factory           Reset cal constants to factory defaults (RAM)");
+  Serial.println("cal build dac         Auto-calibrate DAC table at GND and VrefRaw anchors");
+  Serial.println("cal point <voltage>   Capture DAC table entry at known Vx (e.g., cal point 1.23456)");
   Serial.println("help                Show this help");
   Serial.println("=======================\n");
 }
@@ -2885,12 +2892,196 @@ private:
 static CalibrationStore calStore;
 
 /**
+ * Auto-calibrate the DAC INL table at GND and VrefRaw anchor points.
+ *
+ * Sweeps CAL_BUILD_WINDOW table entries on each side of the binary-search
+ * convergence code for both anchors, measures the actual DAC output voltage
+ * at each code, and stores the result in the calibration table.
+ *
+ * Coverage: ~5 entries near 0 V and ~5 entries near 5 V (total ~10 entries).
+ * This corrects DAC zero offset and full-scale gain without any external source.
+ * After both sweeps, marks the table valid and saves to flash.
+ */
+void cmdCalBuildDac() {
+  ScopedInstrumentState guard;
+
+  Serial.println("=== DAC Calibration Table Build ===");
+
+  // --- Anchor 1: GND (0 V) ---
+  Serial.println("Anchor 1: GND (0 V)...");
+  inputMux.select(InputChannel::GND);
+  dac.setCode(0);
+  if (!binarySearchDAC()) {
+    Serial.println("ERROR: Binary search failed on GND. Aborting.");
+    return;
+  }
+  int16_t bsCode = dac.currentCode();
+  Serial.print("  Converged at code "); Serial.println(bsCode);
+
+  int entriesGnd = 0;
+  for (int delta = -CAL_BUILD_WINDOW; delta <= CAL_BUILD_WINDOW; delta++) {
+    int32_t code32 = (int32_t)bsCode + (int32_t)(delta * 4);
+    if (code32 < -32768) code32 = -32768;
+    if (code32 >  32764) code32 =  32764;
+    int16_t code = (int16_t)code32;
+
+    dac.setCode(code);
+
+    LowerMoments stats;
+    bool overflow = false;
+    for (int i = 0; i < CAL_BUILD_CYCLES; i++) {
+      HalfCycleResult rA = acquireHalfCycle();
+      chopper.toggle();
+      HalfCycleResult rB = acquireHalfCycle();
+      chopper.toggle();
+      if (rA.overflow || rB.overflow) { overflow = true; break; }
+      double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
+      stats.accumulate(demod);
+    }
+    if (overflow) {
+      Serial.print("  WARNING: Overflow at code "); Serial.println(code);
+      continue;
+    }
+
+    // Vx = GND = 0 V, so: V_dac = -(demod * ADC_LSB_V) / PREAMP_GAIN
+    double vDac = -(stats.mean() * ADC_LSB_V) / PREAMP_GAIN;
+    dacCalTable.setPoint(code, vDac);
+    entriesGnd++;
+
+    Serial.print("  code="); Serial.print(code);
+    Serial.print("  V_dac="); Serial.print(vDac * 1e6, 3); Serial.println(" uV");
+  }
+  Serial.print("  GND anchor: "); Serial.print(entriesGnd); Serial.println(" entries stored.");
+
+  // --- Anchor 2: VrefRaw (~5 V) ---
+  Serial.println("Anchor 2: VrefRaw (~5 V)...");
+  inputMux.select(InputChannel::VrefRaw);
+  dac.setCode(REF_MEASURE_DAC_CODE);
+  if (!binarySearchDAC()) {
+    Serial.println("ERROR: Binary search failed on VrefRaw. Aborting.");
+    return;
+  }
+  bsCode = dac.currentCode();
+  Serial.print("  Converged at code "); Serial.println(bsCode);
+
+  int entriesVref = 0;
+  for (int delta = -CAL_BUILD_WINDOW; delta <= CAL_BUILD_WINDOW; delta++) {
+    int32_t code32 = (int32_t)bsCode + (int32_t)(delta * 4);
+    if (code32 < -32768) code32 = -32768;
+    if (code32 >  32764) code32 =  32764;
+    int16_t code = (int16_t)code32;
+
+    dac.setCode(code);
+
+    LowerMoments stats;
+    bool overflow = false;
+    for (int i = 0; i < CAL_BUILD_CYCLES; i++) {
+      HalfCycleResult rA = acquireHalfCycle();
+      chopper.toggle();
+      HalfCycleResult rB = acquireHalfCycle();
+      chopper.toggle();
+      if (rA.overflow || rB.overflow) { overflow = true; break; }
+      double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
+      stats.accumulate(demod);
+    }
+    if (overflow) {
+      Serial.print("  WARNING: Overflow at code "); Serial.println(code);
+      continue;
+    }
+
+    // Vx = VrefRaw ~= NOMINAL_REF_V, so: V_dac = NOMINAL_REF_V - (demod * ADC_LSB_V) / PREAMP_GAIN
+    double vDac = NOMINAL_REF_V - (stats.mean() * ADC_LSB_V) / PREAMP_GAIN;
+    dacCalTable.setPoint(code, vDac);
+    entriesVref++;
+
+    Serial.print("  code="); Serial.print(code);
+    Serial.print("  V_dac="); Serial.print(vDac, 6); Serial.println(" V");
+  }
+  Serial.print("  VrefRaw anchor: "); Serial.print(entriesVref); Serial.println(" entries stored.");
+
+  // Mark valid and save to flash
+  dacCalTable.markValid();
+  Serial.println("DAC calibration table marked valid.");
+  Serial.println("Saving to flash...");
+  if (calStore.saveTable()) {
+    Serial.println("Saved successfully.");
+  }
+  // guard restores channel + DAC on scope exit
+}
+
+/**
+ * Capture a single DAC calibration table entry at a user-supplied known voltage.
+ *
+ * The user applies a known accurate voltage V_known to the Vx input, then
+ * calls "cal point <voltage>". The firmware binary-searches the DAC to lock
+ * onto V_known, accumulates CAL_POINT_CYCLES chopped measurements, and stores
+ * the actual DAC output voltage at the current DAC code.
+ *
+ * Repeat at different applied voltages to build up the full table.
+ * Call "cal save" when done to persist the table to flash.
+ */
+void cmdCalPoint(const char* voltageStr) {
+  double vKnown = atof(voltageStr);
+
+  if (vKnown < -5.1 || vKnown > 5.1) {
+    Serial.println("Error: voltage must be within ±5.1 V.");
+    return;
+  }
+
+  ScopedInstrumentState guard;
+
+  // Select Vx channel (user applies the known voltage here)
+  inputMux.select(InputChannel::Vx);
+
+  Serial.print("cal point: V_known="); Serial.print(vKnown, 8); Serial.println(" V");
+  Serial.println("Binary-searching DAC to lock onto Vx...");
+
+  if (!binarySearchDAC()) {
+    Serial.println("ERROR: Binary search failed. Is the known voltage applied to Vx?");
+    return;
+  }
+
+  int16_t code = dac.currentCode();
+  Serial.print("  DAC code="); Serial.println(code);
+
+  // Accumulate chopped measurements
+  LowerMoments stats;
+  for (int i = 0; i < CAL_POINT_CYCLES; i++) {
+    HalfCycleResult rA = acquireHalfCycle();
+    chopper.toggle();
+    HalfCycleResult rB = acquireHalfCycle();
+    chopper.toggle();
+    if (rA.overflow || rB.overflow) {
+      Serial.println("WARNING: Overflow during cal point measurement. Aborting.");
+      return;
+    }
+    double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
+    stats.accumulate(demod);
+  }
+
+  // V_dac_actual = V_known - ADC_residual/gain
+  double vDac = vKnown - (stats.mean() * ADC_LSB_V) / PREAMP_GAIN;
+  dacCalTable.setPoint(code, vDac);
+
+  Serial.print("  Stored: code="); Serial.print(code);
+  Serial.print(" -> V_dac="); Serial.print(vDac, 8); Serial.println(" V");
+
+  if (!dacCalTable.isValid()) {
+    Serial.println("  (Table not yet marked valid. Run 'cal build dac' first,");
+    Serial.println("   or mark manually; then 'cal save' to persist.)");
+  } else {
+    Serial.println("  (Use 'cal save' to persist updated table.)");
+  }
+  // guard restores channel + DAC on scope exit
+}
+
+/**
  * Handle 'cal' command and subcommands.
  * Defined here (after CalibrationStore) so calStore is fully typed.
  */
 void cmdCal(const char* arg1, const char* arg2, const char* arg3) {
   if (!arg1) {
-    Serial.println("Usage: cal status|save|load|erase|set|factory");
+    Serial.println("Usage: cal status|save|load|erase|set|factory|build|point");
     return;
   }
 
@@ -2952,8 +3143,19 @@ void cmdCal(const char* arg1, const char* arg2, const char* arg3) {
     }
     Serial.println("(Use 'cal save' to persist to flash.)");
 
+  } else if (strcasecmp(arg1, "build") == 0) {
+    if (!arg2 || strcasecmp(arg2, "dac") != 0) {
+      Serial.println("Usage: cal build dac");
+      return;
+    }
+    cmdCalBuildDac();
+
+  } else if (strcasecmp(arg1, "point") == 0) {
+    if (!arg2) { Serial.println("Usage: cal point <voltage>"); return; }
+    cmdCalPoint(arg2);
+
   } else {
-    Serial.println("Unknown cal subcommand. Use: status, save, load, erase, set, factory");
+    Serial.println("Unknown cal subcommand. Use: status, save, load, erase, set, factory, build, point");
   }
 }
 
