@@ -14,7 +14,7 @@
    - ADC DRDY = Teensy pin 15
    - External ADC clock = 25.0 MHz (fMOD = fCLK/2)
    - VREF = 2.500 V
-   - Mux cycle = 400 Hz => 1.25 ms high, 1.25 ms low
+   - Mux cycle around 400 Hz => 1.25 ms high, 1.25 ms low
 */
 
 #include <Arduino.h>
@@ -3400,13 +3400,19 @@ void setup() {
 
   // Run Power-On Self-Test
   PostResult postResult = runPOST();
-
+  
   if (!postResult.allPassed()) {
+    pinMode(LED_BUILTIN, OUTPUT);
     if (POST_HALT_ON_FAIL) {
       Serial.println("POST failed - system halted.");
       Serial.println("Set POST_HALT_ON_FAIL=false to continue despite failures.");
+      // Give config information
+
       while (true) {
-        // Blink LED to indicate failure (if available)
+        // Blink LED to indicate failure 
+        digitalWrite(LED_BUILTIN, HIGH);
+        delay(1500);
+        digitalWrite(LED_BUILTIN, LOW);
         delay(1000);
       }
     } else {
