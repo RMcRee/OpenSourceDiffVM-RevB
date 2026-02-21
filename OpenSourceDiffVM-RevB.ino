@@ -1147,9 +1147,6 @@ HalfCycleResult acquireHalfCycle() {
   return result;
 }
 
-// Statistics accumulator for chopped measurements
-LowerMoments chopStats;
-
 // Allan deviation tracker for voltage stability analysis
 static AllanDeviation allanDev;
 
@@ -3437,8 +3434,8 @@ void setup() {
  * the DAC and clears stats since the measurement baseline changed.
  *
  * @param stats  LowerMoments accumulator to add the demodulated sample to.
- *               In ONE_CHANNEL mode this is chopStats; in SCANNING mode it's
- *               channelStats[currentChannel].
+ *               Both ONE_CHANNEL and SCANNING modes pass scanner.channelStats()
+ *               for the active channel.
  * @return       true if measurement succeeded, false if overflow occurred
  *               (caller should skip output and retry on next loop iteration)
  */
@@ -3480,16 +3477,16 @@ bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow) {
  *   3. State machine branch:
  *
  *   ONE_CHANNEL mode:
- *     - Measures currentInputChannel continuously using chopStats
+ *     - Measures inputMux.current() continuously using scanner.channelStats()
+ *     - Clears stats + resets counter automatically if the channel changes
  *     - Outputs a reading every integrationCycles via outputMeasurement()
- *     - Stats accumulate indefinitely (not cleared between outputs)
  *
  *   SCANNING mode:
  *     - Cycles through scanner.config.channels[0..count-1]
  *     - For each channel:
  *         a. Switch mux + binarySearchDAC() (on channel change)
  *         b. Discard SCAN_SETTLE_CYCLES chop cycles for settling
- *         c. Accumulate integrationCycles into channelStats[channel]
+ *         c. Accumulate integrationCycles into scanner.channelStats[channel]
  *         d. Output result via outputMeasurement() (or plotter assembly)
  *         e. Advance to next channel
  *     - After a full sweep: optionally run performAutoZero()
@@ -3508,16 +3505,28 @@ void loop() {
 
   // ---- ONE_CHANNEL MODE: measure current channel continuously ----
   if (scanner.isOneChannel()) {
-    if (!runOneChopCycle(chopStats)) {
+    InputChannel curCh = inputMux.current();
+
+    // Clear stats and reset integration counter whenever the channel changes
+    // (covers range switches, ScopedInstrumentState restore, first entry after scan stop)
+    static InputChannel lastOneChannel = static_cast<InputChannel>(0xFF);
+    static int loopCounter = 0;
+    if (curCh != lastOneChannel) {
+      scanner.channelStats((uint8_t)curCh).clear();
+      loopCounter = 0;
+      lastOneChannel = curCh;
+    }
+
+    LowerMoments &stats = scanner.channelStats((uint8_t)curCh);
+    if (!runOneChopCycle(stats)) {
       return;  // Overflow handled, restart
     }
 
     // Output every integrationCycles, then clear for fixed-window integration
-    static int loopCounter = 0;
     if (++loopCounter >= scanner.config.integrationCycles) {
       loopCounter = 0;
-      outputMeasurement(inputMux.current(), chopStats, dac.currentCode());
-      chopStats.clear();
+      outputMeasurement(curCh, stats, dac.currentCode());
+      stats.clear();
 
       // Auto-zero: same interval logic as SCANNING mode (counts readings, not sweeps)
       scanner.incScanCycleCount();
