@@ -280,6 +280,9 @@ private:
 
 static DacCalibrationTable dacCalTable;
 
+// Defined in "Voltage Divider Scale Factors" section; used by computeInputVoltage/Uncertainty below.
+double getInputDividerRatio(InputChannel channel);
+
 // ---------------- Precision Voltage Computation ----------------
 /**
  * Compute the measured input voltage using 64-bit double precision.
@@ -1197,7 +1200,7 @@ public:
   bool isScanning() const { return state_ == ScanState::SCANNING; }
   bool isOneChannel() const { return state_ == ScanState::ONE_CHANNEL; }
 
-  void start() { state_ = ScanState::SCANNING; currentScanIndex_ = 0; scanCycleCount_ = 0; chopCycleCount_ = 0; }
+  void start() { state_ = ScanState::SCANNING; currentScanIndex_ = 0; cycleCount_ = 0; chopCycleCount_ = 0; }
   void stop()  { state_ = ScanState::ONE_CHANNEL; }
 
   // Per-channel statistics
@@ -1216,8 +1219,8 @@ public:
   // Scan loop state
   int currentScanIndex() const { return currentScanIndex_; }
   void setCurrentScanIndex(int i) { currentScanIndex_ = i; }
-  int scanCycleCount() const { return scanCycleCount_; }
-  void incScanCycleCount() { scanCycleCount_++; }
+  int cycleCount() const { return cycleCount_; }
+  void incCycleCount() { cycleCount_++; }
   int chopCycleCount() const { return chopCycleCount_; }
   void setChopCycleCount(int c) { chopCycleCount_ = c; }
   void incChopCycleCount() { chopCycleCount_++; }
@@ -1225,7 +1228,7 @@ public:
 private:
   ScanState state_ = ScanState::ONE_CHANNEL;
   int currentScanIndex_ = 0;
-  int scanCycleCount_ = 0;
+  int cycleCount_ = 0;
   int chopCycleCount_ = 0;
   LowerMoments channelStats_[8];
   int16_t channelDacCode_[8];
@@ -3529,9 +3532,9 @@ void loop() {
       stats.clear();
 
       // Auto-zero: same interval logic as SCANNING mode (counts readings, not sweeps)
-      scanner.incScanCycleCount();
+      scanner.incCycleCount();
       if (scanner.config.autoZeroEnabled &&
-          (scanner.scanCycleCount() % scanner.config.autoZeroInterval) == 0) {
+          (scanner.cycleCount() % scanner.config.autoZeroInterval) == 0) {
         performAutoZero();
         if (scanner.autoZeroValid && scanner.config.outputMode == OutputMode::Human) {
           Serial.print("  [auto-zero: offset=");
@@ -3600,11 +3603,11 @@ void loop() {
     if (scanner.currentScanIndex() >= scanner.config.count) {
       // Completed one full sweep
       scanner.setCurrentScanIndex(0);
-      scanner.incScanCycleCount();
+      scanner.incCycleCount();
 
       // Check if auto-zero is due
       if (scanner.config.autoZeroEnabled &&
-          (scanner.scanCycleCount() % scanner.config.autoZeroInterval) == 0) {
+          (scanner.cycleCount() % scanner.config.autoZeroInterval) == 0) {
         performAutoZero();
         if (scanner.autoZeroValid && scanner.config.outputMode == OutputMode::Human) {
           Serial.print("  [auto-zero: offset=");
