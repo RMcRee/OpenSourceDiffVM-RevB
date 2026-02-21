@@ -53,8 +53,8 @@ class DacCalibrationTableTest {
         // Set two adjacent calibration points with known offsets
         // Index for code 0: ((0+32768) & 0xFFFF) >>> 2 = 8192
         // Code 0 → index 8192, code 4 → index 8193
-        table.setCalPoint((short) 0, 0.001);     // 1mV offset at code 0
-        table.setCalPoint((short) 4, 0.002);     // 2mV at code 4
+        table.setPoint((short) 0, 0.001);     // 1mV offset at code 0
+        table.setPoint((short) 4, 0.002);     // 2mV at code 4
         table.markValid();
 
         // Code 0 should return 0.001 (exact table entry)
@@ -79,7 +79,7 @@ class DacCalibrationTableTest {
         assertFalse(table.isValid());
 
         // Even with cal points set, if not marked valid, use nominal
-        table.setCalPoint((short) 0, 999.0);
+        table.setPoint((short) 0, 999.0);
         double v = table.dacCodeToVoltage((short) 0);
         assertEquals(0.0, v, 1e-15, "Uncalibrated should use nominal");
     }

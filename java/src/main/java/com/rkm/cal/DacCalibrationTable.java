@@ -64,9 +64,9 @@ public class DacCalibrationTable {
 
     /**
      * Store a calibration point.
-     * Port of firmware setDacCalPoint().
+     * Port of firmware DacCalibrationTable::setPoint().
      */
-    public void setCalPoint(short code, double measuredVoltage) {
+    public void setPoint(short code, double measuredVoltage) {
         int idx = ((code + 32768) & 0xFFFF) >>> 2;
         if (idx < Constants.DAC_CAL_TABLE_SIZE) {
             table[idx] = measuredVoltage;

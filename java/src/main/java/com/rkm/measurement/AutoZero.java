@@ -20,7 +20,7 @@ import com.rkm.model.InputChannel;
  */
 public class AutoZero {
 
-    private static final int NUM_ITERATIONS = 20;
+    private static final int NUM_ITERATIONS = Constants.AUTOZERO_CYCLES;
 
     private double offset = 0.0;
     private boolean valid = false;

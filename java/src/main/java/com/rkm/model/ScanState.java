@@ -6,9 +6,9 @@ package com.rkm.model;
 
 /**
  * Scanning state machine states.
- * Maps to firmware line 1076.
+ * Maps to firmware ScanState enum (ONE_CHANNEL / SCANNING).
  */
 public enum ScanState {
-    IDLE,
+    ONE_CHANNEL,
     SCANNING
 }

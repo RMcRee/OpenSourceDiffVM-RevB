@@ -47,15 +47,16 @@ public class DiffVMSimulator {
     private final ScanConfig scanConfig;
 
     // State
-    private final LowerMoments chopStats = new LowerMoments();
     private final LowerMoments[] channelStats = new LowerMoments[8];
     private final short[] channelDacCode = new short[8];   // Saved DAC code per channel
     private final boolean[] channelDacValid = new boolean[8]; // True after first successful measurement
-    private ScanState scanState = ScanState.IDLE;
+    private ScanState scanState = ScanState.ONE_CHANNEL;
     private int currentScanIndex = 0;
-    private int scanCycleCount = 0;
+    private int cycleCount = 0;      // Readings in ONE_CHANNEL, sweeps in SCANNING
     private int chopCycleCount = 0;
-    private int idleCounter = 0;
+    // ONE_CHANNEL mode tracking (mirrors firmware lastOneChannel + loopCounter statics)
+    private InputChannel lastOneChannel = null;  // null = sentinel (unset)
+    private int loopCounter = 0;
     private long simulatedTimeMs = 0;
 
     // Results collected during simulation
@@ -163,29 +164,47 @@ public class DiffVMSimulator {
             driftCompensator.measureFilterError(filterError, simulatedTimeMs);
         }
 
-        if (scanState == ScanState.IDLE) {
-            loopIdle();
+        if (scanState == ScanState.ONE_CHANNEL) {
+            loopOneChannel();
         } else {
             loopScanning();
         }
     }
 
-    private void loopIdle() {
+    private void loopOneChannel() {
+        InputChannel curCh = mux.getCurrentChannel();
+
+        // Detect channel change (mirrors firmware static sentinel pattern)
+        if (curCh != lastOneChannel) {
+            channelStats[curCh.getAddress()].clear();
+            loopCounter = 0;
+            lastOneChannel = curCh;
+        }
+
+        LowerMoments stats = channelStats[curCh.getAddress()];
         boolean ok = chopMeasurement.runOneChopCycle(
-                chopStats, adc, dac, mux, config.getPreampOffsetCounts());
+                stats, adc, dac, mux, config.getPreampOffsetCounts());
 
         if (!ok) {
             // Overflow - binary search and restart
             binarySearch.search(adc, dac, mux, config.getPreampOffsetCounts());
-            chopStats.clear();
-            idleCounter = 0;
+            stats.clear();
+            loopCounter = 0;
             return;
         }
 
-        if (++idleCounter >= scanConfig.getIntegrationCycles()) {
-            idleCounter = 0;
-            recordMeasurement(mux.getCurrentChannel(), chopStats, dac.getCurrentCode());
-            // Don't clear stats in IDLE mode (matches firmware behavior)
+        if (++loopCounter >= scanConfig.getIntegrationCycles()) {
+            loopCounter = 0;
+            recordMeasurement(curCh, stats, dac.getCurrentCode());
+            stats.clear();
+            cycleCount++;
+
+            // Auto-zero check (matches firmware ONE_CHANNEL auto-zero logic)
+            if (scanConfig.isAutoZeroEnabled() &&
+                    (cycleCount % scanConfig.getAutoZeroInterval()) == 0) {
+                autoZero.perform(adc, dac, mux, binarySearch,
+                        voltageComputer, config.getPreampOffsetCounts());
+            }
         }
     }
 
@@ -225,11 +244,11 @@ public class DiffVMSimulator {
             currentScanIndex++;
             if (currentScanIndex >= scanConfig.getCount()) {
                 currentScanIndex = 0;
-                scanCycleCount++;
+                cycleCount++;
 
                 // Auto-zero check
                 if (scanConfig.isAutoZeroEnabled() &&
-                        (scanCycleCount % scanConfig.getAutoZeroInterval()) == 0) {
+                        (cycleCount % scanConfig.getAutoZeroInterval()) == 0) {
                     autoZero.perform(adc, dac, mux, binarySearch,
                             voltageComputer, config.getPreampOffsetCounts());
                 }
@@ -275,7 +294,7 @@ public class DiffVMSimulator {
         if (scanConfig.getCount() == 0) return;
         scanState = ScanState.SCANNING;
         currentScanIndex = 0;
-        scanCycleCount = 0;
+        cycleCount = 0;
         chopCycleCount = 0;
 
         InputChannel firstCh = scanConfig.getChannel(0);
@@ -285,8 +304,10 @@ public class DiffVMSimulator {
     }
 
     public void stopScanning() {
-        scanState = ScanState.IDLE;
+        scanState = ScanState.ONE_CHANNEL;
         chopCycleCount = 0;
+        lastOneChannel = null;
+        loopCounter = 0;
     }
 
     // --- Accessors ---
@@ -304,7 +325,7 @@ public class DiffVMSimulator {
     public AutoZero getAutoZero() { return autoZero; }
     public BinarySearchDAC getBinarySearch() { return binarySearch; }
     public ChopMeasurement getChopMeasurement() { return chopMeasurement; }
-    public LowerMoments getChopStats() { return chopStats; }
+    public LowerMoments getChannelStats(int address) { return channelStats[address]; }
     public ScanState getScanState() { return scanState; }
 
     /**

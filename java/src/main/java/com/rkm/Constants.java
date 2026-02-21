@@ -84,6 +84,12 @@ public final class Constants {
     public static final double CHOP_CYCLE_SECONDS =
             (DISCARD_SAMPLES + GOOD_SAMPLES + 1) * 2.0 / EST_FSPS;  // ~0.00256 s
 
+    // ---- DAC calibration build ----
+    public static final int CAL_BUILD_CYCLES = 5;   // Chop cycles per table entry during auto build
+    public static final int CAL_POINT_CYCLES = 20;  // Chop cycles per cal point capture
+    public static final int CAL_BUILD_WINDOW = 2;   // Table entries swept each side of anchor (±2 = 5 total)
+    public static final int AUTOZERO_CYCLES  = 20;  // Chop cycles per auto-zero measurement
+
     // ---- Scanning ----
     public static final int SCAN_SETTLE_CYCLES = 5;
     public static final int MAX_SCAN_CHANNELS = 7;
