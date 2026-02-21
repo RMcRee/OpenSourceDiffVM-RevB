@@ -1459,13 +1459,13 @@ void cmdAutoZero(const char* arg) {
 void cmdAutoZeroInterval(const char* arg) {
   int n = atoi(arg);
   if (n < 1 || n > 1000) {
-    Serial.println("ERROR: Auto-zero interval must be 1-1000 scan sweeps.");
+    Serial.println("ERROR: Auto-zero interval must be 1-1000 cycles.");
     return;
   }
   scanner.config.autoZeroInterval = n;
   Serial.print("Auto-zero interval set to ");
   Serial.print(n);
-  Serial.println(" scan sweeps.");
+  Serial.println(" cycles.");
 }
 
 void cmdRange(const char* arg) {
@@ -1510,7 +1510,7 @@ void printStatus() {
   Serial.print(scanner.config.autoZeroEnabled ? "ON" : "OFF");
   Serial.print(", interval=");
   Serial.print(scanner.config.autoZeroInterval);
-  Serial.println(" sweeps");
+  Serial.println(" cycles");
 
   if (scanner.autoZeroValid) {
     Serial.print("Auto-zero offset: ");
@@ -1557,7 +1557,7 @@ void printHelp() {
   Serial.println("plot stop           Stop plotter output");
   Serial.println("integrate <N>       Set chop cycles per reading (10-10000)");
   Serial.println("autozero on|off     Enable/disable periodic auto-zero");
-  Serial.println("autozero interval <N>  Scan sweeps between auto-zero (1-1000)");
+  Serial.println("autozero interval <N>  Cycles between auto-zero (readings in ONE_CHANNEL, sweeps in SCANNING) 1-1000");
   Serial.println("range <10|100|1000> Set HV divider ratio");
   Serial.println("status              Show current configuration");
   Serial.println("zero                Perform immediate zero calibration");
