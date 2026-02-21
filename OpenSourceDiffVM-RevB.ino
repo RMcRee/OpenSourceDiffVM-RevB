@@ -1284,7 +1284,8 @@ const char* getChannelShortName(InputChannel channel) {
   }
 }
 
-// Forward declarations for command handlers
+// Forward declarations for command handlers and shared helpers
+bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow = true);
 void performAutoZero();
 void printCsvHeader();
 
@@ -2260,20 +2261,11 @@ void measureFilterError() {
   LowerMoments refStats;
 
   for (int i = 0; i < REF_MEASURE_ITERATIONS; i++) {
-    HalfCycleResult rA = acquireHalfCycle();
-    chopper.toggle();
-    HalfCycleResult rB = acquireHalfCycle();
-    chopper.toggle();
-
-    // Check for overflow (shouldn't happen if references are working)
-    if (rA.overflow || rB.overflow) {
+    // searchOnOverflow=false: DAC is deliberately set to ~5V; let caller handle unexpected overflow
+    if (!runOneChopCycle(refStats, /*searchOnOverflow=*/false)) {
       Serial.println("WARNING: Overflow during reference measurement!");
       return;  // guard restores state
     }
-
-    // Demodulate and accumulate
-    double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
-    refStats.accumulate(demod);
   }
 
   // Convert mean to volts: this IS the filter error (J3 - TP1) × preamp_gain
@@ -2580,21 +2572,11 @@ void performAutoZero() {
 
   // Accumulate chopped measurements
   LowerMoments gndStats;
-  const int numIterations = 20;  // More iterations for better accuracy
-
-  for (int i = 0; i < numIterations; i++) {
-    HalfCycleResult rA = acquireHalfCycle();
-    chopper.toggle();
-    HalfCycleResult rB = acquireHalfCycle();
-    chopper.toggle();
-
-    if (rA.overflow || rB.overflow) {
+  for (int i = 0; i < CAL_POINT_CYCLES; i++) {
+    if (!runOneChopCycle(gndStats, /*searchOnOverflow=*/false)) {
       Serial.println("WARNING: Overflow during auto-zero!");
       return;  // guard restores state
     }
-
-    double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
-    gndStats.accumulate(demod);
   }
 
   // Compute zero offset
@@ -2929,17 +2911,11 @@ void cmdCalBuildDac() {
     dac.setCode(code);
 
     LowerMoments stats;
-    bool overflow = false;
+    bool ok = true;
     for (int i = 0; i < CAL_BUILD_CYCLES; i++) {
-      HalfCycleResult rA = acquireHalfCycle();
-      chopper.toggle();
-      HalfCycleResult rB = acquireHalfCycle();
-      chopper.toggle();
-      if (rA.overflow || rB.overflow) { overflow = true; break; }
-      double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
-      stats.accumulate(demod);
+      if (!runOneChopCycle(stats, /*searchOnOverflow=*/false)) { ok = false; break; }
     }
-    if (overflow) {
+    if (!ok) {
       Serial.print("  WARNING: Overflow at code "); Serial.println(code);
       continue;
     }
@@ -2975,17 +2951,11 @@ void cmdCalBuildDac() {
     dac.setCode(code);
 
     LowerMoments stats;
-    bool overflow = false;
+    bool ok = true;
     for (int i = 0; i < CAL_BUILD_CYCLES; i++) {
-      HalfCycleResult rA = acquireHalfCycle();
-      chopper.toggle();
-      HalfCycleResult rB = acquireHalfCycle();
-      chopper.toggle();
-      if (rA.overflow || rB.overflow) { overflow = true; break; }
-      double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
-      stats.accumulate(demod);
+      if (!runOneChopCycle(stats, /*searchOnOverflow=*/false)) { ok = false; break; }
     }
-    if (overflow) {
+    if (!ok) {
       Serial.print("  WARNING: Overflow at code "); Serial.println(code);
       continue;
     }
@@ -3048,16 +3018,10 @@ void cmdCalPoint(const char* voltageStr) {
   // Accumulate chopped measurements
   LowerMoments stats;
   for (int i = 0; i < CAL_POINT_CYCLES; i++) {
-    HalfCycleResult rA = acquireHalfCycle();
-    chopper.toggle();
-    HalfCycleResult rB = acquireHalfCycle();
-    chopper.toggle();
-    if (rA.overflow || rB.overflow) {
+    if (!runOneChopCycle(stats, /*searchOnOverflow=*/false)) {
       Serial.println("WARNING: Overflow during cal point measurement. Aborting.");
       return;
     }
-    double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
-    stats.accumulate(demod);
   }
 
   // V_dac_actual = V_known - ADC_residual/gain
@@ -3487,12 +3451,15 @@ void setup() {
  * @return       true if measurement succeeded, false if overflow occurred
  *               (caller should skip output and retry on next loop iteration)
  */
-bool runOneChopCycle(LowerMoments &stats) {
+// @param searchOnOverflow  If true (default), triggers binarySearchDAC() + stats.clear() on
+//                          overflow — correct for continuous measurement in loop().
+//                          If false, returns false immediately without touching the DAC —
+//                          correct for calibration routines that manage their own DAC state.
+bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow) {
   HalfCycleResult resultA = acquireHalfCycle();
 
   if (resultA.overflow) {
-    binarySearchDAC();
-    stats.clear();
+    if (searchOnOverflow) { binarySearchDAC(); stats.clear(); }
     return false;
   }
 
@@ -3502,8 +3469,7 @@ bool runOneChopCycle(LowerMoments &stats) {
 
   if (resultB.overflow) {
     chopper.toggle();  // Return to original state
-    binarySearchDAC();
-    stats.clear();
+    if (searchOnOverflow) { binarySearchDAC(); stats.clear(); }
     return false;
   }
 
