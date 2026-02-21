@@ -221,9 +221,10 @@ static uint32_t refSampleCounter = 0;                  // Counter for periodic s
 static bool refTrackingInitialized = false;            // True after first reference measurement
 
 // ---------------- DAC Calibration Build Constants ----------------
-static constexpr int CAL_BUILD_CYCLES = 5;   // Chop cycles per table entry during auto build
-static constexpr int CAL_POINT_CYCLES = 20;  // Chop cycles per cal point capture
-static constexpr int CAL_BUILD_WINDOW = 2;   // Table entries swept each side of anchor (±2 = 5 total)
+static constexpr int CAL_BUILD_CYCLES  = 5;   // Chop cycles per table entry during auto build
+static constexpr int CAL_POINT_CYCLES  = 20;  // Chop cycles per cal point capture
+static constexpr int CAL_BUILD_WINDOW  = 2;   // Table entries swept each side of anchor (±2 = 5 total)
+static constexpr int AUTOZERO_CYCLES   = 20;  // Chop cycles per auto-zero measurement
 
 // ---------------- DAC Calibration Table ----------------
 // Encapsulates the 16384-point calibration table for DAC INL correction.
@@ -2152,21 +2153,11 @@ bool postTestZero() {
 
   // Accumulate chopped measurements for accurate zero reading
   LowerMoments zeroStats;
-  const int numIterations = 10;
-
-  for (int i = 0; i < numIterations; i++) {
-    HalfCycleResult rA = acquireHalfCycle();
-    chopper.toggle();
-    HalfCycleResult rB = acquireHalfCycle();
-    chopper.toggle();
-
-    if (rA.overflow || rB.overflow) {
+  for (int i = 0; i < 10; i++) {
+    if (!runOneChopCycle(zeroStats, /*searchOnOverflow=*/false)) {
       Serial.println("FAIL (overflow during zero measurement)");
       return false;  // guard restores state
     }
-
-    double demod = (double)(rA.sum - rB.sum) / (2.0 * GOOD_SAMPLES);
-    zeroStats.accumulate(demod);
   }
 
   // guard restores channel + DAC on scope exit
@@ -2572,7 +2563,7 @@ void performAutoZero() {
 
   // Accumulate chopped measurements
   LowerMoments gndStats;
-  for (int i = 0; i < CAL_POINT_CYCLES; i++) {
+  for (int i = 0; i < AUTOZERO_CYCLES; i++) {
     if (!runOneChopCycle(gndStats, /*searchOnOverflow=*/false)) {
       Serial.println("WARNING: Overflow during auto-zero!");
       return;  // guard restores state
