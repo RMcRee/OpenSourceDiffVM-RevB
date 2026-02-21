@@ -2550,6 +2550,7 @@ IOutputFormatter& getFormatter() {
  *
  * Called by:
  *   - processCommand() on "zero" command (immediate manual calibration)
+ *   - loop() ONE_CHANNEL branch every scanner.config.autoZeroInterval readings
  *   - loop() SCANNING branch every scanner.config.autoZeroInterval sweeps
  *
  * Procedure:
@@ -3560,6 +3561,18 @@ void loop() {
       loopCounter = 0;
       outputMeasurement(inputMux.current(), chopStats, dac.currentCode());
       chopStats.clear();
+
+      // Auto-zero: same interval logic as SCANNING mode (counts readings, not sweeps)
+      scanner.incScanCycleCount();
+      if (scanner.config.autoZeroEnabled &&
+          (scanner.scanCycleCount() % scanner.config.autoZeroInterval) == 0) {
+        performAutoZero();
+        if (scanner.autoZeroValid && scanner.config.outputMode == OutputMode::Human) {
+          Serial.print("  [auto-zero: offset=");
+          Serial.print(scanner.autoZeroOffset * 1e9, 1);
+          Serial.println(" nV]");
+        }
+      }
     }
     return;
   }
