@@ -47,7 +47,7 @@ class DiffVMSimulatorTest {
 
         // Check first result is reasonable
         DiffVMSimulator.MeasurementResult r = results.get(0);
-        assertEquals(InputChannel.Vx, r.channel());
+        assertEquals(InputChannel.Vx1, r.channel());
         assertTrue(Math.abs(r.voltage() - 1.234) < 0.001,
                 "Voltage should be near 1.234V, got: " + r.voltage());
     }

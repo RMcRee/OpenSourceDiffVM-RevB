@@ -19,7 +19,7 @@ public class ScanConfig {
     private OutputMode outputMode = OutputMode.Human;
 
     public ScanConfig() {
-        channels[0] = InputChannel.Vx;
+        channels[0] = InputChannel.Vx1;
     }
 
     public InputChannel getChannel(int index) { return channels[index]; }

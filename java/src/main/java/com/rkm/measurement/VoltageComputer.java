@@ -56,7 +56,7 @@ public class VoltageComputer {
      * Port of firmware getInputDividerRatio().
      */
     public double getInputDividerRatio(InputChannel channel) {
-        if (channel == InputChannel.HVDivider) {
+        if (channel == InputChannel.HVDiv) {
             return currentDividerRatio.getRatio();
         }
         return 1.0;

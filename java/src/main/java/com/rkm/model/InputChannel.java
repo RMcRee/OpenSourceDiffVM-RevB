@@ -6,17 +6,17 @@ package com.rkm.model;
 
 /**
  * Input channel enumeration mapping to MUX36S08 address lines.
- * Maps to firmware lines 102-111.
+ * Maps to firmware InputChannel enum.
  */
 public enum InputChannel {
-    Vx(0, "Vx (±5V)", "Vx"),
+    Vx1(0, "Vx1 (\u00b15V)", "Vx1"),
     GND(1, "GND", "GND"),
     VrefRaw(2, "VrefRaw", "VrefRaw"),
-    Spare1(3, "Spare1", "Spare1"),
-    Spare2(4, "Spare2", "Spare2"),
-    HVDivider(5, "HVDivider", "HVDivider"),
-    Spare3(6, "Spare3", "Spare3"),
-    Spare4(7, "Spare4", "Spare4");
+    Vx2(3, "Vx2", "Vx2"),
+    Vx3(4, "Vx3", "Vx3"),
+    HVDiv(5, "HVDiv", "HVDiv"),
+    Vx4(6, "Vx4", "Vx4"),
+    Vx5(7, "Vx5", "Vx5");
 
     private final int address;
     private final String displayName;

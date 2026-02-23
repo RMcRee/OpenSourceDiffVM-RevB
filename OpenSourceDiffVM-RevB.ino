@@ -116,14 +116,14 @@ static constexpr uint32_t INMUX_SETTLE_US = 100;  // Input mux settling time (µ
 
 // Input channel enumeration (directly maps to MUX36S08 address lines)
 enum class InputChannel : uint8_t {
-  Vx        = 0,  // S1: Unknown input (normal measurement, ±5V)
-  GND       = 1,  // S2: Ground reference (zero calibration)
-  VrefRaw   = 2,  // S3: Raw (pre-filter) ADR1001 average (J3) for drift compensation
-  Spare1    = 3,  // S4: Spare input
-  Spare2    = 4,  // S5: Spare input
-  HVDivider = 5,  // S6: HV divider output (ratio selected by MUX36D04)
-  Spare3    = 6,  // S7: Spare input
-  Spare4    = 7,  // S8: Spare input
+  Vx1     = 0,  // S1: Unknown input 1 (normal measurement, ±5V)
+  GND     = 1,  // S2: Ground reference (zero calibration)
+  VrefRaw = 2,  // S3: Raw (pre-filter) ADR1001 average (J3) for drift compensation
+  Vx2     = 3,  // S4: Unknown input 2
+  Vx3     = 4,  // S5: Unknown input 3
+  HVDiv   = 5,  // S6: HV divider output (ratio selected by MUX36D04)
+  Vx4     = 6,  // S7: Unknown input 4
+  Vx5     = 7,  // S8: Unknown input 5
 };
 
 // ---------------- HV Divider Ratio Selection (MUX36D04) ----------------
@@ -428,7 +428,7 @@ public:
   void select(InputChannel ch);
   InputChannel current() const { return current_; }
 private:
-  InputChannel current_ = InputChannel::Vx;
+  InputChannel current_ = InputChannel::Vx1;
 };
 static InputMuxDriver inputMux;
 
@@ -491,6 +491,12 @@ private:
 };
 static AdcDriver adc;
 
+// ================== Per-channel user labels ==================
+static constexpr int CHANNEL_LABEL_MAX = 15;
+// One label per channel (indexed by InputChannel uint8_t value, 0-7).
+// Empty string means "use default channel name".
+static char channelLabels[8][CHANNEL_LABEL_MAX + 1] = {};
+
 // ================== DividerMuxDriver method implementations ==================
 
 void DividerMuxDriver::begin() {
@@ -506,13 +512,13 @@ void DividerMuxDriver::select(DividerRatio ratio) {
   digitalWriteFast(PIN_DIVMUX_A0, (addr & 0x01) ? HIGH : LOW);
   digitalWriteFast(PIN_DIVMUX_A1, (addr & 0x02) ? HIGH : LOW);
   current_ = ratio;
-  inputMux.select(InputChannel::HVDivider);
+  inputMux.select(InputChannel::HVDiv);
   delayMicroseconds(INMUX_SETTLE_US);
 }
 
 // ---------------- Voltage Divider Scale Factors ----------------
 double getInputDividerRatio(InputChannel channel) {
-  if (channel == InputChannel::HVDivider) {
+  if (channel == InputChannel::HVDiv) {
     switch (divMux.current()) {
       case DividerRatio::Div10:   return DIVIDER_RATIO_10;
       case DividerRatio::Div100:  return DIVIDER_RATIO_100;
@@ -847,7 +853,7 @@ void InputMuxDriver::begin() {
   digitalWrite(PIN_INMUX_A0, LOW);
   digitalWrite(PIN_INMUX_A1, LOW);
   digitalWrite(PIN_INMUX_A2, LOW);
-  current_ = InputChannel::Vx;
+  current_ = InputChannel::Vx1;
 }
 
 void InputMuxDriver::select(InputChannel channel) {
@@ -862,16 +868,36 @@ void InputMuxDriver::select(InputChannel channel) {
 }
 
 const char* getInputChannelName(InputChannel channel) {
+  uint8_t idx = static_cast<uint8_t>(channel);
+  if (idx < 8 && channelLabels[idx][0] != '\0') {
+    // Return a composite string from a small static buffer.
+    // Use %.15s to bound the label length (CHANNEL_LABEL_MAX=15) and suppress
+    // -Wformat-truncation: label<=15 chars + longest prefix "VrefRaw " = 8 chars
+    // → 23 bytes max, well within nameBuf[48].
+    static char nameBuf[48];
+    switch (channel) {
+      case InputChannel::Vx1:    snprintf(nameBuf, sizeof(nameBuf), "Vx1 %.15s (\xc2\xb1" "5V)", channelLabels[idx]); break;
+      case InputChannel::GND:    snprintf(nameBuf, sizeof(nameBuf), "GND %.15s",                  channelLabels[idx]); break;
+      case InputChannel::VrefRaw:snprintf(nameBuf, sizeof(nameBuf), "VrefRaw %.15s",              channelLabels[idx]); break;
+      case InputChannel::Vx2:    snprintf(nameBuf, sizeof(nameBuf), "Vx2 %.15s",                  channelLabels[idx]); break;
+      case InputChannel::Vx3:    snprintf(nameBuf, sizeof(nameBuf), "Vx3 %.15s",                  channelLabels[idx]); break;
+      case InputChannel::HVDiv:  snprintf(nameBuf, sizeof(nameBuf), "HVDiv %.15s",                channelLabels[idx]); break;
+      case InputChannel::Vx4:    snprintf(nameBuf, sizeof(nameBuf), "Vx4 %.15s",                  channelLabels[idx]); break;
+      case InputChannel::Vx5:    snprintf(nameBuf, sizeof(nameBuf), "Vx5 %.15s",                  channelLabels[idx]); break;
+      default:                   snprintf(nameBuf, sizeof(nameBuf), "Unknown %.15s",               channelLabels[idx]); break;
+    }
+    return nameBuf;
+  }
   switch (channel) {
-    case InputChannel::Vx:        return "Vx (±5V)";
-    case InputChannel::GND:       return "GND";
-    case InputChannel::VrefRaw:   return "VrefRaw";
-    case InputChannel::Spare1:    return "Spare1";
-    case InputChannel::Spare2:    return "Spare2";
-    case InputChannel::HVDivider: return "HVDivider";
-    case InputChannel::Spare3:    return "Spare3";
-    case InputChannel::Spare4:    return "Spare4";
-    default:                      return "Unknown";
+    case InputChannel::Vx1:     return "Vx1 (\xc2\xb1" "5V)";  // \xb1 + "5" avoids greedy hex parse
+    case InputChannel::GND:     return "GND";
+    case InputChannel::VrefRaw: return "VrefRaw";
+    case InputChannel::Vx2:     return "Vx2";
+    case InputChannel::Vx3:     return "Vx3";
+    case InputChannel::HVDiv:   return "HVDiv";
+    case InputChannel::Vx4:     return "Vx4";
+    case InputChannel::Vx5:     return "Vx5";
+    default:                    return "Unknown";
   }
 }
 
@@ -1187,7 +1213,7 @@ public:
 
   // Configuration (public for EEPROM save/load and command handlers)
   ScanConfig config = {
-    .channels = { InputChannel::Vx },
+    .channels = { InputChannel::Vx1 },
     .count = 1,
     .integrationCycles = 100,
     .autoZeroEnabled = true,
@@ -1244,44 +1270,49 @@ static int cmdBufferIdx = 0;
 
 /**
  * Parse a channel name string (case-insensitive) to InputChannel enum.
- * Inverse of getChannelShortName(). Called by cmdScanAdd() and cmdScanRemove()
- * to convert user-typed channel names from serial commands.
+ * Inverse of getChannelShortName(). Called by cmdScanAdd(), cmdScanRemove(),
+ * and cmdLabel() to convert user-typed channel names from serial commands.
  *
- * @param name  Channel name string (e.g., "Vx", "VrefRaw", "HVDivider")
+ * @param name  Channel name string (e.g., "Vx1", "VrefRaw", "HVDiv")
  * @param ch    Output: corresponding InputChannel value
  * @return      true on success, false if name not recognized
  */
 bool parseChannelName(const char* name, InputChannel &ch) {
-  if (strcasecmp(name, "Vx") == 0)        { ch = InputChannel::Vx; return true; }
-  if (strcasecmp(name, "GND") == 0)       { ch = InputChannel::GND; return true; }
-  if (strcasecmp(name, "VrefRaw") == 0)   { ch = InputChannel::VrefRaw; return true; }
-  if (strcasecmp(name, "Spare1") == 0)    { ch = InputChannel::Spare1; return true; }
-  if (strcasecmp(name, "Spare2") == 0)    { ch = InputChannel::Spare2; return true; }
-  if (strcasecmp(name, "HVDivider") == 0) { ch = InputChannel::HVDivider; return true; }
-  if (strcasecmp(name, "Spare3") == 0)    { ch = InputChannel::Spare3; return true; }
-  if (strcasecmp(name, "Spare4") == 0)    { ch = InputChannel::Spare4; return true; }
+  if (strcasecmp(name, "Vx1") == 0)     { ch = InputChannel::Vx1; return true; }
+  if (strcasecmp(name, "GND") == 0)     { ch = InputChannel::GND; return true; }
+  if (strcasecmp(name, "VrefRaw") == 0) { ch = InputChannel::VrefRaw; return true; }
+  if (strcasecmp(name, "Vx2") == 0)     { ch = InputChannel::Vx2; return true; }
+  if (strcasecmp(name, "Vx3") == 0)     { ch = InputChannel::Vx3; return true; }
+  if (strcasecmp(name, "HVDiv") == 0)   { ch = InputChannel::HVDiv; return true; }
+  if (strcasecmp(name, "Vx4") == 0)     { ch = InputChannel::Vx4; return true; }
+  if (strcasecmp(name, "Vx5") == 0)     { ch = InputChannel::Vx5; return true; }
   return false;
 }
 
 /**
  * Get short channel name string without range/description suffix.
  * Used by CsvFormatter and PlotterFormatter where compact names are needed.
- * Compare with getInputChannelName() which returns descriptive names like "Vx (±5V)".
+ * If a user label is set for the channel, returns that label instead.
+ * Compare with getInputChannelName() which returns descriptive names like "Vx1 (±5V)".
  *
  * @param channel  Input channel enum value
- * @return         Static string: "Vx", "GND", "VrefRaw", etc.
+ * @return         Label if set, otherwise short name: "Vx1", "GND", "VrefRaw", etc.
  */
 const char* getChannelShortName(InputChannel channel) {
+  uint8_t idx = static_cast<uint8_t>(channel);
+  if (idx < 8 && channelLabels[idx][0] != '\0') {
+    return channelLabels[idx];
+  }
   switch (channel) {
-    case InputChannel::Vx:        return "Vx";
-    case InputChannel::GND:       return "GND";
-    case InputChannel::VrefRaw:   return "VrefRaw";
-    case InputChannel::Spare1:    return "Spare1";
-    case InputChannel::Spare2:    return "Spare2";
-    case InputChannel::HVDivider: return "HVDivider";
-    case InputChannel::Spare3:    return "Spare3";
-    case InputChannel::Spare4:    return "Spare4";
-    default:                      return "Unknown";
+    case InputChannel::Vx1:     return "Vx1";
+    case InputChannel::GND:     return "GND";
+    case InputChannel::VrefRaw: return "VrefRaw";
+    case InputChannel::Vx2:     return "Vx2";
+    case InputChannel::Vx3:     return "Vx3";
+    case InputChannel::HVDiv:   return "HVDiv";
+    case InputChannel::Vx4:     return "Vx4";
+    case InputChannel::Vx5:     return "Vx5";
+    default:                    return "Unknown";
   }
 }
 
@@ -1289,13 +1320,14 @@ const char* getChannelShortName(InputChannel channel) {
 bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow = true);
 void performAutoZero();
 void printCsvHeader();
+void cmdLabel(const char* arg1, const char* arg2);
 
 void cmdScanAdd(const char* arg) {
   InputChannel ch;
   if (!parseChannelName(arg, ch)) {
     Serial.print("ERROR: Unknown channel '");
     Serial.print(arg);
-    Serial.println("'. Use: Vx, GND, VrefRaw, Spare1-4, HVDivider");
+    Serial.println("'. Use: Vx1, GND, VrefRaw, Vx2-Vx5, HVDiv");
     return;
   }
   // GND is reserved for auto-zero, not meaningful as a scan channel
@@ -1545,7 +1577,7 @@ void printStatus() {
 
 void printHelp() {
   Serial.println("\n=== DiffVM Commands ===");
-  Serial.println("scan add <ch>       Add channel (Vx,GND,VrefRaw,Spare1-4,HVDivider)");
+  Serial.println("scan add <ch>       Add channel (Vx1,GND,VrefRaw,Vx2-Vx5,HVDiv)");
   Serial.println("scan remove <ch>    Remove channel from scan list");
   Serial.println("scan list           Show current scan list");
   Serial.println("scan clear          Clear scan list");
@@ -1578,6 +1610,10 @@ void printHelp() {
   Serial.println("cal factory           Reset cal constants to factory defaults (RAM)");
   Serial.println("cal build dac         Auto-calibrate DAC table at GND and VrefRaw anchors");
   Serial.println("cal point <voltage>   Capture DAC table entry at known Vx (e.g., cal point 1.23456)");
+  Serial.println("label list            List all channel labels");
+  Serial.println("label <ch> <text>     Set label for channel (max 15 chars, no spaces)");
+  Serial.println("label <ch>            Show label for channel");
+  Serial.println("label reset           Clear all labels and save to flash");
   Serial.println("help                Show this help");
   Serial.println("=======================\n");
 }
@@ -1700,6 +1736,8 @@ void processCommand(char* line) {
     cmdAdev(arg1);
   } else if (strcasecmp(cmd, "cal") == 0) {
     cmdCal(arg1, arg2, arg3);
+  } else if (strcasecmp(cmd, "label") == 0) {
+    cmdLabel(arg1, arg2);
   } else if (strcasecmp(cmd, "help") == 0) {
     printHelp();
   } else {
@@ -2811,16 +2849,61 @@ public:
     return true;
   }
 
-  // Remove both calibration files from flash.
+  // Write channelLabels[8][16] to /channel_labels.bin
+  // Format: [4] magic [128] labels data [2] CRC16 = 134 bytes
+  bool saveLabels() {
+    if (!mounted_) return false;
+    File f = fs_.open("/channel_labels.bin", FILE_WRITE);
+    if (!f) return false;
+
+    static constexpr uint32_t LABELS_MAGIC = 0xC4BE0001UL;
+    uint8_t buf[134];
+    size_t pos = 0;
+    memcpy(buf + pos, &LABELS_MAGIC, 4); pos += 4;
+    memcpy(buf + pos, channelLabels, 128); pos += 128;
+    uint16_t crc = crc16(buf, pos);
+    memcpy(buf + pos, &crc, 2); pos += 2;
+
+    f.write(buf, pos);
+    f.close();
+    return true;
+  }
+
+  // Read channelLabels from /channel_labels.bin if valid.
+  bool loadLabels() {
+    if (!mounted_) return false;
+    File f = fs_.open("/channel_labels.bin", FILE_READ);
+    if (!f) return false;
+
+    static constexpr uint32_t LABELS_MAGIC = 0xC4BE0001UL;
+    uint8_t buf[134];
+    size_t n = f.read(buf, sizeof(buf));
+    f.close();
+    if (n < 134) return false;
+
+    uint32_t magic; memcpy(&magic, buf, 4);
+    if (magic != LABELS_MAGIC) return false;
+
+    uint16_t storedCrc; memcpy(&storedCrc, buf + 132, 2);
+    if (crc16(buf, 132) != storedCrc) return false;
+
+    memcpy(channelLabels, buf + 4, 128);
+    // Ensure null termination for each label slot
+    for (int i = 0; i < 8; i++) channelLabels[i][CHANNEL_LABEL_MAX] = '\0';
+    return true;
+  }
+
+  // Remove calibration files from flash.
   bool eraseAll() {
     if (!mounted_) return false;
     bool ok = true;
-    if (fs_.exists("/cal_consts.bin")) ok &= fs_.remove("/cal_consts.bin");
-    if (fs_.exists("/dac_table.bin"))  ok &= fs_.remove("/dac_table.bin");
+    if (fs_.exists("/cal_consts.bin"))      ok &= fs_.remove("/cal_consts.bin");
+    if (fs_.exists("/dac_table.bin"))       ok &= fs_.remove("/dac_table.bin");
+    if (fs_.exists("/channel_labels.bin"))  ok &= fs_.remove("/channel_labels.bin");
     return ok;
   }
 
-  // Load constants and table from flash. Called from setup().
+  // Load constants, table, and labels from flash. Called from setup().
   bool autoLoad() {
     bool ok = false;
     if (loadConstants()) {
@@ -2835,6 +2918,10 @@ public:
     } else {
       Serial.println("  DAC cal table: not found or invalid; using nominal.");
     }
+    if (loadLabels()) {
+      Serial.println("  Channel labels: loaded from flash.");
+      ok = true;
+    }
     return ok;
   }
 
@@ -2846,15 +2933,17 @@ public:
       return;
     }
     Serial.println("  Flash: mounted (LittleFS_Program 512 KB)");
-    Serial.print("  /cal_consts.bin: ");
+    Serial.print("  /cal_consts.bin:      ");
     Serial.println(fs_.exists("/cal_consts.bin") ? "present" : "absent");
-    Serial.print("  /dac_table.bin:  ");
+    Serial.print("  /dac_table.bin:       ");
     Serial.println(fs_.exists("/dac_table.bin") ? "present" : "absent");
-    Serial.print("  PREAMP_GAIN:      "); Serial.println(PREAMP_GAIN, 6);
-    Serial.print("  DIVIDER_RATIO_10: "); Serial.println(DIVIDER_RATIO_10, 6);
-    Serial.print("  DIVIDER_RATIO_100: "); Serial.println(DIVIDER_RATIO_100, 6);
-    Serial.print("  DIVIDER_RATIO_1000: "); Serial.println(DIVIDER_RATIO_1000, 6);
-    Serial.print("  DAC cal table:    ");
+    Serial.print("  /channel_labels.bin:  ");
+    Serial.println(fs_.exists("/channel_labels.bin") ? "present" : "absent");
+    Serial.print("  PREAMP_GAIN:          "); Serial.println(PREAMP_GAIN, 6);
+    Serial.print("  DIVIDER_RATIO_10:     "); Serial.println(DIVIDER_RATIO_10, 6);
+    Serial.print("  DIVIDER_RATIO_100:    "); Serial.println(DIVIDER_RATIO_100, 6);
+    Serial.print("  DIVIDER_RATIO_1000:   "); Serial.println(DIVIDER_RATIO_1000, 6);
+    Serial.print("  DAC cal table:        ");
     Serial.println(dacCalTable.isValid() ? "CALIBRATED" : "nominal");
   }
 
@@ -2864,6 +2953,84 @@ private:
 };
 
 static CalibrationStore calStore;
+
+/**
+ * Set, show, or reset user-configurable channel labels.
+ *
+ * Usage:
+ *   label <ch> <text>   Set label for channel; saves to flash. No spaces.
+ *   label <ch>          Show current label for channel.
+ *   label list          Show all 8 channels with their labels.
+ *   label reset         Clear all labels and save to flash.
+ *
+ * Labels: alphanumeric + _-./  Max 15 chars, no spaces.
+ */
+void cmdLabel(const char* arg1, const char* arg2) {
+  if (arg1 == nullptr || arg1[0] == '\0') {
+    Serial.println("Usage: label <ch> [text]  |  label list  |  label reset");
+    return;
+  }
+
+  // --- label list ---
+  if (strcasecmp(arg1, "list") == 0) {
+    Serial.println("Channel labels:");
+    const char* chNames[] = { "Vx1", "GND", "VrefRaw", "Vx2", "Vx3", "HVDiv", "Vx4", "Vx5" };
+    for (int i = 0; i < 8; i++) {
+      Serial.print("  "); Serial.print(chNames[i]);
+      Serial.print(": ");
+      Serial.println(channelLabels[i][0] ? channelLabels[i] : "(none)");
+    }
+    return;
+  }
+
+  // --- label reset ---
+  if (strcasecmp(arg1, "reset") == 0) {
+    memset(channelLabels, 0, sizeof(channelLabels));
+    calStore.saveLabels();
+    Serial.println("All channel labels cleared and saved.");
+    return;
+  }
+
+  // --- label <ch> [text] ---
+  InputChannel ch;
+  if (!parseChannelName(arg1, ch)) {
+    Serial.print("ERROR: Unknown channel '");
+    Serial.print(arg1);
+    Serial.println("'. Use: Vx1, GND, VrefRaw, Vx2-Vx5, HVDiv");
+    return;
+  }
+  uint8_t idx = static_cast<uint8_t>(ch);
+
+  // Show label if no text given
+  if (arg2 == nullptr || arg2[0] == '\0') {
+    Serial.print(arg1); Serial.print(" label: ");
+    Serial.println(channelLabels[idx][0] ? channelLabels[idx] : "(none)");
+    return;
+  }
+
+  // Validate label text
+  size_t len = strlen(arg2);
+  if (len > CHANNEL_LABEL_MAX) {
+    Serial.print("ERROR: Label too long (max ");
+    Serial.print(CHANNEL_LABEL_MAX);
+    Serial.println(" chars).");
+    return;
+  }
+  for (size_t i = 0; i < len; i++) {
+    char c = arg2[i];
+    if (!isalnum(c) && c != '_' && c != '-' && c != '.' && c != '/') {
+      Serial.println("ERROR: Label may only contain: A-Z a-z 0-9 _ - . /");
+      return;
+    }
+  }
+
+  // Set label and save
+  strncpy(channelLabels[idx], arg2, CHANNEL_LABEL_MAX);
+  channelLabels[idx][CHANNEL_LABEL_MAX] = '\0';
+  calStore.saveLabels();
+  Serial.print(arg1); Serial.print(" label set to: ");
+  Serial.println(channelLabels[idx]);
+}
 
 /**
  * Auto-calibrate the DAC INL table at GND and VrefRaw anchor points.
@@ -2992,8 +3159,8 @@ void cmdCalPoint(const char* voltageStr) {
 
   ScopedInstrumentState guard;
 
-  // Select Vx channel (user applies the known voltage here)
-  inputMux.select(InputChannel::Vx);
+  // Select Vx1 channel (user applies the known voltage here)
+  inputMux.select(InputChannel::Vx1);
 
   Serial.print("cal point: V_known="); Serial.print(vKnown, 8); Serial.println(" V");
   Serial.println("Binary-searching DAC to lock onto Vx...");
@@ -3197,7 +3364,7 @@ void cmdConfigLoad() {
  * Stops any active scan and invalidates the auto-zero offset.
  */
 void cmdConfigFactory() {
-  scanner.config.channels[0] = InputChannel::Vx;
+  scanner.config.channels[0] = InputChannel::Vx1;
   scanner.config.count = 1;
   scanner.config.integrationCycles = 100;
   scanner.config.autoZeroEnabled = true;

@@ -5,7 +5,7 @@ port: COM3                    # Serial port (auto-detect if omitted)
 baud: 115200
 
 scan:
-  channels: [Vx, VrefRaw]    # Channels to scan
+  channels: [Vx1, VrefRaw]   # Channels to scan
   integration: 100            # Chop cycles per reading (~2.5 sec)
   autostart: true             # Begin scanning on connect
 
@@ -22,6 +22,6 @@ logging:
 
 plot:
   enabled: true               # Show live plot window
-  channels: [Vx]              # Which channels to plot (default: all scanned)
+  channels: [Vx1]             # Which channels to plot (default: all scanned)
   window: 300                 # Seconds of data visible in plot
   y_auto: true                # Auto-scale Y axis

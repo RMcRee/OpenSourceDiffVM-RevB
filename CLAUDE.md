@@ -95,21 +95,21 @@ An 8:1 input multiplexer allows selecting between the unknown input, calibration
 
 | Channel | Address | Signal | Purpose |
 |---------|---------|--------|---------|
-| S1 | 0 | Vx | Unknown input (normal measurement, ±5V) |
+| S1 | 0 | Vx1 | Unknown input 1 (normal measurement, ±5V) |
 | S2 | 1 | GND | Zero calibration |
 | S3 | 2 | VrefRaw | Pre-filter ADR1001 average (J3) for drift compensation |
-| S4 | 3 | Spare1 | Available for future use |
-| S5 | 4 | Spare2 | Available for future use |
-| S6 | 5 | HVDivider | HV divider output (ratio selected by MUX36D04) |
-| S7 | 6 | Spare3 | Available for future use |
-| S8 | 7 | Spare4 | Available for future use |
+| S4 | 3 | Vx2 | Unknown input 2 |
+| S5 | 4 | Vx3 | Unknown input 3 |
+| S6 | 5 | HVDiv | HV divider output (ratio selected by MUX36D04) |
+| S7 | 6 | Vx4 | Unknown input 4 |
+| S8 | 7 | Vx5 | Unknown input 5 |
 
 ### Key Functions
 
 ```cpp
 selectInputChannel(InputChannel::GND);     // Switch to ground
 selectInputChannel(InputChannel::VrefRaw); // Switch to raw reference average
-selectInputChannel(InputChannel::Vx);      // Switch back to unknown
+selectInputChannel(InputChannel::Vx1);     // Switch back to unknown
 InputChannel ch = getInputChannel();       // Get current channel
 const char* name = getInputChannelName(ch); // Get channel name
 ```
@@ -126,7 +126,7 @@ setDacCode(0);
 // Every ~1 second, firmware measures VrefRaw to track filter error
 
 // Resume normal operation
-selectInputChannel(InputChannel::Vx);
+selectInputChannel(InputChannel::Vx1);
 ```
 
 ## HV Divider System (Caddock 1776-C4815 + MUX36D04 + OPA828)
@@ -168,7 +168,7 @@ Control: Teensy Pin 23 → A0, Teensy Pin 22 → A1.
 ### Key Functions
 
 ```cpp
-// Select HV divider ratio (also switches MUX to HVDivider channel)
+// Select HV divider ratio (also switches MUX to HVDiv channel)
 selectDividerRatio(DividerRatio::Div10);   // ±50V range (hardwired, mux bypassed)
 selectDividerRatio(DividerRatio::Div100);  // ±500V range
 selectDividerRatio(DividerRatio::Div1000); // ±5000V range
@@ -177,7 +177,7 @@ selectDividerRatio(DividerRatio::GND);     // Ground for zero calibration
 // Query current state
 DividerRatio ratio = getDividerRatio();
 const char* name = getDividerRatioName(ratio);
-double divRatio = getInputDividerRatio(InputChannel::HVDivider);
+double divRatio = getInputDividerRatio(InputChannel::HVDiv);
 ```
 
 ### Protection Components

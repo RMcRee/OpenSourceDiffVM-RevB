@@ -16,7 +16,7 @@ import com.rkm.sim.SimulationConfig;
  */
 public class SimulatedMux {
 
-    private InputChannel currentChannel = InputChannel.Vx;
+    private InputChannel currentChannel = InputChannel.Vx1;
     private DividerRatio currentDividerRatio = DividerRatio.Div10;
     private boolean tmuxSelState = false;  // false=LOW, true=HIGH
     private final SimulationConfig config;
@@ -40,7 +40,7 @@ public class SimulatedMux {
      */
     public void selectDividerRatio(DividerRatio ratio) {
         currentDividerRatio = ratio;
-        currentChannel = InputChannel.HVDivider;
+        currentChannel = InputChannel.HVDiv;
     }
 
     /**
@@ -49,11 +49,11 @@ public class SimulatedMux {
      */
     public double getSignalVoltage() {
         return switch (currentChannel) {
-            case Vx -> config.getInputVoltageVx();
+            case Vx1 -> config.getInputVoltageVx();
             case GND -> config.getGndOffset();
             case VrefRaw -> config.getVrefRawVoltage();
-            case HVDivider -> config.getInputVoltageVx() / getInputDividerRatio();
-            default -> 0.0;  // Spare channels
+            case HVDiv -> config.getInputVoltageVx() / getInputDividerRatio();
+            default -> 0.0;  // Vx2-Vx5 channels
         };
     }
 
@@ -62,7 +62,7 @@ public class SimulatedMux {
      * Port of firmware getInputDividerRatio().
      */
     public double getInputDividerRatio() {
-        if (currentChannel == InputChannel.HVDivider) {
+        if (currentChannel == InputChannel.HVDiv) {
             return currentDividerRatio.getRatio();
         }
         return 1.0;

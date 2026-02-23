@@ -600,9 +600,9 @@ def main():
             plot_channels = plot_cfg.get("channels")
             if not plot_channels:
                 scan_cfg = config_mgr.config.get("scan", {})
-                plot_channels = scan_cfg.get("channels", ["Vx"])
+                plot_channels = scan_cfg.get("channels", ["Vx1"])
         else:
-            plot_channels = ["Vx"]
+            plot_channels = ["Vx1"]
         plotter = LivePlotter(
             channels=plot_channels,
             window_sec=args.window,

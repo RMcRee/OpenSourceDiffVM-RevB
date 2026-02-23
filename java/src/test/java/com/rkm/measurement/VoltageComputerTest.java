@@ -27,14 +27,14 @@ class VoltageComputerTest {
     @Test
     void testZeroVoltage() {
         // DAC=0, ADC mean=0 → Vx = 0V
-        double v = computer.computeInputVoltage(0.0, (short) 0, InputChannel.Vx);
+        double v = computer.computeInputVoltage(0.0, (short) 0, InputChannel.Vx1);
         assertEquals(0.0, v, 1e-15);
     }
 
     @Test
     void testDacOnlyVoltage() {
         // DAC=32764 (~5V), ADC mean=0 → Vx = DAC voltage
-        double v = computer.computeInputVoltage(0.0, (short) 32764, InputChannel.Vx);
+        double v = computer.computeInputVoltage(0.0, (short) 32764, InputChannel.Vx1);
         double expected = 32764.0 * Constants.DAC_LSB_V;
         assertEquals(expected, v, 1e-12);
         assertTrue(v > 4.999, "Should be near 5V: " + v);
@@ -43,7 +43,7 @@ class VoltageComputerTest {
     @Test
     void testAdcOnlyVoltage() {
         // DAC=0, ADC mean=1000 → Vx = (1000 × ADC_LSB_V) / PREAMP_GAIN
-        double v = computer.computeInputVoltage(1000.0, (short) 0, InputChannel.Vx);
+        double v = computer.computeInputVoltage(1000.0, (short) 0, InputChannel.Vx1);
         double expected = (1000.0 * Constants.ADC_LSB_V) / Constants.PREAMP_GAIN;
         assertEquals(expected, v, 1e-15);
     }
@@ -51,7 +51,7 @@ class VoltageComputerTest {
     @Test
     void testCombinedVoltage() {
         // DAC=1000, ADC mean=500
-        double v = computer.computeInputVoltage(500.0, (short) 1000, InputChannel.Vx);
+        double v = computer.computeInputVoltage(500.0, (short) 1000, InputChannel.Vx1);
         double dacV = 1000.0 * Constants.DAC_LSB_V;
         double adcV = (500.0 * Constants.ADC_LSB_V) / Constants.PREAMP_GAIN;
         assertEquals(dacV + adcV, v, 1e-15);
@@ -60,20 +60,20 @@ class VoltageComputerTest {
     @Test
     void testHVDividerScaling() {
         computer.setCurrentDividerRatio(DividerRatio.Div10);
-        double v10 = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.HVDivider);
-        double vx = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.Vx);
+        double v10 = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.HVDiv);
+        double vx = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.Vx1);
 
         assertEquals(vx * Constants.DIVIDER_RATIO_10, v10, 1e-12);
 
         computer.setCurrentDividerRatio(DividerRatio.Div100);
-        double v100 = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.HVDivider);
+        double v100 = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.HVDiv);
         assertEquals(vx * Constants.DIVIDER_RATIO_100, v100, 1e-12);
     }
 
     @Test
     void testNonHVChannelNoDivision() {
         computer.setCurrentDividerRatio(DividerRatio.Div1000);
-        double vVx = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.Vx);
+        double vVx = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.Vx1);
         double vGnd = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.GND);
         double vRef = computer.computeInputVoltage(0.0, (short) 1000, InputChannel.VrefRaw);
 
@@ -86,7 +86,7 @@ class VoltageComputerTest {
 
     @Test
     void testUncertainty() {
-        double unc = computer.computeInputUncertainty(10.0, InputChannel.Vx);
+        double unc = computer.computeInputUncertainty(10.0, InputChannel.Vx1);
         double expected = (10.0 * Constants.ADC_LSB_V) / Constants.PREAMP_GAIN;
         assertEquals(expected, unc, 1e-15);
     }
