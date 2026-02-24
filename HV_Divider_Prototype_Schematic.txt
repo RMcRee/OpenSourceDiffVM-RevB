@@ -1,7 +1,7 @@
 ================================================================================
         HV DIVIDER PROTOTYPE SCHEMATIC - ST-1 STRIPBOARD LAYOUT
 ================================================================================
-Rev: B (MUX36D04 replaces ADG1411, OPA848 buffer added)
+Rev: B (MUX36D04 replaces ADG1411, OPA828 buffer added)
 Date: 2026-01-27
 Board: Busboard ST-1 (4" x 3.25")
 Teensy 4.1 footprint: 3" x 1.5" in lower-left corner
@@ -37,7 +37,7 @@ Teensy 4.1 footprint: 3" x 1.5" in lower-left corner
              |
              v (CD2 = divider output)
     +-----------------------------+
-    |  OPA848 (U2)               |
+    |  OPA828 (U2)               |
     |  Unity-gain voltage follower|
     |  High-Z input, low-Z output|
     +--------+--------------------+
@@ -102,7 +102,7 @@ SERIES TOPOLOGY:
                         │                                   │
                         R                                   R
                         │                                   │
-                       AB7 ◄──────────────────────────────  CD2 ──► OPA848 ──► TPD4E1B06 ──► MUX S6
+                       AB7 ◄──────────────────────────────  CD2 ──► OPA828 ──► TPD4E1B06 ──► MUX S6
                                 (feedback)                  │
                                                             R
                                                             │
@@ -172,17 +172,17 @@ Power Connections:
 
 
 ================================================================================
-                    OPA848 VOLTAGE FOLLOWER (U2)
+                    OPA828 VOLTAGE FOLLOWER (U2)
 ================================================================================
 
 Wideband unity-gain buffer isolates divider output impedance
 from MUX36D08 and downstream signal chain.
 
-OPA848 Pinout (SOIC-8):
+OPA828 Pinout (SOIC-8):
                     ┌──────────────┐
         NC  1  ─────┤              ├───── 8  NC
        IN-  2  ─────┤              ├───── 7  +VS
-       IN+  3  ─────┤   OPA848    ├───── 6  OUT
+       IN+  3  ─────┤   OPA828    ├───── 6  OUT
        -VS  4  ─────┤              ├───── 5  NC
                     └──────────────┘
 
@@ -216,7 +216,7 @@ TPD4E1B06 Pinout (SOT-363):
                     └────────────────┘
 
 Connections:
-  Pin 1 (IO1) ────────────► OPA848 output (pin 6)
+  Pin 1 (IO1) ────────────► OPA828 output (pin 6)
                             AND continues to MUX36D08 S6 input
   Pin 3 (GND) ────────────► Ground
   Pin 6 (VCC) ────────────► +5V
@@ -245,7 +245,7 @@ Mount fuse in holder external to stripboard with adequate voltage clearance.
 8:1 low-leakage analog multiplexer. EN is active HIGH.
 
 Connections for HV divider:
-  S6 input ◄──────────────── TPD4E1B06 IO1 / OPA848 output
+  S6 input ◄──────────────── TPD4E1B06 IO1 / OPA828 output
 
 Control (to Teensy):
   A0 ────────────────────────► Teensy Pin 5
@@ -304,7 +304,7 @@ HV+ ──[F1: 200mA/1kV]──────────────────�
     │             │                                                           │
     │             ▼                                                           │
     │      ┌──────────────┐                                                   │
-    │      │  OPA848 (U2) │  Unity-gain voltage follower                      │
+    │      │  OPA828 (U2) │  Unity-gain voltage follower                      │
     │      │  IN+ ← CD2   │  Powered: ±15V                                   │
     │      │  IN- → OUT   │                                                   │
     │      └──────┬───────┘                                                   │
@@ -379,7 +379,7 @@ MUX36D04 (U1):
   EN:  +15V (pin 2, hardwired active high)
   GND: 0V   (pin 15)
 
-OPA848 (U2):
+OPA828 (U2):
   +VS: +15V (pin 7)
   -VS: -15V (pin 4)
 
