@@ -1102,16 +1102,34 @@ void AdcDriver::initAndConfigure() {
   command(CMD_RESET);
   delay(5);
 
+  // CONFIG1: low reference range, 1x input range, no VCM, no reference buffer,
+  //          no input precharge buffers (explicit — matches reset default 0x00)
+  const uint8_t config1 = 0x00;
+  writeReg(REG_CONFIG1, config1);
+
+  // CONFIG2: high-speed mode (fMOD >= 12.5 MHz), data-output mode, default start
+  //          (explicit — matches reset default 0x00)
+  const uint8_t config2 = 0x00;
+  writeReg(REG_CONFIG2, config2);
+
   const uint8_t delayCode  = 0b000;
-  const uint8_t filterCode = 0b11000;
+  const uint8_t filterCode = 0b11000;  // sinc4 (OSR=32) + sinc1 (OSR=100), total OSR=3200
   const uint8_t config3 = (delayCode << 5) | (filterCode & 0x1F);
   writeReg(REG_CONFIG3, config3);
 
-  const uint8_t config4 = (1u << 7);
+  const uint8_t config4 = (1u << 7);  // CLK_SEL=1: external clock
   writeReg(REG_CONFIG4, config4);
 
+  uint8_t r1 = readReg(REG_CONFIG1);
+  uint8_t r2 = readReg(REG_CONFIG2);
   uint8_t r3 = readReg(REG_CONFIG3);
   uint8_t r4 = readReg(REG_CONFIG4);
+
+  Serial.print("ADC CONFIG1 set/read: 0x"); Serial.print(config1, HEX);
+  Serial.print(" / 0x"); Serial.println(r1, HEX);
+
+  Serial.print("ADC CONFIG2 set/read: 0x"); Serial.print(config2, HEX);
+  Serial.print(" / 0x"); Serial.println(r2, HEX);
 
   Serial.print("ADC CONFIG3 set/read: 0x"); Serial.print(config3, HEX);
   Serial.print(" / 0x"); Serial.println(r3, HEX);
@@ -3528,13 +3546,13 @@ void setup() {
     pinMode(LED_BUILTIN, OUTPUT);
     if (POST_HALT_ON_FAIL) {
       Serial.println("POST failed - system halted.");
-      Serial.println("Set POST_HALT_ON_FAIL=false to continue despite failures.");
+      Serial.println("Set POST_HALT_ON_FAIL=false to continue in spite of failures.");
       // Give config information
 
       while (true) {
         // Blink LED to indicate failure 
         digitalWrite(LED_BUILTIN, HIGH);
-        delay(1500);
+        delay(2000);
         digitalWrite(LED_BUILTIN, LOW);
         delay(1000);
       }
