@@ -212,6 +212,80 @@ Values persist in LittleFS flash and reload automatically on boot.
 
 ---
 
+### CAL-04a — OPA828 Buffer Offset  ★★ HIGH (HV ranges only)
+
+**What:** The HV divider output is buffered by an OPA828 voltage follower before the MUX36D08
+input multiplexer. The OPA828 input offset voltage (VOS) adds a fixed DC error to every HVDiv
+measurement. Typical VOS is a few to tens of µV; the production maximum is 150 µV at 25°C.
+
+**Why chopping does not help:** The TMUX7234 chopper switches sit *after* the OPA828 in the signal
+path. Chopping toggles signal polarity at the TMUX, so only offsets that appear after that point
+(i.e., in the AD8428 preamp chain) are cancelled. The OPA828 offset passes through the chopper
+unchanged, appearing as a fixed DC error in `vxAtPreamp`.
+
+**Signal path:**
+```
+HV Input → Caddock divider → [OPA828 + VOS] → TPD4E1B06 → MUX36D08 S6 → TMUX (chop) → AD8428 → ADC
+                                  ↑ error here — not cancelled by chopping
+```
+
+**Impact on measurement accuracy:**
+
+The offset is at the OPA828 output and is multiplied by the active divider ratio in the final result:
+
+| Range | Ratio | 16 µV offset → input-referred error |
+|-------|-------|--------------------------------------|
+| ±50V (÷10) | 10.0 | **160 µV** |
+| ±500V (÷108.76) | 108.76 | **1.74 mV** |
+| ±5kV (÷984.65) | 984.65 | **15.8 mV** |
+
+The ÷10 range is most affected. At ÷100 and ÷1000 the input-referred impact is negligible
+relative to full scale, but the OPA828 offset itself should still be corrected for completeness.
+
+**How the correction is applied in firmware:**
+
+In `computeInputVoltage()`, when channel == `HVDiv`, `OPA828_OFFSET` is subtracted from
+`vxAtPreamp` before multiplying by the divider ratio:
+
+```
+Vx = (vxAtPreamp − OPA828_OFFSET) × dividerRatio
+```
+
+**Measurement procedure:**
+
+1. Short the HV divider input to ground (or connect a stable, known-zero source).
+2. Select the ÷10 range (`divider 10`).
+3. Allow the measurement to stabilize (15–30 minutes of thermal warm-up recommended).
+4. Record the displayed voltage; divide by the divider ratio to get the raw offset:
+   ```
+   OPA828_OFFSET = displayed_voltage / DIVIDER_RATIO_10
+   ```
+   Example: display reads 160 µV → OPA828_OFFSET = 160 µV / 10 = **16 µV = 0.000016 V**.
+5. Apply and save:
+   ```
+   cal set opa828 0.000016
+   cal save
+   ```
+6. Verify: re-measure with HV input grounded — reading should be near zero (noise floor).
+
+**Temperature drift:** The OPA828 typical offset TC is 1.8 µV/°C. A 10°C warm-up from cold start
+changes the offset by ~18 µV. At ÷10 this is 180 µV referred to input. For best results, measure
+the offset after the board has thermally stabilised (typically 15–30 minutes after power-on), and
+re-calibrate if the ambient temperature changes by more than a few degrees.
+
+**Firmware update:** No recompile needed:
+```
+cal set opa828 <value_in_volts>    (e.g. 0.000016 for 16 µV)
+cal save
+```
+
+Persisted in `/cal_consts.bin` (v2 format). On first load of a v1 file, defaults to 0.0 V.
+
+**Recommended interval:** At initial commissioning after thermal stabilisation; re-measure if the
+OPA828 is replaced or if ambient temperature changes significantly.
+
+---
+
 ### CAL-05 — Preamp Gain (PREAMP_GAIN)  ★ MEDIUM
 
 **What:** `PREAMP_GAIN = 2000.0` scales the ADC residual back to an input voltage:
@@ -414,6 +488,7 @@ specification).
 | DAC calibration table | **Yes** | LittleFS flash (512 KB) | Persisted by `cal save`; restored on boot. Build with `cal build dac` (auto) or `cal point <v>` (external source). |
 | Preamp gain (PREAMP_GAIN) | **Yes** | LittleFS flash | Persisted by `cal save`; adjust via `cal set gain <v>`. |
 | HV divider ratios | **Yes** | LittleFS flash | Persisted by `cal save`; adjust via `cal set div10/div100/div1000 <v>`. |
+| OPA828 buffer offset | **Yes** | LittleFS flash | Persisted by `cal save` (v2 format); adjust via `cal set opa828 <v>`. |
 | Auto-zero offset | **No** | RAM only | Lost on reboot; run `zero` after every boot. |
 | Reference drift tracking (filter history) | **No** | RAM only | Reinitializes after reboot; takes ~8 s to stabilize. |
 | Scan configuration, divider ratio, auto-start | Yes | EEPROM | Persisted by `config save`; restored on boot. |
@@ -430,7 +505,7 @@ The full calibration round-trip is now complete.
 
 | Trigger | Actions Required |
 |---|---|
-| First power-on after assembly | CAL-01, CAL-02, CAL-04, CAL-05, CAL-06, CAL-07, CAL-08, CAL-09, CAL-10; verify POST passes |
+| First power-on after assembly | CAL-01, CAL-02, CAL-04, CAL-04a, CAL-05, CAL-06, CAL-07, CAL-08, CAL-09, CAL-10; verify POST passes |
 | Every boot | Run `zero` (CAL-03); DAC cal table auto-loads from flash if `cal save` was run |
 | Every measurement session | Run `zero` (CAL-03); verify `autozero on` is enabled |
 | Temperature change > 5 °C | Run `zero` (CAL-03); allow drift compensation to stabilize (≥10 s) |
@@ -451,10 +526,11 @@ static constexpr double DAC_VREF    = 5.0;      // CAL-01: embedded in cal table
 // PREAMP_GAIN and divider ratios are now runtime-mutable; use 'cal set' + 'cal save':
 static double PREAMP_GAIN           = 2000.0;   // CAL-05: 'cal set gain <v>'
 
-// --- HV divider ratios ---
+// --- HV divider ratios and buffer offset ---
 static double DIVIDER_RATIO_10   = 10.0;    // CAL-04: 'cal set div10 <v>'
 static double DIVIDER_RATIO_100  = 108.76;  // CAL-04: 'cal set div100 <v>'
 static double DIVIDER_RATIO_1000 = 984.65;  // CAL-04: 'cal set div1000 <v>'
+static double OPA828_OFFSET      = 0.0;     // CAL-04a: 'cal set opa828 <v>' (volts; typ. ~16 µV)
 
 // --- Reference drift compensation (lines ~174–197) ---
 static constexpr double NOMINAL_REF_V     = 5.0;   // Low priority; use ADR1001 measured value
