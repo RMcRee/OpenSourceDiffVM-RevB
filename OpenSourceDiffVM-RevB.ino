@@ -173,6 +173,12 @@ static constexpr double DAC_LSB_V       = (2.0 * DAC_VREF) / DAC_FSR_CODES;  // 
 static constexpr double PREAMP_GAIN_DEFAULT = 2000.0;
 static double PREAMP_GAIN = PREAMP_GAIN_DEFAULT;
 
+// OPA828 buffer offset at the HV divider output node (volts, measured at buffer output).
+// Chopping does NOT cancel this offset — it must be calibrated out explicitly.
+// Apply with 'cal set opa828 <v>' after measuring with DAC tracking at GND divider output.
+static constexpr double OPA828_OFFSET_DEFAULT = 0.0;
+static double OPA828_OFFSET = OPA828_OFFSET_DEFAULT;
+
 // ---------------- Reference Drift Compensation ----------------
 // The DAC reference comes from a filtered average of three ADR1001 references.
 // Filter: Sallen-Key 2nd order, fc=0.3Hz, Q=0.566
@@ -313,7 +319,13 @@ double computeInputVoltage(double adcMean, int16_t dacCode, InputChannel channel
   // Vx_at_preamp = DAC + preamp_delta
   double vxAtPreamp = dacVoltage + preampDelta;
 
-  // Step 4: Scale by voltage divider ratio (if using extended range)
+  // Step 4: Remove OPA828 buffer offset (HVDiv channel only).
+  // The OPA828 sits before the TMUX switches so chopping does not cancel it.
+  if (channel == InputChannel::HVDiv) {
+    vxAtPreamp -= OPA828_OFFSET;
+  }
+
+  // Step 5: Scale by voltage divider ratio (if using extended range)
   double dividerRatio = getInputDividerRatio(channel);
   double vxInput = vxAtPreamp * dividerRatio;
 
@@ -1585,6 +1597,8 @@ void printStatus() {
   Serial.print(DIVIDER_RATIO_100, 4);
   Serial.print("  ÷1000=");
   Serial.println(DIVIDER_RATIO_1000, 4);
+  Serial.print("OPA828 offset: ");
+  Serial.print(OPA828_OFFSET * 1e6, 2); Serial.println(" uV");
 
   Serial.print("DAC calibration: ");
   Serial.println(dacCalTable.isValid() ? "CALIBRATED" : "nominal");
@@ -1625,6 +1639,7 @@ void printHelp() {
   Serial.println("cal set div10 <v>     Set DIVIDER_RATIO_10");
   Serial.println("cal set div100 <v>    Set DIVIDER_RATIO_100");
   Serial.println("cal set div1000 <v>   Set DIVIDER_RATIO_1000");
+  Serial.println("cal set opa828 <v>    Set OPA828 buffer offset in volts (e.g. 0.000016)");
   Serial.println("cal factory           Reset cal constants to factory defaults (RAM)");
   Serial.println("cal build dac         Auto-calibrate DAC table at GND and VrefRaw anchors");
   Serial.println("cal point <voltage>   Capture DAC table entry at known Vx (e.g., cal point 1.23456)");
@@ -2700,24 +2715,25 @@ public:
 
   bool isMounted() const { return mounted_; }
 
-  // Write preampGain + divider ratios to /cal_consts.bin
-  // Format: [4] magic [2] version [8×4=32] four doubles [2] CRC16 = 40 bytes
+  // Write preampGain + divider ratios + OPA828 offset to /cal_consts.bin
+  // Format v2: [4] magic [2] version=2 [8×5=40] five doubles [2] CRC16 = 48 bytes
   bool saveConstants() {
     if (!mounted_) return false;
     File f = fs_.open("/cal_consts.bin", FILE_WRITE);
     if (!f) return false;
 
-    uint8_t buf[40];
+    uint8_t buf[48];
     size_t pos = 0;
 
     uint32_t magic = CAL_CONSTS_MAGIC;
     memcpy(buf + pos, &magic, 4); pos += 4;
-    uint16_t ver = 1;
+    uint16_t ver = 2;
     memcpy(buf + pos, &ver, 2); pos += 2;
     memcpy(buf + pos, &PREAMP_GAIN, 8); pos += 8;
     memcpy(buf + pos, &DIVIDER_RATIO_10, 8); pos += 8;
     memcpy(buf + pos, &DIVIDER_RATIO_100, 8); pos += 8;
     memcpy(buf + pos, &DIVIDER_RATIO_1000, 8); pos += 8;
+    memcpy(buf + pos, &OPA828_OFFSET, 8); pos += 8;
     uint16_t crc = crc16(buf, pos);
     memcpy(buf + pos, &crc, 2); pos += 2;
 
@@ -2727,12 +2743,13 @@ public:
   }
 
   // Read constants from /cal_consts.bin and apply them if valid.
+  // Supports v1 (40 bytes, 4 doubles) and v2 (48 bytes, 5 doubles incl. OPA828_OFFSET).
   bool loadConstants() {
     if (!mounted_) return false;
     File f = fs_.open("/cal_consts.bin", FILE_READ);
     if (!f) return false;
 
-    uint8_t buf[40];
+    uint8_t buf[48];
     size_t n = f.read(buf, sizeof(buf));
     f.close();
     if (n < 40) return false;
@@ -2740,25 +2757,45 @@ public:
     uint32_t magic; memcpy(&magic, buf, 4);
     if (magic != CAL_CONSTS_MAGIC) return false;
 
-    uint16_t storedCrc; memcpy(&storedCrc, buf + 38, 2);
-    if (crc16(buf, 38) != storedCrc) return false;
+    uint16_t ver; memcpy(&ver, buf + 4, 2);
 
-    double pg, d10, d100, d1000;
-    memcpy(&pg,    buf + 6,  8);
-    memcpy(&d10,   buf + 14, 8);
-    memcpy(&d100,  buf + 22, 8);
-    memcpy(&d1000, buf + 30, 8);
+    double pg, d10, d100, d1000, opa828 = 0.0;
+
+    if (ver == 1 && n >= 40) {
+      // v1 format: 4 doubles, CRC at offset 38
+      uint16_t storedCrc; memcpy(&storedCrc, buf + 38, 2);
+      if (crc16(buf, 38) != storedCrc) return false;
+      memcpy(&pg,    buf + 6,  8);
+      memcpy(&d10,   buf + 14, 8);
+      memcpy(&d100,  buf + 22, 8);
+      memcpy(&d1000, buf + 30, 8);
+      // OPA828_OFFSET not present in v1 — keep current value (default 0.0)
+      opa828 = OPA828_OFFSET_DEFAULT;
+    } else if (ver == 2 && n >= 48) {
+      // v2 format: 5 doubles, CRC at offset 46
+      uint16_t storedCrc; memcpy(&storedCrc, buf + 46, 2);
+      if (crc16(buf, 46) != storedCrc) return false;
+      memcpy(&pg,     buf + 6,  8);
+      memcpy(&d10,    buf + 14, 8);
+      memcpy(&d100,   buf + 22, 8);
+      memcpy(&d1000,  buf + 30, 8);
+      memcpy(&opa828, buf + 38, 8);
+    } else {
+      return false;
+    }
 
     // Sanity bounds: refuse obviously wrong values
     if (pg < 100.0 || pg > 100000.0) return false;
     if (d10 < 1.0  || d10 > 100.0)   return false;
     if (d100 < 10.0 || d100 > 10000.0) return false;
     if (d1000 < 100.0 || d1000 > 100000.0) return false;
+    if (opa828 < -0.001 || opa828 > 0.001) return false;  // ±1 mV sanity bound
 
-    PREAMP_GAIN       = pg;
-    DIVIDER_RATIO_10  = d10;
-    DIVIDER_RATIO_100 = d100;
+    PREAMP_GAIN        = pg;
+    DIVIDER_RATIO_10   = d10;
+    DIVIDER_RATIO_100  = d100;
     DIVIDER_RATIO_1000 = d1000;
+    OPA828_OFFSET      = opa828;
     return true;
   }
 
@@ -2961,6 +2998,7 @@ public:
     Serial.print("  DIVIDER_RATIO_10:     "); Serial.println(DIVIDER_RATIO_10, 6);
     Serial.print("  DIVIDER_RATIO_100:    "); Serial.println(DIVIDER_RATIO_100, 6);
     Serial.print("  DIVIDER_RATIO_1000:   "); Serial.println(DIVIDER_RATIO_1000, 6);
+    Serial.print("  OPA828_OFFSET:        "); Serial.print(OPA828_OFFSET * 1e6, 3); Serial.println(" uV");
     Serial.print("  DAC cal table:        ");
     Serial.println(dacCalTable.isValid() ? "CALIBRATED" : "nominal");
   }
@@ -3250,6 +3288,7 @@ void cmdCal(const char* arg1, const char* arg2, const char* arg3) {
     DIVIDER_RATIO_10   = DIVIDER_RATIO_10_DEFAULT;
     DIVIDER_RATIO_100  = DIVIDER_RATIO_100_DEFAULT;
     DIVIDER_RATIO_1000 = DIVIDER_RATIO_1000_DEFAULT;
+    OPA828_OFFSET      = OPA828_OFFSET_DEFAULT;
     Serial.println("Cal constants reset to factory defaults (RAM only).");
     Serial.println("Use 'cal save' to persist, or reboot to revert if saved.");
 
@@ -3279,8 +3318,12 @@ void cmdCal(const char* arg1, const char* arg2, const char* arg3) {
       if (val < 100.0 || val > 100000.0) { Serial.println("Error: div1000 out of range [100, 100000]."); return; }
       DIVIDER_RATIO_1000 = val;
       Serial.print("DIVIDER_RATIO_1000 set to "); Serial.println(DIVIDER_RATIO_1000, 6);
+    } else if (strcasecmp(arg2, "opa828") == 0) {
+      if (val < -0.001 || val > 0.001) { Serial.println("Error: opa828 offset out of range [-1000, +1000] uV."); return; }
+      OPA828_OFFSET = val;
+      Serial.print("OPA828_OFFSET set to "); Serial.print(OPA828_OFFSET * 1e6, 3); Serial.println(" uV");
     } else {
-      Serial.println("Unknown cal set parameter. Use: gain, div10, div100, div1000");
+      Serial.println("Unknown cal set parameter. Use: gain, div10, div100, div1000, opa828");
     }
     Serial.println("(Use 'cal save' to persist to flash.)");
 
