@@ -131,6 +131,14 @@ KiCad 8 project files are in `DiffVM/`:
 | `VRef.kicad_sch` | 3x ADR1001 voltage references |
 | `DiffVM_4L.kicad_pcb` | PCB layout |
 
+## Design Notes
+
+| Document | Description |
+|----------|-------------|
+| [`filter-design.md`](filter-design.md) | Workflow for building precision low-pass filters with measured capacitors and calculated resistors |
+| [`Calibration.md`](Calibration.md) | Calibration procedures and constants |
+| [`ADC_analysis.md`](ADC_analysis.md) | ADS127L11 configuration, filter selection, and ENOB analysis |
+
 ## References
 
 - [Low-Noise Instrumentation Amplifier with Nanovolt Sensitivity](https://www.analog.com/en/resources/analog-dialogue/articles/low-noise-inamp-nanovolt-sensitivity.html) (Analog Devices)
