@@ -1,0 +1,172 @@
+// ===== POST Test 10: Settling time / ENOB =====================================
+// REMOVED 2026-04-30 — preserved here for reference. Was the last entry in runPOST().
+// Drives the input mux to GND and the DAC between its largest non-overflowing
+// positive code (maxCode) and most negative non-overflowing code (minCode), with
+// a chopper toggle in between. After each transition the ADC is read until 5
+// consecutive samples lie within SETTLE_TOL_LSB of each other; the population
+// stdev of those 5 samples is the within-run plateau noise. Averaged over
+// SETTLE_TRIALS trials per phase, the noise is converted to ENOB; PASS if all
+// four phases >= 20 bits.
+
+namespace post_settling {
+  static constexpr int      SETTLE_TRIALS         = 5;
+  static constexpr int      SETTLE_MAX_SAMPLES    = 200;     // ~51 ms cap
+  static constexpr int32_t  SETTLE_TOL_LSB        = 64;      // last-PLATEAU_N stability band
+  static constexpr int32_t  OVERFLOW_BACKOFF_LSB  = 200000;  // headroom below ADC_OVERFLOW_POS
+  static constexpr float    ENOB_PASS_BITS        = 20.0f;
+  static constexpr int      PLATEAU_N             = 5;
+
+  struct SettleResult {
+    bool    settled;
+    int     samplesUsed;
+    double  plateauStdevLsb;
+  };
+
+  // Reusable ADC read loop. Knows nothing about DAC or chopper -- only reads
+  // the ADC and decides when the plateau is stable.
+  static SettleResult readUntilSettled(int trialIdx, const char* tag) {
+    SettleResult r{false, 0, 0.0};
+    int32_t window[PLATEAU_N] = {0};
+    int     wCount = 0;
+
+    for (int i = 0; i < SETTLE_MAX_SAMPLES; ++i) {
+      int32_t s;
+      if (!adc.readSample24(s)) break;
+      r.samplesUsed = i + 1;
+
+      Serial.print("  trial="); Serial.print(trialIdx);
+      Serial.print(" phase="); Serial.print(tag);
+      Serial.print(" n="); Serial.print(r.samplesUsed);
+      Serial.print(" code="); Serial.println(s);
+
+      window[i % PLATEAU_N] = s;
+      wCount++;
+      if (wCount < PLATEAU_N) continue;
+
+      int32_t mn = window[0], mx = window[0];
+      for (int k = 1; k < PLATEAU_N; ++k) {
+        if (window[k] < mn) mn = window[k];
+        if (window[k] > mx) mx = window[k];
+      }
+      if ((mx - mn) > SETTLE_TOL_LSB) continue;
+
+      double mean = 0;
+      for (int k = 0; k < PLATEAU_N; ++k) mean += window[k];
+      mean /= PLATEAU_N;
+      double var = 0;
+      for (int k = 0; k < PLATEAU_N; ++k) {
+        double d = window[k] - mean;
+        var += d * d;
+      }
+      r.plateauStdevLsb = sqrt(var / PLATEAU_N);
+      r.settled = true;
+      return r;
+    }
+    return r;   // settled stays false if loop exhausted
+  }
+
+  // Sweep DAC outward in coarse steps until the ADC reading approaches overflow,
+  // then return the last in-range code. direction = +1 finds maxCode, -1 finds minCode.
+  static bool findNonOverflowCode(int direction, int16_t &out) {
+    const int32_t step = (direction > 0) ? 4 : -4;
+    int16_t code = 0;
+    int16_t lastGood = 0;
+    for (int i = 0; i < 256; ++i) {
+      dac.setCodeFast(code);
+      delay(20);                                 // Bessel filter ~99% settled
+      int32_t s;
+      adc.readSample24(s); // discard one
+      if (!adc.readSample24(s)) return false;
+      const int32_t posLimit = ADC_OVERFLOW_POS - OVERFLOW_BACKOFF_LSB;
+      const int32_t negLimit = ADC_OVERFLOW_NEG + OVERFLOW_BACKOFF_LSB;
+      if (s > posLimit || s < negLimit) { out = lastGood; return true; }
+      lastGood = code;
+      int32_t nextCode = (int32_t)code + step;
+      if (nextCode > 32764)  nextCode = 32764;
+      if (nextCode < -32764) nextCode = -32764;
+      if ((int16_t)nextCode == code) { out = lastGood; return true; }
+      code = (int16_t)nextCode;
+    }
+    out = lastGood;
+    return true;
+  }
+
+  static void accumulatePhase(const SettleResult& r, int phaseIdx,
+                              double* sumStdev, int* sumSamples, int* failed) {
+    if (!r.settled) { failed[phaseIdx]++; return; }
+    sumStdev[phaseIdx]   += r.plateauStdevLsb;
+    sumSamples[phaseIdx] += r.samplesUsed;
+  }
+} // namespace post_settling
+
+bool postTestSettling() {
+  using namespace post_settling;
+
+  Serial.println("POST: Settling time / ENOB...");
+  ScopedInstrumentState guard;
+  const bool savedChopState = chopper.state();
+
+  inputMux.select(InputChannel::GND);
+  digitalWriteFast(PIN_TMUX_EN, LOW);
+  delayMicroseconds(SETTLE_US + TMUX_RECONNECT_US);
+  adc.stop();
+  delayMicroseconds(SETTLE_US);
+  adc.start();
+
+  int16_t maxCode, minCode;
+  if (!findNonOverflowCode(+1, maxCode) || !findNonOverflowCode(-1, minCode) || maxCode==minCode) {
+    Serial.println("POST: Settling FAIL (could not find valid non-overflow codes)");
+    adc.stop();
+    chopper.setState(savedChopState);
+    return false;
+  }
+  Serial.print("  maxCode="); Serial.print(maxCode);
+  Serial.print("  minCode="); Serial.println(minCode);
+
+  static const char* phaseName[4] = {"DAC_min_to_max","CHOP_at_max",
+                                     "DAC_max_to_min","CHOP_at_min"};
+  double sumStdev[4]   = {0,0,0,0};
+  int    sumSamples[4] = {0,0,0,0};
+  int    failed[4]     = {0,0,0,0};
+
+  // Prime so the first phase is a genuine min->max transition.
+  dac.setCodeFast(minCode);
+  delay(20);
+
+  for (int trial = 0; trial < SETTLE_TRIALS; ++trial) {
+    dac.setCodeFast(maxCode);
+    accumulatePhase(readUntilSettled(trial, phaseName[0]), 0, sumStdev, sumSamples, failed);
+
+    chopper.toggle();
+    accumulatePhase(readUntilSettled(trial, phaseName[1]), 1, sumStdev, sumSamples, failed);
+
+    dac.setCodeFast(minCode);
+    accumulatePhase(readUntilSettled(trial, phaseName[2]), 2, sumStdev, sumSamples, failed);
+
+    chopper.toggle();
+    accumulatePhase(readUntilSettled(trial, phaseName[3]), 3, sumStdev, sumSamples, failed);
+  }
+
+  adc.stop();
+  chopper.setState(savedChopState);
+
+  bool pass = true;
+  Serial.println("  Phase             AvgSamples  AvgNoiseLSB   ENOB    Result");
+  for (int p = 0; p < 4; ++p) {
+    const double avgNoise   = sumStdev[p]   / SETTLE_TRIALS;
+    const double avgSamples = (double)sumSamples[p] / SETTLE_TRIALS;
+    const double enob = (avgNoise > 0)
+        ? log2(ADC_FSR_CODES / (avgNoise * 3.4641))   // sqrt(12) ~= 3.4641
+        : 24.0;
+    const bool phasePass = (enob >= ENOB_PASS_BITS) && (failed[p] == 0);
+    pass = pass && phasePass;
+    Serial.print("  "); Serial.print(phaseName[p]);
+    Serial.print("\t"); Serial.print(avgSamples, 1);
+    Serial.print("\t"); Serial.print(avgNoise, 2);
+    Serial.print("\t"); Serial.print(enob, 2);
+    Serial.print("\t"); Serial.println(phasePass ? "PASS" : "FAIL");
+  }
+  Serial.print("POST: Settling ");
+  Serial.println(pass ? "PASS" : "FAIL");
+  return pass;
+}

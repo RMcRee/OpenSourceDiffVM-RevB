@@ -143,7 +143,7 @@ public:
   // Write code, then update output using software LDAC.
   void writeCodeAndUpdate(int16_t code) {
     writeCode(code);
-    softwareLDAC();
+    //softwareLDAC(); LDAC pin tied low
   }
 
   // Set clearcode register.

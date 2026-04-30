@@ -47,13 +47,14 @@ static constexpr bool SHOW_ADEV  = false;
 
 // ---------------- POST Configuration ----------------
 // Set to true to halt on POST failure, false to continue with warning
-static constexpr bool POST_HALT_ON_FAIL = false;
+static constexpr bool POST_HALT_ON_FAIL = true;
 
 // Zero calibration test threshold (in nanovolts at input)
 // With preamp gain of 2000 and ADC LSB of ~298nV, this translates to ADC counts.
-// 5000 nV = 5 µV: allows for TMUX charge-injection residual and ADC noise on uncalibrated system.
-// Auto-zero will compensate this in normal operation; POST just checks the signal path works.
-static constexpr double POST_ZERO_THRESHOLD_NV = 25000.0;  // nV
+// Loose bound: chain has natural ~250 µV RTI residual offset (chopping doesn't fully cancel
+// every error term; observed ~248 µV on a healthy unit). Auto-zero compensates this in normal
+// operation. POST threshold catches "totally broken" not "needs auto-zero".
+static constexpr double POST_ZERO_THRESHOLD_NV = 500000.0;  // nV (500 µV)
 
 // POST result structure
 struct PostResult {
@@ -102,9 +103,9 @@ static constexpr uint8_t PIN_DIVMUX_A1  = 22;  // MUX36D04 A1: divider tap addre
 static constexpr float    ADC_FCLK_HZ       = 25'000'000.0f;   // external clock
 static constexpr float    ADC_FMOD_HZ       = ADC_FCLK_HZ / 2; // fMOD = fCLK/2
 static constexpr uint32_t SETTLE_US         = 300;             // guard time after each mux edge before using samples
-static constexpr uint8_t  DISCARD_SAMPLES   = 3;               // toss first 3 samples after edge (sinc5 positions 4,5,6 = symmetric for both phases)
-static constexpr uint8_t  GOOD_SAMPLES      = 4;               // samples to average per half-cycle
-static constexpr int      PULSE_WIDTH_US    = 5;               // CI_TMUXSEL pre-transition pulse duration
+static constexpr uint8_t  DISCARD_SAMPLES   = 1;               // toss first 3 samples after edge (sinc5 positions 4,5,6 = symmetric for both phases)
+static constexpr uint8_t  GOOD_SAMPLES      = 6;               // samples to average per half-cycle
+static constexpr int      PULSE_WIDTH_US    = 50;              // CI_TMUXSEL pre-transition pulse duration (was 5 — too short to be reliably visible at 320 kHz scope sampling, and marginal for the cancellation switch settle)
 
 // ---------------- DAC Filter Settling ----------------
 // Second-order Bessel filter on DAC output requires settling after step changes.
@@ -157,11 +158,6 @@ static double DIVIDER_RATIO_10   = DIVIDER_RATIO_10_DEFAULT;    // ±50V: mux by
 static double DIVIDER_RATIO_100  = DIVIDER_RATIO_100_DEFAULT;   // ±500V: 1.1111M || 101.26K
 static double DIVIDER_RATIO_1000 = DIVIDER_RATIO_1000_DEFAULT;  // ±5kV: 1.1111M || 10.26K
 
-// ---------------- Overflow Detection ----------------
-// 24-bit ADC full scale: ±8,388,607. Use 90% threshold for overflow detection.
-static constexpr int32_t ADC_OVERFLOW_POS   =  7'549'747;      // ~90% of 0x7FFFFF
-static constexpr int32_t ADC_OVERFLOW_NEG   = -7'549'747;      // ~90% of -0x800000
-
 // ---------------- Precision Voltage Constants (64-bit double) ----------------
 // ADC: ADS127L11, 24-bit, differential, VREF = 2.500V nominal.
 // The VREF pin is driven through a 100Ω series resistor (added to handle capacitive load),
@@ -173,6 +169,11 @@ static double ADC_VREF     = ADC_VREF_DEFAULT;       // runtime-calibratable; us
 static constexpr double ADC_FSR_CODES   = 16777216.0; // 2^24 full scale codes
 static double ADC_LSB_V    = (2.0 * ADC_VREF_DEFAULT) / ADC_FSR_CODES;  // updated when ADC_VREF changes
 
+// ---------------- Overflow Detection ----------------
+// 24-bit ADC full scale: ±8,388,607. Use 90% threshold for overflow detection.
+static constexpr int32_t ADC_OVERFLOW_POS   =  0.95 * ADC_FSR_CODES/2;      // ~95% of 0x7FFFFF
+static constexpr int32_t ADC_OVERFLOW_NEG   = -1.00 * ADC_OVERFLOW_POS;     // ~95% of -0x800000
+
 // DAC: AD5760, 16-bit, two's complement in 2x mode, VREFP=5V, VREFN=0V
 // Output range: ±5V (with 2x gain), codes 0x8000 (-32768) to 0x7FFF (+32767)
 static constexpr double DAC_VREF        = 5.0;                           // DAC full-scale voltage (V)
@@ -183,6 +184,13 @@ static constexpr double DAC_LSB_V       = (2.0 * DAC_VREF) / DAC_FSR_CODES;  // 
 // Runtime-mutable for in-situ calibration. Use 'cal set gain <v>' to adjust.
 static constexpr double PREAMP_GAIN_DEFAULT = 2000.0;
 static double PREAMP_GAIN = PREAMP_GAIN_DEFAULT;
+
+// Cache for 'cal gain' — updated by outputMeasurement each cycle.
+// g_calLastVoltage is ewmaV when EWMA is initialized, else vxCorrected — the same
+// value the user sees as the primary reading.
+static double       g_calLastVoltage = NAN;
+static int16_t      g_calLastDacCode = 0;
+static InputChannel g_calLastChannel = InputChannel::Vx1;
 
 // OPA828 buffer offset at the HV divider output node (volts, measured at buffer output).
 // Chopping does NOT cancel this offset — it must be calibrated out explicitly.
@@ -677,6 +685,7 @@ private:
 struct HalfCycleResult {
   LowerMoments stats;   // Welford accumulator over GOOD_SAMPLES ADC counts for this half-cycle
   bool overflow = false;
+  int32_t overflowSample = 0;  // value of the sample that triggered overflow (only valid when overflow)
 };
 
 // ================== Allan Deviation (OADEV) Tracker ==================
@@ -1021,15 +1030,35 @@ inline bool isOverflow(int32_t sample) {
 // Resets the ADC filter via stop/start so filter history from the previous
 // DAC code does not produce a spurious in-range reading on the first sample.
 // Returns true on success, false on ADC timeout.
+// Settle time after re-enabling TMUX in binary search. The preamp has been
+// disconnected for up to RC_SETTLE_MS; allow it to recover before the ADC filter
+// sees any signal. Must be long enough to avoid false overflow on the discard sample.
+static constexpr uint32_t TMUX_RECONNECT_US = 2000;
+
 bool readSettledSample(int32_t &sample) {
   adc.stop();
-  delayMicroseconds(SETTLE_US);
+  digitalWriteFast(PIN_TMUX_EN, LOW);   // enable TMUX (active-low) early so preamp starts recovering
+  delayMicroseconds(SETTLE_US + TMUX_RECONNECT_US);  // guard + preamp reconnect settle
   adc.start();
   int32_t discard;
   for (uint8_t i = 0; i < DISCARD_SAMPLES; i++) {
-    if (!adc.readSample24(discard)) return false;
+    if (!adc.readSample24(discard)) {
+      digitalWriteFast(PIN_TMUX_EN, HIGH);  // disable TMUX on error
+      return false;
+    }
+    if (isOverflow(discard)) {
+      // Overflow confirmed on first sample — disable TMUX immediately to protect diodes.
+      sample = discard;
+      digitalWriteFast(PIN_TMUX_EN, HIGH);
+      return true;
+    }
   }
-  return adc.readSample24(sample);
+  bool ok = adc.readSample24(sample);
+  if (!ok || isOverflow(sample)) {
+    digitalWriteFast(PIN_TMUX_EN, HIGH);
+  }
+  // Non-overflow: leave TMUX enabled so normal measurement can follow without re-enabling.
+  return ok;
 }
 
 /**
@@ -1057,6 +1086,11 @@ bool binarySearchDAC() {
   if (chopper.state()) {
     chopper.toggle();  // Toggle HIGH -> LOW using charge-injection-minimizing sequence
   }
+  
+  // Disable TMUX for the bulk of the search. readSettledSample re-enables it
+  // briefly per sample (active-low EN), so diodes are only exposed during the
+  // ~2-sample window, not the full 80ms RC settle.
+  digitalWriteFast(PIN_TMUX_EN, HIGH);
 
   // Search bounds constrained to 14-bit boundaries (multiples of 4)
   // 16-bit range: -32768 to 32767, but max aligned value is 32764
@@ -1119,11 +1153,38 @@ bool binarySearchDAC() {
       // Vx < DAC, decrease DAC
       high = mid - 4;  // Previous 14-bit boundary
     } else {
-      // Converged — now do full settle at final code for clean integration
-      dac.setCode((int16_t)mid);
+      // First in-range sample. Refine by stepping ±4 codes toward zero to find
+      // the 14-bit-aligned code with smallest |ADC| — gives more headroom for
+      // the chopped measurement that follows (a code "just below overflow" can
+      // rail on the very next sample due to noise).
+      int32_t bestMid    = mid;
+      int32_t bestSample = lastSample;
+      const int MAX_REFINE = 8;
+      for (int r = 0; r < MAX_REFINE; r++) {
+        int32_t step = (bestSample > 0) ? +4 : -4;   // sample>0 means Vx>Vdac → raise DAC
+        int32_t trialMid = bestMid + step;
+        if (trialMid > 32764 || trialMid < -32764) break;
+        dac.setCodeFast((int16_t)trialMid);
+        delay(RC_SETTLE_MS);
+        int32_t trialSample;
+        if (!readSettledSample(trialSample)) break;
+        Serial.print("  refine: DAC="); Serial.print(trialMid);
+        Serial.print(" ADC="); Serial.println(trialSample);
+        if (isOverflow(trialSample)) break;          // overshot to rail — keep prev best
+        const bool signFlipped = (trialSample > 0) != (bestSample > 0);
+        if (abs(trialSample) < abs(bestSample)) {
+          bestMid    = trialMid;
+          bestSample = trialSample;
+        }
+        if (signFlipped) break;                      // adjacent codes straddle zero — done
+        if (abs(trialSample) >= abs(bestSample) && trialMid != bestMid) break;
+      }
+      dac.setCode((int16_t)bestMid);
       Serial.print("DAC: Converged at code ");
-      Serial.print(mid);
-      Serial.println(" (14-bit aligned)");
+      Serial.print(bestMid);
+      Serial.print(" (refined, ADC=");
+      Serial.print(bestSample);
+      Serial.println(")");
       return true;
     }
 
@@ -1318,12 +1379,12 @@ void ChopperDriver::begin() {
 
 void ChopperDriver::toggle() {
   digitalWriteFast(PIN_TMUX_EN, LOW); // just in case we got into unknown state due to post...or?
-  //digitalWriteFast(PIN_CI_TMUXSEL, HIGH);
-  //delayMicroseconds(PULSE_WIDTH_US);
+  digitalWriteFast(PIN_CI_TMUXSEL, HIGH);
+  delayMicroseconds(PULSE_WIDTH_US);
   state_ = !state_;
   digitalWriteFast(PIN_TMUXSEL, state_);
-  //delayMicroseconds(PULSE_WIDTH_US);
-  //digitalWriteFast(PIN_CI_TMUXSEL, LOW);
+  delayMicroseconds(PULSE_WIDTH_US);
+  digitalWriteFast(PIN_CI_TMUXSEL, LOW);
 }
 
 // ---------------- Chopped acquisition ----------------
@@ -1332,18 +1393,12 @@ void ChopperDriver::toggle() {
 // extraDiscards: additional samples to discard after DISCARD_SAMPLES, before the overflow
 // check. Pass > 0 for Phase B to allow TMUX charge-injection transients to decay first.
 // Sets result.overflow on ADC overflow OR timeout.
-HalfCycleResult acquireHalfCycle(uint8_t extraDiscards = 0) {
+HalfCycleResult acquireHalfCycle() {
   HalfCycleResult result;
-  adc.stop();
-  delayMicroseconds(SETTLE_US);
-  adc.start();
+
   // Discard initial samples after settling
   int32_t discard;
   for (uint8_t i = 0; i < DISCARD_SAMPLES; i++) {
-    if (!adc.readSample24(discard)) { result.overflow = true; return result; }
-  }
-  // Extra discards to let TMUX charge-injection decay (Phase B only)
-  for (uint8_t i = 0; i < extraDiscards; i++) {
     if (!adc.readSample24(discard)) { result.overflow = true; return result; }
   }
 
@@ -1352,6 +1407,7 @@ HalfCycleResult acquireHalfCycle(uint8_t extraDiscards = 0) {
   if (!adc.readSample24(firstSample)) { result.overflow = true; return result; }
   if (isOverflow(firstSample)) {
     result.overflow = true;
+    result.overflowSample = firstSample;
     return result;
   }
   result.stats.accumulate((double)firstSample);
@@ -1405,7 +1461,7 @@ public:
     .channels = { InputChannel::Vx1 },
     .count = 1,
     .integrationCycles = 850,
-    .autoZeroEnabled = true,
+    .autoZeroEnabled = false,
     .autoZeroInterval = 10,
     .outputMode = OutputMode::Human,
   };
@@ -1682,6 +1738,11 @@ void cmdAutoZero(const char* arg) {
   if (strcasecmp(arg, "on") == 0) {
     scanner.config.autoZeroEnabled = true;
     Serial.println("Auto-zero enabled.");
+    Serial.println("WARNING: Auto-zero re-converges the DAC to near code 0 during GND measurement.");
+    Serial.println("  The DAC cal table is typically uncalibrated near code 0, so the DAC's");
+    Serial.println("  true near-zero offset is stored as a spurious correction applied to all");
+    Serial.println("  readings. This degrades accuracy when 'cal dac' is used at measurement codes.");
+    Serial.println("  Recommended: keep autozero off when using DAC calibration.");
   } else if (strcasecmp(arg, "off") == 0) {
     scanner.config.autoZeroEnabled = false;
     Serial.println("Auto-zero disabled.");
@@ -1824,6 +1885,7 @@ void printHelp() {
   Serial.println("label <ch> <text>     Set label for channel (max 15 chars, no spaces)");
   Serial.println("label <ch>            Show label for channel");
   Serial.println("label reset           Clear all labels and save to flash");
+  Serial.println("hold a|b              Force chopper state for scope probing (any key to exit)");
   Serial.println("help                Show this help");
   Serial.println("=======================\n");
 }
@@ -1845,6 +1907,52 @@ void cmdAdev(const char* arg) {
     return;
   }
   allanDev.printResults(computeTau0());
+}
+
+// Debug: force chopper into state A or B and hold there so the AD8428 inputs
+// can be probed with a scope. Uses the CI-protected toggle path (same as the
+// chopped measurement loop). Leaves DAC code and input mux untouched. Prints
+// the ADC sample every ~500 ms so a railed preamp is obvious. Exits on any
+// incoming serial character and restores the previous chopper state.
+void cmdHold(const char* arg) {
+  if (!arg || (strcasecmp(arg, "a") != 0 && strcasecmp(arg, "b") != 0)) {
+    Serial.println("Usage: hold a|b   (force chopper state for scope probing; any key to exit)");
+    return;
+  }
+  bool wantB = (strcasecmp(arg, "b") == 0);
+  bool savedState = chopper.state();
+
+  digitalWriteFast(PIN_TMUX_EN, LOW);
+  if (chopper.state() != wantB) chopper.toggle();
+
+  adc.stop();
+  delayMicroseconds(SETTLE_US);
+  adc.start();
+  delay(20);
+
+  Serial.print("Holding chopper in state ");
+  Serial.print(wantB ? 'B' : 'A');
+  Serial.print(" (DAC code="); Serial.print(dac.currentCode());
+  Serial.print(", MUXSEL="); Serial.print(wantB ? "HIGH" : "LOW");
+  Serial.println("). Press any key to exit.");
+
+  uint32_t lastPrint = millis();
+  while (Serial.available() == 0) {
+    if (millis() - lastPrint >= 500) {
+      lastPrint = millis();
+      int32_t s;
+      if (adc.readSample24(s)) {
+        Serial.print("  state="); Serial.print(wantB ? 'B' : 'A');
+        Serial.print(" ADC="); Serial.println(s);
+      } else {
+        Serial.println("  (ADC read failed)");
+      }
+    }
+  }
+  Serial.read();  // consume wake-up character
+
+  if (chopper.state() != savedState) chopper.toggle();
+  Serial.println("Hold released.");
 }
 
 // Forward declarations for config commands (implemented in EEPROM section)
@@ -1964,6 +2072,8 @@ void processCommand(char* line) {
     cmdCal(arg1, arg2, arg3);
   } else if (strcasecmp(cmd, "label") == 0) {
     cmdLabel(arg1, arg2);
+  } else if (strcasecmp(cmd, "hold") == 0) {
+    cmdHold(arg1);
   } else if (strcasecmp(cmd, "help") == 0) {
     printHelp();
   } else {
@@ -2192,207 +2302,148 @@ bool postPinIdVerify() {
   chopper.begin(); // re-initialize
   return true;
 }
-/**
- * POST Test 4: Signal Chain (DAC to ADC)
- * Sets DAC to 0V and verifies ADC reads near zero.
- * This tests the entire analog signal path.
- */
-bool postTestSignalChain() {
-  Serial.print("POST: Signal Chain... ");
-  
-  // Switch to GND
-  inputMux.select(InputChannel::GND);
-  // Set DAC to 0V (code 0x0000 in two's complement mode)
-  dac.setCode(0);  // Includes 250ms filter settling delay
-
-  // Stop/start to flush any filter history from startup transients or prior tests.
-  adc.stop();
-  delayMicroseconds(SETTLE_US);
-  adc.start();
-  int32_t s;
-  for (uint8_t i = 0; i < DISCARD_SAMPLES; i++) {
-    if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
-  }
-  int64_t sum = 0;
-  const int numSamples = 5;
-  for (int i = 0; i < numSamples; i++) {
-    if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
-    sum += s;
-  }
-  int32_t avg = sum / numSamples;
-
-  adc.stop();
-  
-  // With DAC at 0V and Vx presumably near 0V (or within range),
-  // the ADC should not be in overflow. Allow up to 50% of full scale.
-  const int32_t threshold = 4'000'000;  // ~50% of 8,388,607
-  bool pass = (avg > -threshold) && (avg < threshold);
-
-  if (pass) {
-    Serial.print("PASS (ADC=");
-    Serial.print(avg);
-    Serial.println(")");
-  } else {
-    Serial.print("FAIL (ADC=");
-    Serial.print(avg);
-    Serial.print(", expected < ±");
-    Serial.print(threshold);
-    Serial.println(")");
-  }
-  return pass;
-}
-
-/**
- * POST Test 5: Polarity Check
- * Verifies that changing DAC in positive direction causes expected ADC change.
- * With TMUXSEL=LOW, increasing DAC should decrease ADC reading
- * because ADC measures (Vx - DAC) * gain.
- *
- * Hardware signal routing (from schematic):
- *   MUXSEL=0 (LOW):  DAC→pin1(V-), Vx→pin4(V+) → output = (Vx - DAC) × gain
- *   MUXSEL=1 (HIGH): DAC→pin4(V+), Vx→pin1(V-) → output = (DAC - Vx) × gain
- */
-bool postTestPolarity() {
-  Serial.print("POST: Polarity... ");
-  inputMux.select(InputChannel::GND);
-
-  // Ensure TMUXSEL=LOW so ADC reads (Vx - DAC) * gain
-  if (chopper.state()) {
-    chopper.toggle();
-  }
-
-  static constexpr uint8_t POL_DISCARD = 10;  // flush sinc5 filter after each DAC step
-
-  // Measure at DAC=0: stop/start so filter starts fresh
-  dac.setCode(0);
-  adc.stop();
-  delayMicroseconds(SETTLE_US);
-  adc.start();
-  int32_t adcAt0, adcAt1000, discard;
-  for (uint8_t i = 0; i < POL_DISCARD; i++) {
-    if (!adc.readSample24(discard)) { Serial.println("FAIL (ADC timeout)"); return false; }
-  }
-  if (!adc.readSample24(adcAt0)) { Serial.println("FAIL (ADC timeout)"); return false; }
-
-  // Measure at DAC=+1000: settle delay is inside setCode(); then stop/start to flush filter
-  dac.setCode(1000);
-  adc.stop();
-  delayMicroseconds(SETTLE_US);
-  adc.start();
-  for (uint8_t i = 0; i < POL_DISCARD; i++) {
-    if (!adc.readSample24(discard)) { Serial.println("FAIL (ADC timeout)"); return false; }
-  }
-  if (!adc.readSample24(adcAt1000)) { Serial.println("FAIL (ADC timeout)"); return false; }
-
-  // Restore DAC
-  dac.setCode(0);
-  adc.stop();
-
-  // With TMUXSEL=LOW: ADC = (Vx - DAC) * gain
-  // Increasing DAC should decrease ADC output (expect large negative delta)
-  int32_t delta = adcAt1000 - adcAt0;
-  bool pass = (delta < -10000);
-
-  Serial.print(pass ? "PASS" : "FAIL");
-  Serial.print(" (adcAt0="); Serial.print(adcAt0);
-  Serial.print(", adcAt1000="); Serial.print(adcAt1000);
-  Serial.print(", delta="); Serial.print(delta);
-  if (!pass) {
-    Serial.print(", expected delta < -10000");
-    if (abs(delta) < 1000) {
-      Serial.print(" -- DAC not reaching preamp? Check external op-amp (RBUF=0 mode requires it)");
+// ===== Helpers shared by signal_chain / polarity / chop_symmetry tests ========
+//
+// Static single-phase reads at gain ×2000 saturate the ADC because the AD8428
+// chain's offset (and charge stored in the Vcm filter cap) dominates a single
+// phase's output. The chopper-demodulated value is the only stable observable;
+// these tests therefore drive the chopper at normal cadence and read the
+// demodulated mean from runOneChopCycle().
+//
+// Returns demod mean (in ADC LSB) on success, or NaN on overflow.
+static double measureDemodMean(int cycles) {
+  LowerMoments stats;
+  for (int i = 0; i < cycles; ++i) {
+    if (!runOneChopCycle(stats, /*searchOnOverflow=*/false)) {
+      return NAN;
     }
   }
+  return stats.mean();
+}
+
+// DAC null code with mux=GND, found by postTestSignalChain via binarySearchDAC.
+// postTestPolarity / postTestChopSymmetry use this null ±1 LSB so neither single
+// phase rails (offset margin too small for larger steps even at gain ×2000).
+// Reset to 0 if signal_chain fails — the dependent tests will then fail too,
+// which is the correct cascade.
+static int16_t s_postZeroDac = 0;
+
+/**
+ * POST Test 4: Signal Chain (DAC to ADC) — uses binarySearchDAC to find the null.
+ * Convergence proves the entire chain (DAC → preamp → ADC) responds correctly.
+ * Records the null code in s_postZeroDac for the next two tests.
+ */
+bool postTestSignalChain() {
+  Serial.println("POST: Signal Chain...");
+  ScopedInstrumentState guard;
+
+  inputMux.select(InputChannel::GND);
+  dac.setCode(0);  // 250 ms filter settling
+
+  if (!binarySearchDAC()) {
+    Serial.println("POST: Signal Chain FAIL (binarySearchDAC did not converge)");
+    s_postZeroDac = 0;
+    return false;
+  }
+  s_postZeroDac = dac.currentCode();
+
+  // At the null, the demodulated reading should be near zero.
+  const double demod = measureDemodMean(5);
+  if (isnan(demod)) {
+    Serial.println("POST: Signal Chain FAIL (overflow during measurement at null)");
+    return false;
+  }
+
+  // Loose demod bound: chain has natural chopping-residual offset (~250 µV RTI ~= 1.7 M LSB)
+  // that auto-zero handles. Threshold catches "totally broken" not "needs auto-zero".
+  static constexpr double  DEMOD_THRESHOLD = 5'000'000.0;
+  static constexpr int16_t ZERO_DAC_BOUND  = 200;   // expect single-digit LSB at GND
+  const bool pass = (fabs(demod) < DEMOD_THRESHOLD) && (abs(s_postZeroDac) < ZERO_DAC_BOUND);
+
+  Serial.print("POST: Signal Chain ");
+  Serial.print(pass ? "PASS" : "FAIL");
+  Serial.print(" (zeroDac="); Serial.print(s_postZeroDac);
+  Serial.print(", demod="); Serial.print(demod, 0);
   Serial.println(")");
   return pass;
 }
 
 /**
- * POST Test 6: Chopping Symmetry
- * Verifies that the two chopping phases produce opposite polarity readings.
- *
- * Hardware signal routing (from schematic):
- *   MUXSEL=0 (LOW):  DAC→pin1(V-), Vx→pin4(V+) → output = (Vx - DAC) × gain
- *   MUXSEL=1 (HIGH): DAC→pin4(V+), Vx→pin1(V-) → output = (DAC - Vx) × gain
- *
- * These should be approximately equal and opposite.
+ * POST Test 5: Polarity — chop-demodulated, ±1 LSB around the discovered null.
+ * Demod = (Vx - DAC) × gain, so stepping DAC up swings demod down. Confirms the
+ * sign of the chain end-to-end.
+ */
+bool postTestPolarity() {
+  Serial.print("POST: Polarity... ");
+  ScopedInstrumentState guard;
+  inputMux.select(InputChannel::GND);
+
+  const int16_t zero = s_postZeroDac;
+
+  dac.setCode(zero - 1);
+  LowerMoments prime;
+  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero-1)"); return false; }
+  const double demodNeg = measureDemodMean(5);
+  if (isnan(demodNeg)) { Serial.println("FAIL (overflow @ zero-1)"); return false; }
+
+  dac.setCode(zero + 1);
+  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero+1)"); return false; }
+  const double demodPos = measureDemodMean(5);
+  if (isnan(demodPos)) { Serial.println("FAIL (overflow @ zero+1)"); return false; }
+
+  const double delta = demodPos - demodNeg;
+  const bool pass = (delta < -500000.0);
+  Serial.print(pass ? "PASS" : "FAIL");
+  Serial.print(" (zero="); Serial.print(zero);
+  Serial.print(", demod@zero-1="); Serial.print(demodNeg, 0);
+  Serial.print(", demod@zero+1="); Serial.print(demodPos, 0);
+  Serial.print(", delta="); Serial.print(delta, 0);
+  if (!pass) Serial.print(" — expected delta < -500000");
+  Serial.println(")");
+  return pass;
+}
+
+/**
+ * POST Test 6: Chop Symmetry — magnitudes at zero±1 LSB should be equal-and-opposite.
+ * Polarity catches sign errors; this catches duty-skew or charge-injection asymmetry
+ * that polarity alone would miss.
  */
 bool postTestChopSymmetry() {
   Serial.print("POST: Chop Symmetry... ");
-  // Switch to GND
+  ScopedInstrumentState guard;
   inputMux.select(InputChannel::GND);
 
-  // DAC=0: with Vx=GND=0 and DAC=0, both chop phases read ≈ VOS×gain (same sign).
-  // The symmetry check is that P1≈P2 (not P1≈-P2), i.e. the mux is toggling correctly.
-  dac.setCode(0);
+  const int16_t zero = s_postZeroDac;
 
-  // Ensure TMUXSEL=LOW, measure (Vx - DAC) * gain
-  if (chopper.state()) {
-    chopper.toggle();
-  }
+  // 3-point slope linearity around the null. The chain has a natural ~262 µV RTI
+  // residual offset (~-1.76M LSB demod), so symmetry-around-zero fails on a healthy
+  // unit. Slopes between adjacent DAC codes are independent of that offset.
+  dac.setCode(zero - 1);
+  LowerMoments prime;
+  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero-1)"); return false; }
+  const double demodNeg = measureDemodMean(5);
+  if (isnan(demodNeg)) { Serial.println("FAIL (overflow @ zero-1)"); return false; }
 
-  // TMUX charge injection saturates the preamp; sinc5 filter needs ~5 output samples
-  // to flush. Use 15 discards after each toggle for a safe margin.
-  static constexpr uint8_t CHOP_DISCARD = 15;
+  dac.setCode(zero);
+  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero)"); return false; }
+  const double demodMid = measureDemodMean(5);
+  if (isnan(demodMid)) { Serial.println("FAIL (overflow @ zero)"); return false; }
 
-  // Phase 1: stop/start to flush filter history, then read.
-  adc.stop();
-  delayMicroseconds(SETTLE_US);
-  adc.start();
+  dac.setCode(zero + 1);
+  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero+1)"); return false; }
+  const double demodPos = measureDemodMean(5);
+  if (isnan(demodPos)) { Serial.println("FAIL (overflow @ zero+1)"); return false; }
 
-  int32_t phase1, phase2, discard;
-  for (uint8_t i = 0; i < CHOP_DISCARD; i++) {
-    if (!adc.readSample24(discard)) { Serial.println("FAIL (ADC timeout)"); return false; }
-  }
-  if (!adc.readSample24(phase1)) {
-    Serial.println("FAIL (ADC timeout)"); return false;
-  }
+  const double slopeLeft  = demodMid - demodNeg;   // expect ~-1.0M LSB / LSB DAC
+  const double slopeRight = demodPos - demodMid;
+  const double slopeAvgMag = (fabs(slopeLeft) + fabs(slopeRight)) / 2.0;
+  const double asym = (slopeAvgMag > 0) ? fabs(slopeLeft - slopeRight) / slopeAvgMag : 1.0;
 
-  // Phase 2: toggle TMUX, stop/start to flush charge-injection transient, then read.
-  chopper.toggle();
-  adc.stop();
-  delayMicroseconds(SETTLE_US);
-  adc.start();
-
-  // Settling trace: print sample value at key steps to distinguish transient vs steady-state.
-  Serial.println();
-  Serial.print("  P2 settle trace (sample# : count): ");
-  for (uint8_t i = 0; i < CHOP_DISCARD; i++) {
-    if (!adc.readSample24(discard)) { Serial.println("FAIL (ADC timeout)"); return false; }
-    if (i == 0 || i == 2 || i == 4 || i == 9 || i == CHOP_DISCARD - 1) {
-      Serial.print(i); Serial.print(":"); Serial.print(discard); Serial.print("  ");
-    }
-  }
-  Serial.println();
-
-  if (!adc.readSample24(phase2)) {
-    Serial.println("FAIL (ADC timeout)"); return false;
-  }
-
-  // Restore TMUXSEL=LOW; stop ADC; wait for preamp to recover from phase-2 saturation.
-  // Settle-trace shows the decay time constant is ~200 output samples (~51ms), so 150ms
-  // is enough for the preamp output to reach the un-chopped VOS level before Input Mux runs.
-  chopper.toggle();
-  adc.stop();
-  delay(150);
-
-  // Pass criterion: TMUX is actively switching (P1 ≠ P2) and neither phase is in hard overflow.
-  // With a working DAC, |P1-P2| will be large (opposite polarity). With floating DAC output,
-  // the two phases will still differ if the TMUX routes different impedances to V+/V-.
-  // Failure (stuck TMUX) = P1 ≈ P2.
-  bool p1Overflow = (abs(phase1) > 8000000);
-  bool p2Overflow = (abs(phase2) > 8000000);
-  int32_t diff = abs(phase1 - phase2);
-  // Threshold: 10× the preamp VOS contribution (~15000 counts) — any TMUX switching produces far more
-  bool pass = !p1Overflow && !p2Overflow && (diff > 150000);
-
-  Serial.print("  ");
+  const bool pass = (slopeLeft < -500000.0) && (slopeRight < -500000.0) && (asym < 0.10);
   Serial.print(pass ? "PASS" : "FAIL");
-  Serial.print(" (P1="); Serial.print(phase1);
-  Serial.print(", P2="); Serial.print(phase2);
-  Serial.print(", diff="); Serial.print(diff);
-  if (p1Overflow) Serial.print(", P1_OVERFLOW");
-  if (p2Overflow) Serial.print(", P2_OVERFLOW");
+  Serial.print(" (slopeL="); Serial.print(slopeLeft, 0);
+  Serial.print(", slopeR="); Serial.print(slopeRight, 0);
+  Serial.print(", asym="); Serial.print(asym * 100.0, 1); Serial.print("%");
   Serial.println(")");
   return pass;
 }
@@ -3038,6 +3089,9 @@ public:
   // Format v3: [4] magic [2] version=3 [8×6=48] six doubles [2] CRC16 = 56 bytes
   bool saveConstants() {
     if (!mounted_) return false;
+    // Remove before writing: FILE_WRITE appends on LittleFS, so without this
+    // the new data lands after the old bytes and the next load reads stale values.
+    fs_.remove("/cal_consts.bin");
     File f = fs_.open("/cal_consts.bin", FILE_WRITE);
     if (!f) return false;
 
@@ -3136,6 +3190,7 @@ public:
       Serial.println("cal save: DAC table not valid; not saving table.");
       return false;
     }
+    fs_.remove("/dac_table.bin");
     File f = fs_.open("/dac_table.bin", FILE_WRITE);
     if (!f) return false;
 
@@ -3237,6 +3292,7 @@ public:
   // Format: [4] magic [128] labels data [2] CRC16 = 134 bytes
   bool saveLabels() {
     if (!mounted_) return false;
+    fs_.remove("/channel_labels.bin");
     File f = fs_.open("/channel_labels.bin", FILE_WRITE);
     if (!f) return false;
 
@@ -3589,7 +3645,7 @@ void cmdCalPoint(const char* voltageStr) {
  */
 void cmdCal(const char* arg1, const char* arg2, const char* arg3) {
   if (!arg1) {
-    Serial.println("Usage: cal status|save|load|erase|set|factory|build|point");
+    Serial.println("Usage: cal status|save|load|erase|set|factory|build|point|gain");
     return;
   }
 
@@ -3697,8 +3753,81 @@ void cmdCal(const char* arg1, const char* arg2, const char* arg3) {
     Serial.print("DAC table: code="); Serial.print(code);
     Serial.print(" -> "); Serial.print(voltage, 8); Serial.println(" V  (use 'cal save' to persist)");
 
+  } else if (strcasecmp(arg1, "gain") == 0) {
+    if (!arg2 || arg2[0] == '\0') {
+      Serial.println("Usage: cal gain <V_actual_V>");
+      Serial.println("  Apply a known precise voltage (e.g. 2.5 V reference), let binary search settle,");
+      Serial.println("  then run: cal gain 2.5");
+      return;
+    }
+    if (isnan(g_calLastVoltage)) {
+      Serial.println("No measurement cached yet -- start a scan first.");
+      return;
+    }
+    double vActual = atof(arg2);
+    if (vActual == 0.0) {
+      Serial.println("V_actual cannot be zero.");
+      return;
+    }
+
+    double dacV     = dacCalTable.codeToVoltage(g_calLastDacCode);
+    double divRatio = getInputDividerRatio(g_calLastChannel);
+    double refCorr  = getRefCorrectionFactor();
+
+    // Invert computeInputVoltage+refCorrection to get the preamp-space delta
+    // that corresponds to the displayed voltage (ewma if active, else vxCorrected).
+    // vxCorrected = (dacV + preampDelta) * divRatio * refCorr  [non-HVDiv]
+    // => preampDelta = vxCorrected / divRatio / refCorr - dacV
+    double vxAtPreampDisplayed = g_calLastVoltage / divRatio / refCorr;
+    if (g_calLastChannel == InputChannel::HVDiv) vxAtPreampDisplayed += OPA828_OFFSET;
+    double deltaDisplayed = vxAtPreampDisplayed - dacV;
+
+    // deltaActual: true preamp input delta from the reference meter reading.
+    double vxAtPreampActual = vActual / divRatio;
+    if (g_calLastChannel == InputChannel::HVDiv) vxAtPreampActual += OPA828_OFFSET;
+    double deltaActual = vxAtPreampActual / refCorr - dacV;
+
+    Serial.print("  Channel                  : "); Serial.println(getInputChannelName(g_calLastChannel));
+    Serial.print("  DAC code / voltage       : "); Serial.print(g_calLastDacCode);
+      Serial.print(" / "); Serial.print(dacV, 7); Serial.println(" V");
+    Serial.print("  refCorrection            : "); Serial.println(refCorr, 9);
+    Serial.print("  Displayed voltage        : "); Serial.print(g_calLastVoltage, 9); Serial.println(" V");
+    Serial.print("  Preamp delta (displayed) : "); Serial.print(deltaDisplayed * 1e6, 2); Serial.println(" uV");
+    Serial.print("  Preamp delta (actual)    : "); Serial.print(deltaActual * 1e6, 2); Serial.println(" uV");
+
+    if (fabs(deltaActual) < 0.010) {
+      Serial.println("WARNING: preamp delta < 10 mV -- accuracy will be poor.");
+    }
+
+    double newGain = PREAMP_GAIN * (deltaDisplayed / deltaActual);
+    Serial.print("  Old PREAMP_GAIN          : "); Serial.println(PREAMP_GAIN, 4);
+    Serial.print("  New PREAMP_GAIN          : "); Serial.println(newGain, 4);
+
+    // Hard reject: catches wrong channel, wildly wrong voltage, or measurement failure.
+    // AD8428 absolute gain tolerance is ±10% per stage; ±20% covers the two-stage ensemble.
+    constexpr double GAIN_SANITY_TOL = 0.20;
+    constexpr double GAIN_SANITY_MIN = PREAMP_GAIN_DEFAULT * (1.0 - GAIN_SANITY_TOL);  // 1600
+    constexpr double GAIN_SANITY_MAX = PREAMP_GAIN_DEFAULT * (1.0 + GAIN_SANITY_TOL);  // 2400
+    if (newGain < GAIN_SANITY_MIN || newGain > GAIN_SANITY_MAX) {
+      Serial.print("  REJECTED: computed gain outside sanity range [");
+      Serial.print(GAIN_SANITY_MIN, 0); Serial.print(", ");
+      Serial.print(GAIN_SANITY_MAX, 0); Serial.println("]");
+      Serial.println("  Check: correct channel selected, large preamp delta, ADC_VREF calibrated.");
+      return;
+    }
+
+    // Warn if outside ±5% — likely a small-delta accuracy issue rather than a hardware problem.
+    constexpr double GAIN_WARN_TOL = 0.05;
+    if (fabs(newGain - PREAMP_GAIN_DEFAULT) > PREAMP_GAIN_DEFAULT * GAIN_WARN_TOL) {
+      Serial.print("  WARNING: gain deviates >5% from nominal -- verify large preamp delta and correct ADC_VREF.");
+      Serial.println(" Applying anyway.");
+    }
+
+    PREAMP_GAIN = newGain;
+    Serial.println("  Applied. Run 'cal save' to persist.");
+
   } else {
-    Serial.println("Unknown cal subcommand. Use: status, save, load, erase, set, factory, build, point, dac");
+    Serial.println("Unknown cal subcommand. Use: status, save, load, erase, set, factory, build, point, dac, gain");
   }
 }
 
@@ -3857,6 +3986,9 @@ void outputMeasurement(InputChannel channel, LowerMoments &stats, int16_t dacCod
   double adcMean = stats.mean();
   double adcStdDev = stats.standardDeviation();
 
+  g_calLastDacCode = dacCode;
+  g_calLastChannel = channel;
+
   double vxRaw = computeInputVoltage(adcMean, dacCode, channel);
   double vxUncertainty = computeInputUncertainty(adcStdDev, channel);
 
@@ -3872,6 +4004,7 @@ void outputMeasurement(InputChannel channel, LowerMoments &stats, int16_t dacCod
 
   AdjustedEWMA& ewma = scanner.channelEwma((uint8_t)channel);
   double ewmaV = ewma.update(vxCorrected);
+  g_calLastVoltage = ewma.isInitialized() ? ewmaV : vxCorrected;
 
   MeasurementData data;
   data.channel     = channel;
@@ -4077,18 +4210,53 @@ void setup() {
 //                          If false, returns false immediately without touching the DAC —
 //                          correct for calibration routines that manage their own DAC state.
 bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow) {
+  // ensure that we are in a known polarity: Vx - DAC into INAMP...
+  if (chopper.state()) {
+    chopper.toggle();
+  }
+  adc.stop();
+  delayMicroseconds(SETTLE_US);
+  adc.start();
+  
   HalfCycleResult resultA = acquireHalfCycle();
 
   if (resultA.overflow) {
+    Serial.print("DAC: Phase A overflow (DAC=");
+    Serial.print(dac.currentCode());
+    Serial.print(" chopState="); Serial.print(chopper.state() ? 'B' : 'A');
+    Serial.print(" sample="); Serial.print(resultA.overflowSample);
+    Serial.println(")");
+    Serial.print("  post-overflow trace:");
+    for (int i = 0; i < 6; ++i) {
+      int32_t s;
+      if (!adc.readSample24(s)) break;
+      Serial.print(' '); Serial.print(s);
+    }
+    Serial.println();
     if (searchOnOverflow) { binarySearchDAC(); stats.clear(); }
     return false;
   }
 
   chopper.toggle();
+  adc.stop();
+  delayMicroseconds(SETTLE_US);
+  adc.start();
 
   HalfCycleResult resultB = acquireHalfCycle();
 
   if (resultB.overflow) {
+    Serial.print("DAC: Phase B overflow (DAC=");
+    Serial.print(dac.currentCode());
+    Serial.print(" chopState="); Serial.print(chopper.state() ? 'B' : 'A');
+    Serial.print(" sample="); Serial.print(resultB.overflowSample);
+    Serial.println(")");
+    Serial.print("  post-overflow trace:");
+    for (int i = 0; i < 6; ++i) {
+      int32_t s;
+      if (!adc.readSample24(s)) break;
+      Serial.print(' '); Serial.print(s);
+    }
+    Serial.println();
     chopper.toggle();  // Return to original state
     if (searchOnOverflow) { binarySearchDAC(); stats.clear(); }
     return false;
