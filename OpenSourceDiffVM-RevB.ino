@@ -47,7 +47,7 @@ static constexpr bool SHOW_ADEV  = false;
 
 // ---------------- POST Configuration ----------------
 // Set to true to halt on POST failure, false to continue with warning
-static constexpr bool POST_HALT_ON_FAIL = true;
+static constexpr bool POST_HALT_ON_FAIL = false;
 
 // Zero calibration test threshold (in nanovolts at input)
 // With preamp gain of 2000 and ADC LSB of ~298nV, this translates to ADC counts.
@@ -102,10 +102,12 @@ static constexpr uint8_t PIN_DIVMUX_A1  = 22;  // MUX36D04 A1: divider tap addre
 // ---------------- Timing ----------------
 static constexpr float    ADC_FCLK_HZ       = 25'000'000.0f;   // external clock
 static constexpr float    ADC_FMOD_HZ       = ADC_FCLK_HZ / 2; // fMOD = fCLK/2
-static constexpr uint32_t SETTLE_US         = 300;             // guard time after each mux edge before using samples
-static constexpr uint8_t  DISCARD_SAMPLES   = 1;               // toss first 3 samples after edge (sinc5 positions 4,5,6 = symmetric for both phases)
-static constexpr uint8_t  GOOD_SAMPLES      = 6;               // samples to average per half-cycle
-static constexpr int      PULSE_WIDTH_US    = 50;              // CI_TMUXSEL pre-transition pulse duration (was 5 — too short to be reliably visible at 320 kHz scope sampling, and marginal for the cancellation switch settle)
+static constexpr uint32_t SETTLE_US         = 300;             // generic post-event guard (mux changes, POST tests)
+static constexpr uint32_t CHOP_SETTLE_US    = 800;             // post-chop-edge analog settle (preamp + TMUX); OSR-independent
+static constexpr uint8_t  DISCARD_SAMPLES   = 0;               // no per-sample discard — wall-clock settle is now in CHOP_SETTLE_US
+static constexpr int      CI_PRE_EDGE_US    = 50;              // CI cancel switches HIGH before TMUXSEL flip
+static constexpr int      CI_POST_EDGE_US   = 100;             // CI cancel switches HIGH after TMUXSEL flip
+uint8_t                   g_good_samples    = 8 ;              // samples to average per half-cycle; runtime-tunable via `samples N`
 
 // ---------------- DAC Filter Settling ----------------
 // Second-order Bessel filter on DAC output requires settling after step changes.
@@ -170,7 +172,7 @@ static constexpr double ADC_FSR_CODES   = 16777216.0; // 2^24 full scale codes
 static double ADC_LSB_V    = (2.0 * ADC_VREF_DEFAULT) / ADC_FSR_CODES;  // updated when ADC_VREF changes
 
 // ---------------- Overflow Detection ----------------
-// 24-bit ADC full scale: ±8,388,607. Use 90% threshold for overflow detection.
+// 24-bit ADC full scale: ±8,388,607. Use 95% threshold for overflow detection.
 static constexpr int32_t ADC_OVERFLOW_POS   =  0.95 * ADC_FSR_CODES/2;      // ~95% of 0x7FFFFF
 static constexpr int32_t ADC_OVERFLOW_NEG   = -1.00 * ADC_OVERFLOW_POS;     // ~95% of -0x800000
 
@@ -251,6 +253,12 @@ static constexpr int CAL_POINT_CYCLES  = 20;  // Chop cycles per cal point captu
 static constexpr int CAL_BUILD_WINDOW  = 2;   // Table entries swept each side of anchor (±2 = 5 total)
 static constexpr int AUTOZERO_CYCLES   = 20;  // Chop cycles per auto-zero measurement
 
+// ---------------- Debug Flags ----------------
+// Toggle with 'debug on|off' command. Off by default — keeps normal operation quiet.
+// When on, binary search prints per-iteration ADC/DAC traces (helpful when
+// chasing settling or convergence problems).
+static bool g_debugDac = false;
+
 // ---------------- DAC Calibration Table ----------------
 // Encapsulates the 16384-point calibration table for DAC INL correction.
 // Index: (dacCode + 32768) >> 2 gives 14-bit index (0..16383)
@@ -266,10 +274,15 @@ public:
       int16_t code = (int16_t)((i << 2) - 32768);
       table_[i] = (double)code * DAC_LSB_V;
     }
+    maxCodeV_ = 32767.0 * DAC_LSB_V;   // nominal V at absolute-max code 32767
     valid_ = false;
   }
 
   double codeToVoltage(int16_t code) const {
+    // Absolute-max code 32767 has its own cal slot — used to read accurately near +5 V.
+    if (code == 32767) {
+      return valid_ ? maxCodeV_ : (32767.0 * DAC_LSB_V);
+    }
     if (!valid_) {
       return (double)code * DAC_LSB_V;
     }
@@ -284,6 +297,10 @@ public:
   }
 
   void setPoint(int16_t code, double measuredVoltage) {
+    if (code == 32767) {
+      maxCodeV_ = measuredVoltage;
+      return;
+    }
     uint16_t idx = ((uint16_t)(code + 32768)) >> 2;
     if (idx < TABLE_SIZE) {
       table_[idx] = measuredVoltage;
@@ -293,6 +310,9 @@ public:
   void markValid() { valid_ = true; }
   bool isValid() const { return valid_; }
 
+  double maxCodeVoltage() const { return maxCodeV_; }
+  void setMaxCodeVoltage(double v) { maxCodeV_ = v; }
+
   // Raw table access for CalibrationStore flash I/O
   double* rawTable() { return table_; }
   const double* rawTable() const { return table_; }
@@ -300,6 +320,7 @@ public:
 
 private:
   double table_[TABLE_SIZE];
+  double maxCodeV_;       // calibration for absolute-max code 32767 (outside the 14-bit-aligned grid)
   bool valid_ = false;
 };
 
@@ -413,10 +434,10 @@ int formatVoltage(double voltage, char* buf, size_t bufLen, int sigDigits = 9) {
   return snprintf(buf, bufLen, "%.*f %s", decimals, scaledV, unit);
 }
 
-// Estimated sample period for FILTER=11000b (OSR 32*100 = 3200)
-static constexpr float    OSR_TOTAL         = 3200.0f;
-static constexpr float    EST_FSPS          = ADC_FMOD_HZ / OSR_TOTAL;     // ~3906.25 SPS
-static constexpr float    EST_TS_US         = 1e6f / EST_FSPS;             // ~256 us/sample
+// Sample period derived from filterCode below (sinc4 OSR=32 * sinc1 OSR; see configureFilter).
+static constexpr float    OSR_TOTAL         = 12800.0f;
+static constexpr float    EST_FSPS          = ADC_FMOD_HZ / OSR_TOTAL;     // ~976.5625 SPS at OSR=12800
+static constexpr float    EST_TS_US         = 1e6f / EST_FSPS;             // ~1024 us/sample at OSR=12800
 
 // ---------------- SPI ----------------
 static constexpr uint32_t SPI_HZ = 5'000'000;
@@ -518,7 +539,7 @@ public:
   void initAndConfigure();
   void writeReg(uint8_t addr, uint8_t val);
   uint8_t readReg(uint8_t addr);
-  bool waitDrdy(uint32_t timeout_us = 1000);
+  bool waitDrdy(uint32_t timeout_us = 2000);
   bool readSample24(int32_t &sample);
   void start(); // start/stop control mode, per section 8.4.6.2
   void stop();
@@ -674,6 +695,7 @@ public:
 
   double value() const { return initialized_ ? numer_ / denom_ : 0.0; }
   bool isInitialized() const { return initialized_; }
+  float window() const { return 2.0f / (1.0f - beta_) - 1.0f; }   // inverse of setWindow()
 
 private:
   float  beta_;
@@ -747,7 +769,11 @@ public:
     Serial.print(count_);
     Serial.print(" readings, tau0=");
     Serial.print(tau0, 4);
-    Serial.println("s)");
+    Serial.print("s, OSR=");
+    Serial.print((int)OSR_TOTAL);
+    Serial.print(", samples=");
+    Serial.print(g_good_samples);
+    Serial.println(")");
     Serial.println("  tau (s)      OADEV          pairs");
     Serial.println("  ----------   ------------   -----");
 
@@ -1078,7 +1104,7 @@ bool readSettledSample(int32_t &sample) {
  * across the ±5V range.
  */
 bool binarySearchDAC() {
-  Serial.println("DAC: Starting binary search (14-bit aligned)...");
+  if (g_debugDac) Serial.println("DAC: Starting binary search (14-bit aligned)...");
 
   // Force TMUXSEL=LOW so ADC reads (Vx - DAC) * gain
   // This ensures consistent search direction regardless of prior mux state
@@ -1139,14 +1165,32 @@ bool binarySearchDAC() {
       else if (sign != firstRailSign) railChanged = true;
     }
 
-    Serial.print("  iter=");
-    Serial.print(iter);
-    Serial.print(" DAC=");
-    Serial.print(mid);
-    Serial.print(" ADC=");
-    Serial.println(lastSample);
+    if (g_debugDac) {
+      Serial.print("  iter=");
+      Serial.print(iter);
+      Serial.print(" DAC=");
+      Serial.print(mid);
+      Serial.print(" ADC=");
+      Serial.println(lastSample);
+    }
 
     if (isOverflowPositive(lastSample)) {
+      // Special case: at the upper rail of the 14-bit grid, try absolute-max code 32767
+      // (3 LSBs above 32764, ~458 µV). Used for accurate readings near +5 V.
+      // Has its own calibration slot (DacCalibrationTable::maxCodeV_).
+      if (mid == 32764) {
+        dac.setCodeFast((int16_t)32767);
+        delay(RC_SETTLE_MS);
+        int32_t s32767;
+        if (readSettledSample(s32767)) {
+          if (g_debugDac) { Serial.print("  iter=max DAC=32767 ADC="); Serial.println(s32767); }
+          if (!isOverflow(s32767)) {
+            dac.setCode((int16_t)32767);
+            Serial.println("DAC: Converged at code 32767 (max-code special case)");
+            return true;
+          }
+        }
+      }
       // Vx > DAC, increase DAC
       low = mid + 4;  // Next 14-bit boundary
     } else if (isOverflowNegative(lastSample)) {
@@ -1168,8 +1212,10 @@ bool binarySearchDAC() {
         delay(RC_SETTLE_MS);
         int32_t trialSample;
         if (!readSettledSample(trialSample)) break;
-        Serial.print("  refine: DAC="); Serial.print(trialMid);
-        Serial.print(" ADC="); Serial.println(trialSample);
+        if (g_debugDac) {
+          Serial.print("  refine: DAC="); Serial.print(trialMid);
+          Serial.print(" ADC="); Serial.println(trialSample);
+        }
         if (isOverflow(trialSample)) break;          // overshot to rail — keep prev best
         const bool signFlipped = (trialSample > 0) != (bestSample > 0);
         if (abs(trialSample) < abs(bestSample)) {
@@ -1178,6 +1224,19 @@ bool binarySearchDAC() {
         }
         if (signFlipped) break;                      // adjacent codes straddle zero — done
         if (abs(trialSample) >= abs(bestSample) && trialMid != bestMid) break;
+      }
+      // Special case at the +5 V end: from 32764 with positive residual, probe absolute-max
+      // code 32767 (3-LSB step instead of the usual 4). Accept only if it strictly improves.
+      if (bestMid == 32764 && bestSample > 0) {
+        dac.setCodeFast((int16_t)32767);
+        delay(RC_SETTLE_MS);
+        int32_t trialSample;
+        if (readSettledSample(trialSample) && !isOverflow(trialSample) &&
+            abs(trialSample) < abs(bestSample)) {
+          if (g_debugDac) { Serial.print("  refine: DAC=32767 ADC="); Serial.println(trialSample); }
+          bestMid    = 32767;
+          bestSample = trialSample;
+        }
       }
       dac.setCode((int16_t)bestMid);
       Serial.print("DAC: Converged at code ");
@@ -1257,12 +1316,19 @@ uint8_t AdcDriver::readReg(uint8_t addr) {
 }
 
 bool AdcDriver::waitDrdy(uint32_t timeout_us) {
-  // Clock-counting method (ADS127L11 datasheet §8.5.7.2.4):
-  // Teensy generates the 25 MHz MCLK, so conversion timing is deterministic.
-  // One conversion period = EST_TS_US (~256 µs). Waiting that long guarantees
-  // data is ready without needing the DRDY pin.
-  (void)timeout_us;
-  delayMicroseconds((uint32_t)EST_TS_US + 10);  // +10 µs margin
+  // Edge-triggered: wait for HIGH first to discard any stale assertion left
+  // over from before adc.stop() (the data register would otherwise hold a
+  // pre-stop reading — saturated if the preamp was railed, e.g. binary search
+  // with TMUX disabled), then wait for the genuine falling edge of the next
+  // post-start conversion. ADS127L11 default DRDY mode is pulsed: LOW for
+  // ~1/2 conversion period, plenty wide for digitalReadFast polling to catch.
+  uint32_t t0 = micros();
+  while (digitalReadFast(PIN_ADC_DRDY) == LOW) {
+    if ((micros() - t0) > timeout_us) return false;
+  }
+  while (digitalReadFast(PIN_ADC_DRDY) == HIGH) {
+    if ((micros() - t0) > timeout_us) return false;
+  }
   return true;
 }
 
@@ -1270,7 +1336,7 @@ bool AdcDriver::waitDrdy(uint32_t timeout_us) {
 // section 8.5.7 conversion data read, short format
 //
 bool AdcDriver::readSample24(int32_t &sample) {
-  if (!waitDrdy(1000)) {
+  if (!waitDrdy(2000)) {
     sample = 0;
     return false;
   }
@@ -1340,7 +1406,7 @@ void AdcDriver::initAndConfigure() {
   writeReg(REG_CONFIG2, config2);
 
   const uint8_t delayCode  = 0b000;
-  const uint8_t filterCode = 0b11000;  // sinc4 (OSR=32) + sinc1 (OSR=100), total OSR=3200
+  const uint8_t filterCode = 0b11010;  // sinc4 (OSR=32) + sinc1 (OSR=400), total OSR=12800
   const uint8_t config3 = (delayCode << 5) | (filterCode & 0x1F);
   writeReg(REG_CONFIG3, config3);
 
@@ -1380,10 +1446,10 @@ void ChopperDriver::begin() {
 void ChopperDriver::toggle() {
   digitalWriteFast(PIN_TMUX_EN, LOW); // just in case we got into unknown state due to post...or?
   digitalWriteFast(PIN_CI_TMUXSEL, HIGH);
-  delayMicroseconds(PULSE_WIDTH_US);
+  delayMicroseconds(CI_PRE_EDGE_US);
   state_ = !state_;
   digitalWriteFast(PIN_TMUXSEL, state_);
-  delayMicroseconds(PULSE_WIDTH_US);
+  delayMicroseconds(CI_POST_EDGE_US);
   digitalWriteFast(PIN_CI_TMUXSEL, LOW);
 }
 
@@ -1413,7 +1479,7 @@ HalfCycleResult acquireHalfCycle() {
   result.stats.accumulate((double)firstSample);
 
   // Accumulate remaining good samples into Welford tracker
-  for (uint8_t i = 1; i < GOOD_SAMPLES; i++) {
+  for (uint8_t i = 1; i < g_good_samples; i++) {
     int32_t s;
     if (!adc.readSample24(s)) { result.overflow = true; return result; }
     result.stats.accumulate((double)s);
@@ -1444,6 +1510,7 @@ struct ScanConfig {
   bool autoZeroEnabled;
   int autoZeroInterval;
   OutputMode outputMode;
+  float ewmaWindow;          // equivalent SMA length applied to all channel + auto-zero EWMAs
 };
 
 enum class ScanState : uint8_t { ONE_CHANNEL, SCANNING };
@@ -1464,6 +1531,7 @@ public:
     .autoZeroEnabled = false,
     .autoZeroInterval = 10,
     .outputMode = OutputMode::Human,
+    .ewmaWindow = 10.0f,
   };
 
   // State queries
@@ -1730,8 +1798,23 @@ void cmdIntegrate(const char* arg) {
   Serial.print("Integration set to ");
   Serial.print(n);
   Serial.print(" chop cycles (~");
-  Serial.print((float)n / EST_FSPS * (DISCARD_SAMPLES + GOOD_SAMPLES + 1) * 2, 1);
+  Serial.print((float)n / EST_FSPS * (DISCARD_SAMPLES + g_good_samples + 1) * 2, 1);
   Serial.println(" sec per reading).");
+}
+
+void cmdSetSamples(const char *arg) {
+  int n = atoi(arg);
+  if (n < 1 || n > 100) {
+    Serial.println("ERROR: Samples must be 1-100.");
+    return;
+  }
+  g_good_samples = n;
+  Serial.print("Samples set to ");
+  Serial.print(n);
+  Serial.println(" per half cycle.");
+  scanner.resetAllChannelEwma();
+  allanDev.clear();
+  Serial.println("EWMA + Allan deviation history cleared as a side-effect.");
 }
 
 void cmdAutoZero(const char* arg) {
@@ -1807,6 +1890,10 @@ void printStatus() {
   Serial.print(scanner.config.autoZeroInterval);
   Serial.println(" cycles");
 
+  Serial.print("EWMA window: ");
+  Serial.print(scanner.channelEwma(0).window(), 1);
+  Serial.println(" (equivalent SMA length)");
+
   if (scanner.autoZeroValid) {
     Serial.print("Auto-zero offset: ");
     Serial.print(scanner.autoZeroOffset * 1e9, 1);
@@ -1844,56 +1931,58 @@ void printStatus() {
 
 void printHelp() {
   Serial.println("\n=== DiffVM Commands ===");
-  Serial.println("scan add <ch>       Add channel (Vx1,GND,VrefRaw,Vx2-Vx5,HVDiv)");
-  Serial.println("scan remove <ch>    Remove channel from scan list");
-  Serial.println("scan list           Show current scan list");
-  Serial.println("scan clear          Clear scan list");
-  Serial.println("scan start          Begin automatic scanning");
-  Serial.println("scan stop           Stop scanning");
-  Serial.println("log start           Start CSV logging output");
-  Serial.println("log stop            Stop CSV logging");
-  Serial.println("plot start          Start Arduino Serial Plotter output");
-  Serial.println("plot stop           Stop plotter output");
-  Serial.println("integrate <N>       Set chop cycles per reading (10-10000)");
-  Serial.println("autozero on|off     Enable/disable periodic auto-zero");
+  Serial.println("scan add <ch>          Add channel (Vx1,GND,VrefRaw,Vx2-Vx5,HVDiv)");
+  Serial.println("scan remove <ch>       Remove channel from scan list");
+  Serial.println("scan list              Show current scan list");
+  Serial.println("scan clear             Clear scan list");
+  Serial.println("scan start             Begin automatic scanning");
+  Serial.println("scan stop              Stop scanning");
+  Serial.println("log start              Start CSV logging output");
+  Serial.println("log stop               Stop CSV logging");
+  Serial.println("plot start             Start Arduino Serial Plotter output");
+  Serial.println("plot stop              Stop plotter output");
+  Serial.println("integrate <N>          Set chop cycles per reading (10-10000)");
+  Serial.println("samples <n>            Set samples per half chop (1-100)");  
+  Serial.println("autozero on|off        Enable/disable periodic auto-zero");
   Serial.println("autozero interval <N>  Cycles between auto-zero (readings in ONE_CHANNEL, sweeps in SCANNING) 1-1000");
-  Serial.println("range <10|100|1000> Set HV divider ratio");
-  Serial.println("status              Show current configuration");
-  Serial.println("zero                Perform immediate zero calibration");
-  Serial.println("config save         Save config to EEPROM");
-  Serial.println("config load         Load config from EEPROM");
-  Serial.println("config factory      Reset to factory defaults");
+  Serial.println("range <10|100|1000>    Set HV divider ratio");
+  Serial.println("status                 Show current configuration");
+  Serial.println("zero                   Perform immediate zero calibration");
+  Serial.println("config save            Save config to EEPROM");
+  Serial.println("config load            Load config from EEPROM");
+  Serial.println("config factory         Reset to factory defaults");
+  Serial.println("config show            Show saved vs current config");
   Serial.println("config autostart on|off  Auto-start scanning on boot");
-  Serial.println("config show         Show saved vs current config");
-  Serial.println("adev [clear]          Show Allan deviation (or clear history)");
-  Serial.println("ewma <n>              Set EWMA window equivalent (default 10); 'ewma reset' to clear");
-  Serial.println("cal status            Show calibration flash status and current values");
-  Serial.println("cal save              Save constants + DAC table to flash");
-  Serial.println("cal load              Reload constants + DAC table from flash");
-  Serial.println("cal erase             Erase calibration files from flash");
-  Serial.println("cal set gain <v>      Set PREAMP_GAIN (e.g. 1998.5)");
-  Serial.println("cal set adcvref <v>   Set ADC VREF voltage (measure at ADS127L11 pin, e.g. 2.4993)");
-  Serial.println("cal set div10 <v>     Set DIVIDER_RATIO_10");
-  Serial.println("cal set div100 <v>    Set DIVIDER_RATIO_100");
-  Serial.println("cal set div1000 <v>   Set DIVIDER_RATIO_1000");
-  Serial.println("cal set opa828 <v>    Set OPA828 buffer offset in volts (e.g. 0.000016)");
-  Serial.println("cal factory           Reset cal constants to factory defaults (RAM)");
-  Serial.println("cal build dac         Auto-calibrate DAC table at GND and VrefRaw anchors");
-  Serial.println("cal point <voltage>   Capture DAC table entry at known Vx (e.g., cal point 1.23456)");
-  Serial.println("cal dac <code> <v>    Store measured DAC voltage directly (e.g., cal dac 0 -0.0003515)");
-  Serial.println("label list            List all channel labels");
-  Serial.println("label <ch> <text>     Set label for channel (max 15 chars, no spaces)");
-  Serial.println("label <ch>            Show label for channel");
-  Serial.println("label reset           Clear all labels and save to flash");
-  Serial.println("hold a|b              Force chopper state for scope probing (any key to exit)");
-  Serial.println("help                Show this help");
+  Serial.println("adev [clear]           Show Allan deviation (or clear history)");
+  Serial.println("ewma <n>               Set EWMA window equivalent (default 10); 'ewma reset' to clear");
+  Serial.println("cal status             Show calibration flash status and current values");
+  Serial.println("cal save               Save constants + DAC table to flash");
+  Serial.println("cal load               Reload constants + DAC table from flash");
+  Serial.println("cal erase              Erase calibration files from flash");
+  Serial.println("cal set gain <v>       Set PREAMP_GAIN (e.g. 1998.5)");
+  Serial.println("cal set adcvref <v>    Set ADC VREF voltage (measure at ADS127L11 pin, e.g. 2.4993)");
+  Serial.println("cal set div10 <v>      Set DIVIDER_RATIO_10");
+  Serial.println("cal set div100 <v>     Set DIVIDER_RATIO_100");
+  Serial.println("cal set div1000 <v>    Set DIVIDER_RATIO_1000");
+  Serial.println("cal set opa828 <v>     Set OPA828 buffer offset in volts (e.g. 0.000016)");
+  Serial.println("cal factory            Reset cal constants to factory defaults (RAM)");
+  Serial.println("cal build dac          Auto-calibrate DAC table at GND and VrefRaw anchors");
+  Serial.println("cal point <voltage>    Capture DAC table entry at known Vx (e.g., cal point 1.23456)");
+  Serial.println("cal dac <code> <v>     Store measured DAC voltage directly (e.g., cal dac 0 -0.0003515)");
+  Serial.println("label list             List all channel labels");
+  Serial.println("label <ch> <text>      Set label for channel (max 15 chars, no spaces)");
+  Serial.println("label <ch>             Show label for channel");
+  Serial.println("label reset            Clear all labels and save to flash");
+  Serial.println("hold a|b               Force chopper state for scope probing (any key to exit)");
+  Serial.println("debug [on|off]         Toggle binary-search trace prints (default off)");
+  Serial.println("help                   Show this help");
   Serial.println("=======================\n");
 }
 
 // Compute measurement interval (tau0) in seconds for current integration setting
 static double computeTau0() {
   return (double)scanner.config.integrationCycles / EST_FSPS
-         * (DISCARD_SAMPLES + GOOD_SAMPLES + 1) * 2;
+         * (DISCARD_SAMPLES + g_good_samples + 1) * 2;
 }
 
 void cmdAdev(const char* arg) {
@@ -2063,6 +2152,7 @@ void processCommand(char* line) {
         Serial.println("Usage: ewma [<window>|reset]  (window: 1..10000, default 10)");
       } else {
         scanner.setEwmaWindow(w);
+        scanner.config.ewmaWindow = w;
         Serial.print("EWMA window set to "); Serial.print(w, 1); Serial.println(" (all filters reset)");
       }
     }
@@ -2074,9 +2164,25 @@ void processCommand(char* line) {
     cmdLabel(arg1, arg2);
   } else if (strcasecmp(cmd, "hold") == 0) {
     cmdHold(arg1);
+  } else if (strcasecmp(cmd, "debug") == 0) {
+    if (!arg1) {
+      Serial.print("Debug: ");
+      Serial.println(g_debugDac ? "on" : "off");
+    } else if (strcasecmp(arg1, "on") == 0) {
+      g_debugDac = true;
+      Serial.println("Debug ON (binary-search trace).");
+    } else if (strcasecmp(arg1, "off") == 0) {
+      g_debugDac = false;
+      Serial.println("Debug OFF.");
+    } else {
+      Serial.println("Usage: debug [on|off]");
+    }
   } else if (strcasecmp(cmd, "help") == 0) {
     printHelp();
-  } else {
+  } else if(strcasecmp(cmd, "samples")==0) {
+    if (!arg1) { Serial.println("Usage: samples <1-100>"); return; }
+    cmdSetSamples(arg1);
+   } else {
     Serial.print("Unknown command: '");
     Serial.print(cmd);
     Serial.println("'. Type 'help' for available commands.");
@@ -2203,9 +2309,10 @@ bool postTestDacComm() {
 /**
  * POST Test 3: DRDY Timing
  * Measures the DRDY pulse rate to verify ADC clock is running correctly.
- * Expected: ~3906 Hz (256 µs period) ± 10%
+ * Expected: ~MAX_FSPS (1953)
  */
 bool postTestDrdyTiming() {
+  const int32_t EXPECTED = 2000;
   Serial.print("POST: DRDY Timing... ");
   adc.start();
   // Report raw pin state before attempting to measure — helps diagnose wiring vs. timing issues
@@ -2215,7 +2322,7 @@ bool postTestDrdyTiming() {
 
   // Wait for DRDY to go high first
   elapsedMicros timeout = 0;
-  while (digitalReadFast(PIN_ADC_DRDY) == LOW && timeout < 1000) {}
+  while (digitalReadFast(PIN_ADC_DRDY) == LOW && timeout < EXPECTED) {}
 
   // Measure time for 10 DRDY pulses
   const int numPulses = 10;
@@ -2224,16 +2331,16 @@ bool postTestDrdyTiming() {
   for (int i = 0; i < numPulses; i++) {
     // Wait for falling edge (data ready)
     timeout = 0;
-    while (digitalReadFast(PIN_ADC_DRDY) == HIGH && timeout < 1000) {}
-    if (timeout >= 1000) {
+    while (digitalReadFast(PIN_ADC_DRDY) == HIGH && timeout < EXPECTED) {}
+    if (timeout >= EXPECTED) {
       Serial.println("FAIL (DRDY timeout high)");
       return false;
     }
 
     // Wait for rising edge
     timeout = 0;
-    while (digitalReadFast(PIN_ADC_DRDY) == LOW && timeout < 1000) {}
-    if (timeout >= 1000) {
+    while (digitalReadFast(PIN_ADC_DRDY) == LOW && timeout < EXPECTED) {}
+    if (timeout >= EXPECTED) {
       Serial.println("FAIL (DRDY timeout low)");
       return false;
     }
@@ -2243,8 +2350,9 @@ bool postTestDrdyTiming() {
   float periodUs = (float)totalUs / numPulses;
   float freqHz = 1e6f / periodUs;
 
-  // Expected: ~256 µs period (~3906 Hz), allow ±10%
-  bool pass = (periodUs > 230) && (periodUs < 282);
+  // Expected: EST_TS_US (derived from OSR_TOTAL), allow ±10%
+  const float expectedUs = EST_TS_US;
+  bool pass = (periodUs > expectedUs * 0.90f) && (periodUs < expectedUs * 1.10f);
 
   if (pass) {
     Serial.print("PASS (");
@@ -2253,7 +2361,9 @@ bool postTestDrdyTiming() {
   } else {
     Serial.print("FAIL (");
     Serial.print(freqHz, 1);
-    Serial.print(" Hz, expected ~3906 Hz)");
+    Serial.print(" Hz, expected ~");
+    Serial.print(EST_FSPS, 1);
+    Serial.print(" Hz)");
     Serial.println();
   }
   return pass;
@@ -2835,7 +2945,7 @@ public:
     Serial.print(")");
     if (data.ewmaValid) {
       char ewmaBuf[32];
-      formatVoltage(data.ewmaVoltage, ewmaBuf, sizeof(ewmaBuf), 6);
+      formatVoltage(data.ewmaVoltage, ewmaBuf, sizeof(ewmaBuf), 9);
       Serial.print("  ewma=");
       Serial.print(ewmaBuf);
     }
@@ -3026,7 +3136,7 @@ void performAutoZero() {
 // Written by cmdConfigSave(), read by loadConfigFromEEPROM() at startup
 // and by cmdConfigLoad()/cmdConfigShow().
 
-static constexpr uint32_t EEPROM_MAGIC = 0xD1FF0001UL;  // "DIFF" version 1
+static constexpr uint32_t EEPROM_MAGIC = 0xD1FF0002UL;  // "DIFF" v2 — adds ewmaWindow field
 static constexpr int EEPROM_BASE_ADDR = 0;
 
 /**
@@ -3069,7 +3179,7 @@ uint16_t crc16(const uint8_t* data, size_t len) {
 // flash (512 KB partition on Teensy 4.1 QSPI flash).
 
 static constexpr uint32_t CAL_CONSTS_MAGIC = 0xCA1C0001UL;  // "CALC" v1
-static constexpr uint32_t CAL_TABLE_MAGIC  = 0xDACC0001UL;  // "DACC" v1
+static constexpr uint32_t CAL_TABLE_MAGIC  = 0xDACC0002UL;  // "DACC" v2 — adds maxCodeV_ slot for code 32767
 static constexpr uint32_t CAL_LFS_SIZE     = 512UL * 1024UL; // 512 KB partition
 
 class CalibrationStore {
@@ -3226,6 +3336,16 @@ public:
       f.write(chunk, sz);
     }
 
+    // v2: write maxCodeV_ (cal point for absolute-max code 32767) into CRC and file
+    uint8_t maxBuf[8];
+    double maxV = dacCalTable.maxCodeVoltage();
+    memcpy(maxBuf, &maxV, 8);
+    for (int i = 0; i < 8; i++) {
+      crc ^= maxBuf[i];
+      for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+    }
+    f.write(maxBuf, 8);
+
     // Write final CRC
     uint8_t crcBuf[2];
     memcpy(crcBuf, &crc, 2);
@@ -3272,6 +3392,16 @@ public:
       }
       offset += sz;
     }
+
+    // v2: read maxCodeV_ slot
+    uint8_t maxBuf[8];
+    if (f.read(maxBuf, 8) != 8) { f.close(); return false; }
+    for (int i = 0; i < 8; i++) {
+      crc ^= maxBuf[i];
+      for (int b = 0; b < 8; b++) crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+    }
+    double maxV; memcpy(&maxV, maxBuf, 8);
+    dacCalTable.setMaxCodeVoltage(maxV);
 
     // Read and check stored CRC
     uint8_t crcBuf[2];
@@ -3894,6 +4024,7 @@ void applyConfig(const SavedConfig &saved) {
   if (saved.dividerRatio != divMux.current()) {
     divMux.select(saved.dividerRatio);
   }
+  scanner.setEwmaWindow(scanner.config.ewmaWindow);
 }
 
 void cmdConfigLoad() {
@@ -3919,6 +4050,8 @@ void cmdConfigFactory() {
   scanner.config.autoZeroEnabled = true;
   scanner.config.autoZeroInterval = 10;
   scanner.config.outputMode = OutputMode::Human;
+  scanner.config.ewmaWindow = 10.0f;
+  scanner.setEwmaWindow(10.0f);
   configAutoStart = false;
   scanner.autoZeroOffset = 0.0;
   scanner.autoZeroValid = false;
@@ -3955,6 +4088,8 @@ void cmdConfigShow() {
     Serial.print(saved.scanConfig.autoZeroEnabled ? "ON" : "OFF");
     Serial.print(", interval=");
     Serial.println(saved.scanConfig.autoZeroInterval);
+    Serial.print("EWMA window: ");
+    Serial.println(saved.scanConfig.ewmaWindow, 1);
     Serial.print("Scan channels: ");
     Serial.println(saved.scanConfig.count);
     for (int i = 0; i < saved.scanConfig.count; i++) {
@@ -4215,9 +4350,9 @@ bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow) {
     chopper.toggle();
   }
   adc.stop();
-  delayMicroseconds(SETTLE_US);
+  delayMicroseconds(CHOP_SETTLE_US);
   adc.start();
-  
+
   HalfCycleResult resultA = acquireHalfCycle();
 
   if (resultA.overflow) {
@@ -4239,7 +4374,7 @@ bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow) {
 
   chopper.toggle();
   adc.stop();
-  delayMicroseconds(SETTLE_US);
+  delayMicroseconds(CHOP_SETTLE_US);
   adc.start();
 
   HalfCycleResult resultB = acquireHalfCycle();
@@ -4320,6 +4455,8 @@ void loop() {
 
     LowerMoments &stats = scanner.channelStats((uint8_t)curCh);
     if (!runOneChopCycle(stats)) {
+      scanner.resetChannelEwma((uint8_t)curCh);  // DAC re-centered: old EWMA history is stale
+      loopCounter = 0;
       return;  // Overflow handled, restart
     }
 
