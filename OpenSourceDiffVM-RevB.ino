@@ -435,9 +435,9 @@ int formatVoltage(double voltage, char* buf, size_t bufLen, int sigDigits = 9) {
 }
 
 // Sample period derived from filterCode below (sinc4 OSR=32 * sinc1 OSR; see configureFilter).
-static constexpr float    OSR_TOTAL         = 12800.0f;
-static constexpr float    EST_FSPS          = ADC_FMOD_HZ / OSR_TOTAL;     // ~976.5625 SPS at OSR=12800
-static constexpr float    EST_TS_US         = 1e6f / EST_FSPS;             // ~1024 us/sample at OSR=12800
+static constexpr float    OSR_TOTAL         = 6400.0f;
+static constexpr float    EST_FSPS          = ADC_FMOD_HZ / OSR_TOTAL;     // ~1953.125 SPS at OSR=6400
+static constexpr float    EST_TS_US         = 1e6f / EST_FSPS;             // ~512 us/sample at OSR=6400
 
 // ---------------- SPI ----------------
 static constexpr uint32_t SPI_HZ = 5'000'000;
@@ -716,8 +716,8 @@ struct HalfCycleResult {
 // analysis. Stores a circular buffer of corrected voltage readings and
 // computes OADEV at octave-spaced averaging times on demand.
 //
-// OADEV^2(m) = 1/(2(N-2m)) * SUM (y_bar_{i+m} - y_bar_i)^2
-// where y_bar_i = (1/m) * SUM_{k=0}^{m-1} y_{i+k}
+// OADEV^2(m) = 1/(2 * pairs) * SUM_{i=0..N-2m} (y_bar_{i+m} - y_bar_i)^2
+// where y_bar_i = (1/m) * SUM_{k=0}^{m-1} y_{i+k}, pairs = N - 2m + 1
 
 class AllanDeviation {
 public:
@@ -784,7 +784,7 @@ public:
       if (std::isnan(ad)) break;
 
       double tau = (double)m * tau0;
-      int pairs = count_ - 2 * m;
+      int pairs = count_ - 2 * m + 1;
 
       char adBuf[24];
       formatVoltage(ad, adBuf, sizeof(adBuf), 3);
@@ -819,10 +819,9 @@ private:
       return std::numeric_limits<double>::quiet_NaN();
     }
 
-    // Compute prefix sums over linearized readings
-    // To avoid allocating a big array, compute block sums on the fly
-    // using a sliding window approach
-    int pairs = count_ - 2 * m;
+    // Sliding-window block sums to avoid an O(N) prefix-sum array.
+    // pairs = number of valid (i, i+m) block-pair start indices for i in [0, N-2m].
+    int pairs = count_ - 2 * m + 1;
 
     // Compute initial two block sums: block1 = sum[0..m-1], block2 = sum[m..2m-1]
     double block1 = 0.0;
@@ -1406,7 +1405,7 @@ void AdcDriver::initAndConfigure() {
   writeReg(REG_CONFIG2, config2);
 
   const uint8_t delayCode  = 0b000;
-  const uint8_t filterCode = 0b11010;  // sinc4 (OSR=32) + sinc1 (OSR=400), total OSR=12800
+  const uint8_t filterCode = 0b11001;  // sinc4 (OSR=32) + sinc1 (OSR=200), total OSR=6400
   const uint8_t config3 = (delayCode << 5) | (filterCode & 0x1F);
   writeReg(REG_CONFIG3, config3);
 
