@@ -39,6 +39,8 @@ class CalibrationStore;
 class IOutputFormatter;
 struct MeasurementData;
 struct SavedConfig;
+enum class InputChannel : uint8_t;
+enum class DividerRatio : uint8_t;
 
 // ---------------- Output Verbosity Flags ----------------
 // Set to true to include the drift and Allan deviation lines in human-readable output.
@@ -47,7 +49,7 @@ static constexpr bool SHOW_ADEV  = false;
 
 // ---------------- POST Configuration ----------------
 // Set to true to halt on POST failure, false to continue with warning
-static constexpr bool POST_HALT_ON_FAIL = false;
+static constexpr bool POST_HALT_ON_FAIL = true;
 
 // Zero calibration test threshold (in nanovolts at input)
 // With preamp gain of 2000 and ADC LSB of ~298nV, this translates to ADC counts.
@@ -104,10 +106,38 @@ static constexpr float    ADC_FCLK_HZ       = 25'000'000.0f;   // external clock
 static constexpr float    ADC_FMOD_HZ       = ADC_FCLK_HZ / 2; // fMOD = fCLK/2
 static constexpr uint32_t SETTLE_US         = 300;             // generic post-event guard (mux changes, POST tests)
 static constexpr uint32_t CHOP_SETTLE_US    = 800;             // post-chop-edge analog settle (preamp + TMUX); OSR-independent
-static constexpr uint8_t  DISCARD_SAMPLES   = 0;               // no per-sample discard — wall-clock settle is now in CHOP_SETTLE_US
+static constexpr uint8_t  DISCARD_SAMPLES   = 0;               // sinc4+sinc1 settles in one DRDY (sinc1 stage primes immediately)
+static constexpr uint8_t  MAX_SAMPLES       = 20;              // max ADC readings per each chop phase
 static constexpr int      CI_PRE_EDGE_US    = 50;              // CI cancel switches HIGH before TMUXSEL flip
 static constexpr int      CI_POST_EDGE_US   = 100;             // CI cancel switches HIGH after TMUXSEL flip
 uint8_t                   g_good_samples    = 8 ;              // samples to average per half-cycle; runtime-tunable via `samples N`
+
+// ---------------- Demodulation Outlier Rejection (Pooled-MAD) ----------------
+// Pair-diffs from the last DEMOD_POOL_N cycles are kept in a ring buffer.
+// Each demodulate() call: push this cycle's diffs, recompute pooled median +
+// MAD, threshold = max(k·1.4826·MAD, FLOOR). Pooling stabilises the threshold
+// across cycles so the rejection bias is a constant offset (cancels in (A-B)/2)
+// instead of a wandering one (which injects flicker at long ADEV τ).
+// Runtime-tunable via 'drj <k>' command. k=10000 effectively disables rejection.
+static int32_t           g_demodRejKx10    = 100;   // k = 10.0  (×10 for integer math)
+static constexpr int32_t DEMOD_REJ_FLOOR  = 32;     // ADC counts, ~10× per-pair RMS noise at OSR=12800
+static constexpr int     DEMOD_POOL_N      = 256;   // pair-diff ring buffer depth
+static constexpr int     DEMOD_POOL_MIN    = 64;    // skip rejection until this many entries collected
+static int32_t           g_diffPool[DEMOD_POOL_N];
+static int               g_diffPoolHead    = 0;
+static int               g_diffPoolFilled  = 0;
+
+// Flush pool history. MUST be called whenever the signal level steps abruptly
+// (DAC change, channel switch, range change) — otherwise the lagging pool
+// median biases the next ~DEMOD_POOL_N pair-diffs toward the previous level.
+static inline void demodPoolReset() {
+  g_diffPoolHead = 0;
+  g_diffPoolFilled = 0;
+}
+static uint64_t          g_demodRejTotal   = 0;
+static uint64_t          g_demodPairsTotal = 0;
+static uint32_t          g_demodRejSinceOutput   = 0;
+static uint32_t          g_demodPairsSinceOutput = 0;
 
 // ---------------- DAC Filter Settling ----------------
 // Second-order Bessel filter on DAC output requires settling after step changes.
@@ -434,10 +464,10 @@ int formatVoltage(double voltage, char* buf, size_t bufLen, int sigDigits = 9) {
   return snprintf(buf, bufLen, "%.*f %s", decimals, scaledV, unit);
 }
 
-// Sample period derived from filterCode below (sinc4 OSR=32 * sinc1 OSR; see configureFilter).
-static constexpr float    OSR_TOTAL         = 6400.0f;
-static constexpr float    EST_FSPS          = ADC_FMOD_HZ / OSR_TOTAL;     // ~1953.125 SPS at OSR=6400
-static constexpr float    EST_TS_US         = 1e6f / EST_FSPS;             // ~512 us/sample at OSR=6400
+// Sample period derived from filterCode below.
+static constexpr float    OSR_TOTAL         = 12800.0f;
+static constexpr float    EST_FSPS          = ADC_FMOD_HZ / OSR_TOTAL;     // ~976.56 SPS at OSR=12800
+static constexpr float    EST_TS_US         = 1e6f / EST_FSPS;             // ~1024 us/sample at OSR=12800
 
 // ---------------- SPI ----------------
 static constexpr uint32_t SPI_HZ = 5'000'000;
@@ -539,7 +569,7 @@ public:
   void initAndConfigure();
   void writeReg(uint8_t addr, uint8_t val);
   uint8_t readReg(uint8_t addr);
-  bool waitDrdy(uint32_t timeout_us = 2000);
+  bool waitDrdy(uint32_t timeout_us = 5000);  // default safe up to OSR ~30000 (Ts ~2.4ms)
   bool readSample24(int32_t &sample);
   void start(); // start/stop control mode, per section 8.4.6.2
   void stop();
@@ -599,8 +629,8 @@ const char* getDividerRatioName(DividerRatio ratio) {
 
 //
 // LowerMoments
-//
-// LowerMoments.h / drop-in class for Teensy/Arduino (64-bit double supported)
+// Statistical moments, mean, count, std deviation, aka Welford tracker.
+// drop-in class for Teensy/Arduino (64-bit double supported)
 
 #include <cmath>
 #include <cfloat>
@@ -608,7 +638,9 @@ const char* getDividerRatioName(DividerRatio ratio) {
 
 class LowerMoments {
 public:
-  LowerMoments() { clear(); }
+  LowerMoments() { 	 
+	clear();
+  }
 
   // Add a sample and update mean/variance incrementally
   void accumulate(double x) {
@@ -703,9 +735,8 @@ private:
   bool   initialized_;
 };
 
-// HalfCycleResult — defined here, after LowerMoments, because it holds LowerMoments by value.
+// HalfCycleResult. Signals overflow when gathering ADC samples
 struct HalfCycleResult {
-  LowerMoments stats;   // Welford accumulator over GOOD_SAMPLES ADC counts for this half-cycle
   bool overflow = false;
   int32_t overflowSample = 0;  // value of the sample that triggered overflow (only valid when overflow)
 };
@@ -972,6 +1003,7 @@ void InputMuxDriver::select(InputChannel channel) {
   digitalWriteFast(PIN_INMUX_A1, (addr & 0x02) ? HIGH : LOW);
   digitalWriteFast(PIN_INMUX_A2, (addr & 0x04) ? HIGH : LOW);
   current_ = channel;
+  demodPoolReset();
   delayMicroseconds(INMUX_SETTLE_US);
 }
 
@@ -1025,6 +1057,7 @@ void DacDriver::setCode(int16_t code) {
   int32_t stepSize = abs((int32_t)code - (int32_t)currentCode_);
   currentCode_ = code;
   _dac.writeCodeAndUpdate(code);
+  demodPoolReset();
 
   uint32_t settleMs = calculateSettleTime(stepSize);
   if (settleMs > 0) {
@@ -1035,6 +1068,7 @@ void DacDriver::setCode(int16_t code) {
 void DacDriver::setCodeFast(int16_t code) {
   currentCode_ = code;
   _dac.writeCodeAndUpdate(code);
+  demodPoolReset();
   delay(5);  // ~5 ms: enough for ADC to see coarse signal, not full filter settle
 }
 
@@ -1335,7 +1369,11 @@ bool AdcDriver::waitDrdy(uint32_t timeout_us) {
 // section 8.5.7 conversion data read, short format
 //
 bool AdcDriver::readSample24(int32_t &sample) {
-  if (!waitDrdy(2000)) {
+  // Per-sample DRDY timeout sized to cover the worst filter-pipeline latency
+  // we use: sinc3 OSR=26667 has 3*Ts latency before first DRDY after start().
+  // 4x Ts + slack handles all filter modes without false negatives.
+  const uint32_t timeoutUs = (uint32_t)(EST_TS_US * 4.0f) + 200;
+  if (!waitDrdy(timeoutUs)) {
     sample = 0;
     return false;
   }
@@ -1405,7 +1443,7 @@ void AdcDriver::initAndConfigure() {
   writeReg(REG_CONFIG2, config2);
 
   const uint8_t delayCode  = 0b000;
-  const uint8_t filterCode = 0b11001;  // sinc4 (OSR=32) + sinc1 (OSR=200), total OSR=6400
+  const uint8_t filterCode = 0b11010;  // sinc4 OSR=32 + sinc1 OSR=400 → OSR_total=12800
   const uint8_t config3 = (delayCode << 5) | (filterCode & 0x1F);
   writeReg(REG_CONFIG3, config3);
 
@@ -1454,11 +1492,9 @@ void ChopperDriver::toggle() {
 
 // ---------------- Chopped acquisition ----------------
 
-// Collect samples for one half-cycle, detect overflow on first sample.
-// extraDiscards: additional samples to discard after DISCARD_SAMPLES, before the overflow
-// check. Pass > 0 for Phase B to allow TMUX charge-injection transients to decay first.
-// Sets result.overflow on ADC overflow OR timeout.
-HalfCycleResult acquireHalfCycle() {
+// Collect samples for one half-cycle, detect overflow on any sample.
+// write samples array for stats accumulation
+HalfCycleResult acquireHalfCycle(int32_t *samples) {
   HalfCycleResult result;
 
   // Discard initial samples after settling
@@ -1467,21 +1503,18 @@ HalfCycleResult acquireHalfCycle() {
     if (!adc.readSample24(discard)) { result.overflow = true; return result; }
   }
 
-  // Read first good sample and check for preamp saturation
-  int32_t firstSample;
-  if (!adc.readSample24(firstSample)) { result.overflow = true; return result; }
-  if (isOverflow(firstSample)) {
-    result.overflow = true;
-    result.overflowSample = firstSample;
-    return result;
-  }
-  result.stats.accumulate((double)firstSample);
-
-  // Accumulate remaining good samples into Welford tracker
-  for (uint8_t i = 1; i < g_good_samples; i++) {
+  for (uint8_t i = 0; i < g_good_samples; i++) {
     int32_t s;
-    if (!adc.readSample24(s)) { result.overflow = true; return result; }
-    result.stats.accumulate((double)s);
+    if (!adc.readSample24(s)) { 
+      result.overflow = true; 
+      return result; 
+    }
+    if (isOverflow(s)) {
+      result.overflow = true; 
+      result.overflowSample = s;
+      return result;  
+    }
+    samples[i] = s;
   }
   return result;
 }
@@ -1543,6 +1576,9 @@ public:
 
   // Per-channel statistics
   LowerMoments& channelStats(uint8_t idx) { return channelStats_[idx]; }
+  // Per-channel phase buffers
+  int32_t *bufferA(uint8_t idx) { return phaseA_[idx]; }
+  int32_t *bufferB(uint8_t idx) { return phaseB_[idx]; }
 
   // Per-channel DAC code cache
   int16_t channelDacCode(uint8_t idx) const { return channelDacCode_[idx]; }
@@ -1581,6 +1617,8 @@ private:
   int cycleCount_ = 0;
   int chopCycleCount_ = 0;
   LowerMoments channelStats_[8];
+  int32_t phaseA_[8][MAX_SAMPLES];
+  int32_t phaseB_[8][MAX_SAMPLES];
   AdjustedEWMA channelEwma_[8];
   int16_t channelDacCode_[8];
   bool channelDacValid_[8];
@@ -1642,7 +1680,7 @@ const char* getChannelShortName(InputChannel channel) {
 }
 
 // Forward declarations for command handlers and shared helpers
-bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow = true);
+bool runOneChopCycle(LowerMoments &stats, int32_t* bA, int32_t* bB, bool searchOnOverflow = true);
 void performAutoZero();
 void printCsvHeader();
 void cmdLabel(const char* arg1, const char* arg2);
@@ -1787,30 +1825,65 @@ void cmdPlotStop() {
   Serial.println("Serial Plotter output disabled, human-readable output restored.");
 }
 
+// Wall-clock seconds per chop cycle, modeled exactly from chopper.toggle() + the
+// stop/settle/start gap + the (DISCARD + samples) readSample24 calls per half-cycle.
+// Used by cmdIntegrate, cmdSetSamples, and computeTau0 so all three agree.
+static double chopCycleSeconds() {
+  const double fixedUs = (double)(CHOP_SETTLE_US + CI_PRE_EDGE_US + CI_POST_EDGE_US);
+  const double samplesUs = (double)(DISCARD_SAMPLES + g_good_samples) * (double)EST_TS_US;
+  return 2.0 * (fixedUs + samplesUs) * 1e-6;
+}
+
+// Compute measurement interval (tau0) in seconds for current integration setting
+static double computeTau0() {
+  return scanner.config.integrationCycles * chopCycleSeconds();
+}
+
 void cmdIntegrate(const char* arg) {
-  int n = atoi(arg);
-  if (n < 10 || n > 10000) {
-    Serial.println("ERROR: Integration cycles must be 10-10000.");
+  // Argument is a target integration time in seconds. Internally translates
+  // to integrationCycles using current OSR + samples so the wall-clock per
+  // reading is preserved across `samples` changes.
+  float secs = atof(arg);
+  if (secs < 0.1f || secs > 600.0f) {
+    Serial.println("ERROR: Integration time must be 0.1-600 seconds.");
     return;
   }
+  const float tau0 = (float)chopCycleSeconds();
+  int n = (int)roundf(secs / tau0);
+  if (n < 10)    n = 10;
+  if (n > 10000) n = 10000;
   scanner.config.integrationCycles = n;
+  const float actualSec = n * tau0;
   Serial.print("Integration set to ");
+  Serial.print(actualSec, 2);
+  Serial.print(" sec per reading (");
   Serial.print(n);
-  Serial.print(" chop cycles (~");
-  Serial.print((float)n / EST_FSPS * (DISCARD_SAMPLES + g_good_samples + 1) * 2, 1);
-  Serial.println(" sec per reading).");
+  Serial.println(" chop cycles).");
 }
 
 void cmdSetSamples(const char *arg) {
   int n = atoi(arg);
-  if (n < 1 || n > 100) {
-    Serial.println("ERROR: Samples must be 1-100.");
+  if (n < 1 || n > MAX_SAMPLES) {
+    Serial.print("ERROR: Samples must be 1-"); Serial.print(MAX_SAMPLES); Serial.println(".");
     return;
   }
+  // Preserve wall-clock per reading: rescale integrationCycles using the exact
+  // chop-cycle model (chopCycleSeconds accounts for DISCARD + samples + fixed overhead).
+  const double oldSec = scanner.config.integrationCycles * chopCycleSeconds();
   g_good_samples = n;
+  const double newTau0 = chopCycleSeconds();
+  int newCycles = (int)round(oldSec / newTau0);
+  if (newCycles < 10)    newCycles = 10;
+  if (newCycles > 10000) newCycles = 10000;
+  scanner.config.integrationCycles = newCycles;
+
   Serial.print("Samples set to ");
   Serial.print(n);
-  Serial.println(" per half cycle.");
+  Serial.print(" per half cycle. Integration rescaled to ");
+  Serial.print(newCycles);
+  Serial.print(" chop cycles (~");
+  Serial.print(newCycles * newTau0, 2);
+  Serial.println(" sec per reading).");
   scanner.resetAllChannelEwma();
   allanDev.clear();
   Serial.println("EWMA + Allan deviation history cleared as a side-effect.");
@@ -1881,7 +1954,17 @@ void printStatus() {
 
   Serial.print("Integration: ");
   Serial.print(scanner.config.integrationCycles);
-  Serial.println(" chop cycles");
+  Serial.print(" chop cycles (");
+  Serial.print(computeTau0(), 3);
+  Serial.print(" s/reading; tau0=");
+  Serial.print(chopCycleSeconds() * 1000.0, 2);
+  Serial.print(" ms; samples=");
+  Serial.print(g_good_samples);
+  Serial.print(", DISCARD=");
+  Serial.print(DISCARD_SAMPLES);
+  Serial.print(", OSR=");
+  Serial.print((int)OSR_TOTAL);
+  Serial.println(")");
 
   Serial.print("Auto-zero: ");
   Serial.print(scanner.config.autoZeroEnabled ? "ON" : "OFF");
@@ -1940,8 +2023,9 @@ void printHelp() {
   Serial.println("log stop               Stop CSV logging");
   Serial.println("plot start             Start Arduino Serial Plotter output");
   Serial.println("plot stop              Stop plotter output");
-  Serial.println("integrate <N>          Set chop cycles per reading (10-10000)");
-  Serial.println("samples <n>            Set samples per half chop (1-100)");  
+  Serial.println("integrate <secs>       Set integration time per reading (0.1-600 s)");
+  Serial.println("samples <n>            Set samples per half chop (1-20)");
+  Serial.println("drj [<k>]              Demod outlier rejection k (k=10000 disables; no arg = show)");
   Serial.println("autozero on|off        Enable/disable periodic auto-zero");
   Serial.println("autozero interval <N>  Cycles between auto-zero (readings in ONE_CHANNEL, sweeps in SCANNING) 1-1000");
   Serial.println("range <10|100|1000>    Set HV divider ratio");
@@ -1953,7 +2037,7 @@ void printHelp() {
   Serial.println("config show            Show saved vs current config");
   Serial.println("config autostart on|off  Auto-start scanning on boot");
   Serial.println("adev [clear]           Show Allan deviation (or clear history)");
-  Serial.println("ewma <n>               Set EWMA window equivalent (default 10); 'ewma reset' to clear");
+  Serial.println("ewma <n>               Set EWMA window equivalent (default 10); 'ewma reset|clear' to clear");
   Serial.println("cal status             Show calibration flash status and current values");
   Serial.println("cal save               Save constants + DAC table to flash");
   Serial.println("cal load               Reload constants + DAC table from flash");
@@ -1976,12 +2060,6 @@ void printHelp() {
   Serial.println("debug [on|off]         Toggle binary-search trace prints (default off)");
   Serial.println("help                   Show this help");
   Serial.println("=======================\n");
-}
-
-// Compute measurement interval (tau0) in seconds for current integration setting
-static double computeTau0() {
-  return (double)scanner.config.integrationCycles / EST_FSPS
-         * (DISCARD_SAMPLES + g_good_samples + 1) * 2;
 }
 
 void cmdAdev(const char* arg) {
@@ -2105,7 +2183,7 @@ void processCommand(char* line) {
     else if (strcasecmp(arg1, "stop") == 0) cmdPlotStop();
     else Serial.println("Usage: plot start|stop");
   } else if (strcasecmp(cmd, "integrate") == 0) {
-    if (!arg1) { Serial.println("Usage: integrate <10-10000>"); return; }
+    if (!arg1) { Serial.println("Usage: integrate <0.1-600 seconds>"); return; }
     cmdIntegrate(arg1);
   } else if (strcasecmp(cmd, "autozero") == 0) {
     if (!arg1) { Serial.println("Usage: autozero on|off | autozero interval <N>"); return; }
@@ -2141,7 +2219,7 @@ void processCommand(char* line) {
     } else if (strcasecmp(arg1, "show") == 0) cmdConfigShow();
     else Serial.println("Usage: config save|load|factory|autostart|show");
   } else if (strcasecmp(cmd, "ewma") == 0) {
-    if (!arg1 || strcasecmp(arg1, "reset") == 0) {
+    if (!arg1 || strcasecmp(arg1, "reset") == 0 || strcasecmp(arg1, "clear") == 0) {
       scanner.resetAllChannelEwma();
       scanner.autoZeroEwma_.reset();
       Serial.println("EWMA filters reset.");
@@ -2179,8 +2257,22 @@ void processCommand(char* line) {
   } else if (strcasecmp(cmd, "help") == 0) {
     printHelp();
   } else if(strcasecmp(cmd, "samples")==0) {
-    if (!arg1) { Serial.println("Usage: samples <1-100>"); return; }
+    if (!arg1) { Serial.println("Usage: samples <1-20>"); return; }
     cmdSetSamples(arg1);
+  } else if (strcasecmp(cmd, "drj") == 0) {
+    if (!arg1) {
+      Serial.print("drj k = "); Serial.print(g_demodRejKx10 / 10.0, 1);
+      Serial.print("  (rej ");
+      Serial.print((unsigned long)g_demodRejTotal); Serial.print('/');
+      Serial.print((unsigned long)g_demodPairsTotal);
+      Serial.println(" cum)  Usage: drj <k>  (k=10000 disables)");
+      return;
+    }
+    double kf = atof(arg1);
+    if (kf < 0.1) { Serial.println("k must be >= 0.1"); return; }
+    g_demodRejKx10 = (int32_t)(kf * 10.0 + 0.5);
+    Serial.print("Demod outlier rejection: k = ");
+    Serial.println(g_demodRejKx10 / 10.0, 1);
    } else {
     Serial.print("Unknown command: '");
     Serial.print(cmd);
@@ -2311,7 +2403,8 @@ bool postTestDacComm() {
  * Expected: ~MAX_FSPS (1953)
  */
 bool postTestDrdyTiming() {
-  const int32_t EXPECTED = 2000;
+  // Per-edge timeout: 4x sample period covers sinc3's 3*Ts first-conversion latency.
+  const int32_t EXPECTED = (int32_t)(EST_TS_US * 4.0f) + 200;
   Serial.print("POST: DRDY Timing... ");
   adc.start();
   // Report raw pin state before attempting to measure — helps diagnose wiring vs. timing issues
@@ -2322,6 +2415,17 @@ bool postTestDrdyTiming() {
   // Wait for DRDY to go high first
   elapsedMicros timeout = 0;
   while (digitalReadFast(PIN_ADC_DRDY) == LOW && timeout < EXPECTED) {}
+
+  // Discard the first full DRDY cycle to skip the sinc3 cascade fill latency
+  // (~3*Ts on first conversion after START). Use a wider timeout for this first
+  // edge specifically, then the steady-state EXPECTED applies to the timed loop.
+  const int32_t FIRST_EDGE_TIMEOUT = (int32_t)(EST_TS_US * 6.0f) + 200;
+  timeout = 0;
+  while (digitalReadFast(PIN_ADC_DRDY) == HIGH && timeout < FIRST_EDGE_TIMEOUT) {}
+  if (timeout >= FIRST_EDGE_TIMEOUT) { Serial.println("FAIL (first DRDY fall timeout)"); return false; }
+  timeout = 0;
+  while (digitalReadFast(PIN_ADC_DRDY) == LOW && timeout < FIRST_EDGE_TIMEOUT) {}
+  if (timeout >= FIRST_EDGE_TIMEOUT) { Serial.println("FAIL (first DRDY rise timeout)"); return false; }
 
   // Measure time for 10 DRDY pulses
   const int numPulses = 10;
@@ -2422,8 +2526,10 @@ bool postPinIdVerify() {
 // Returns demod mean (in ADC LSB) on success, or NaN on overflow.
 static double measureDemodMean(int cycles) {
   LowerMoments stats;
+  int32_t buffA[MAX_SAMPLES];
+  int32_t buffB[MAX_SAMPLES];
   for (int i = 0; i < cycles; ++i) {
-    if (!runOneChopCycle(stats, /*searchOnOverflow=*/false)) {
+    if (!runOneChopCycle(stats, buffA, buffB, false)) {
       return NAN;
     }
   }
@@ -2491,12 +2597,16 @@ bool postTestPolarity() {
 
   dac.setCode(zero - 1);
   LowerMoments prime;
-  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero-1)"); return false; }
+  int32_t buffA[MAX_SAMPLES];
+  int32_t buffB[MAX_SAMPLES];
+  
+  if (!runOneChopCycle(prime, buffA, buffB, false)) { Serial.println("FAIL (prime overflow @ zero-1)"); return false; }
   const double demodNeg = measureDemodMean(5);
   if (isnan(demodNeg)) { Serial.println("FAIL (overflow @ zero-1)"); return false; }
 
   dac.setCode(zero + 1);
-  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero+1)"); return false; }
+  prime.clear();
+  if (!runOneChopCycle(prime, buffA, buffB, false)) { Serial.println("FAIL (prime overflow @ zero+1)"); return false; }
   const double demodPos = measureDemodMean(5);
   if (isnan(demodPos)) { Serial.println("FAIL (overflow @ zero+1)"); return false; }
 
@@ -2529,17 +2639,22 @@ bool postTestChopSymmetry() {
   // unit. Slopes between adjacent DAC codes are independent of that offset.
   dac.setCode(zero - 1);
   LowerMoments prime;
-  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero-1)"); return false; }
+  int32_t buffA[MAX_SAMPLES];
+  int32_t buffB[MAX_SAMPLES];
+  
+  if (!runOneChopCycle(prime, buffA, buffB, false)) { Serial.println("FAIL (prime overflow @ zero-1)"); return false; }
   const double demodNeg = measureDemodMean(5);
   if (isnan(demodNeg)) { Serial.println("FAIL (overflow @ zero-1)"); return false; }
 
-  dac.setCode(zero);
-  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero)"); return false; }
+  dac.setCode(zero); 
+  prime.clear();
+  if (!runOneChopCycle(prime, buffA, buffB, false)) { Serial.println("FAIL (prime overflow @ zero)"); return false; }
   const double demodMid = measureDemodMean(5);
   if (isnan(demodMid)) { Serial.println("FAIL (overflow @ zero)"); return false; }
 
   dac.setCode(zero + 1);
-  if (!runOneChopCycle(prime, false)) { Serial.println("FAIL (prime overflow @ zero+1)"); return false; }
+  prime.clear();
+  if (!runOneChopCycle(prime, buffA, buffB, false)) { Serial.println("FAIL (prime overflow @ zero+1)"); return false; }
   const double demodPos = measureDemodMean(5);
   if (isnan(demodPos)) { Serial.println("FAIL (overflow @ zero+1)"); return false; }
 
@@ -2605,63 +2720,208 @@ bool postTestInputMux() {
 }
 
 /**
- * POST Test 8: Reference Verification
- * Measures VrefRaw (pre-filter ADR1001 average at J3) and verifies it is
- * close to the expected 5V, within the ADC's measurement range.
- * This catches a failed reference or signal path issue.
+ * POST Test 8: Reference Verification + DAC Settling Characterization
+ * Two things in one test, sharing the long VrefRaw filter wait:
+ *  1) Measure how long the DAC's RC filter takes to bring the preamp output
+ *     to within {1 mV, 100 µV, 10 µV, 1 µV} (input-referred) of its final
+ *     value after a 0 → +FS step. Used to tune RC_SETTLE_MS in
+ *     binarySearchDAC and the wait between DAC code changes elsewhere.
+ *  2) Verify VrefRaw (pre-filter ADR1001 average at J3) is near the expected
+ *     5 V, using the settled value from step (1) as the reading.
+ *
+ * Setup: VrefRaw provides a stable +5 V at the (-) input. With DAC parked
+ * at 0 V the preamp is positively saturated; as the DAC steps to +5 V the
+ * preamp comes out of saturation and the tail of the RC settle is
+ * observable. Only the tail is visible (preamp linear range is ±1.25 mV at
+ * the input), but that's the part that matters for chop accuracy.
  */
 bool postTestReferences() {
-  Serial.print("POST: Reference... ");
+  Serial.println("POST: Reference + DAC Settle...");
   ScopedInstrumentState guard;
 
-  // Set DAC to ~5V to match the expected reference voltage
-  const int16_t dacAt5V = 32764;  // Near +5V, 14-bit aligned
-  dac.setCode(dacAt5V);
-
-  // Measure the raw reference average (J3)
+  // Park DAC at 0 V and switch the (-) input to VrefRaw. VrefRaw RC filter
+  // and the DAC at 0 share the long warm-up wait.
+  dac.setCode(0);
   inputMux.select(InputChannel::VrefRaw);
-  delayMicroseconds(SETTLE_US);
-  
-  // Wait for VrefRaw RC filter to settle — the low-pass filter has a long time constant.
-  Serial.print("settling... ");
-  delay(1000*20);
+  Serial.print("  VrefRaw filter settling (15 s)... ");
+  delay(1000 * 15);
+  Serial.println("done");
 
-  // Stop/start ADC to flush filter history, then read.
+  // --- DAC settling characterization ---
+  // Capture timestamped ADC samples after a 0 → +FS step. The DAC RC filter
+  // was recently modified and τ is unknown, so we use a long window with
+  // decimated storage: every ~20 ms over 30 s. Storage is function-static
+  // (BSS) to avoid stack pressure (~12 KB).
+  static constexpr uint32_t PROBE_WINDOW_US   = 30UL * 1000000UL;          // 30 s
+  static constexpr int      PROBE_N           = 1500;
+  static constexpr uint32_t STORE_INTERVAL_US = PROBE_WINDOW_US / PROBE_N; // 20 ms
+  static constexpr uint32_t MID_REFLUSH_US    = 400000;                   // 400 ms
+  static int32_t  probeSample[PROBE_N];
+  static uint32_t probeUs[PROBE_N];
+
+  // Flush ADC sinc memory. Match the dance used by readSettledSample (proven
+  // to produce clean first samples) rather than the shorter SETTLE_US.
   adc.stop();
-  delayMicroseconds(SETTLE_US);
+  delayMicroseconds(SETTLE_US + TMUX_RECONNECT_US);
   adc.start();
-  int32_t s;
-  for (uint8_t i = 0; i < DISCARD_SAMPLES; i++) {
-    if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
+
+  // Sanity check #1: with DAC=0 and VrefRaw=+5V, the preamp should be at one
+  // rail. Take 5 prestep samples — if they all agree at the rail, the ADC is
+  // tracking input correctly. If they vary or disagree with expectation, the
+  // ADC or input path is the suspect (not the DAC RC).
+  Serial.print("  Pre-step (DAC=0, expect rail): ");
+  int32_t prestepMin =  INT32_MAX, prestepMax = INT32_MIN;
+  for (int i = 0; i < 5; i++) {
+    int32_t s;
+    if (!adc.readSample24(s)) {
+      Serial.println("\n  FAIL (ADC timeout pre-step)");
+      return false;
+    }
+    Serial.print(s); Serial.print(' ');
+    if (s < prestepMin) prestepMin = s;
+    if (s > prestepMax) prestepMax = s;
   }
-  int64_t sum = 0;
-  const int numSamples = 5;
-  for (int i = 0; i < numSamples; i++) {
-    if (!adc.readSample24(s)) { Serial.println("FAIL (ADC timeout)"); return false; }
-    sum += s;
+  Serial.print("(spread="); Serial.print(prestepMax - prestepMin); Serial.println(")");
+
+  const int16_t finalCode = 32767;  // the exception to the 14 bit alignment
+  const uint32_t t0 = micros();
+  dac.setCodeFast(finalCode);  // bypasses built-in settle delay; we time it ourselves
+
+  // Sanity check #2: at MID_REFLUSH_US, do an in-flight stop/start of the ADC.
+  // If post-reflush samples diverge from the values just before, the sinc
+  // filter was stuck on stale modulator state. If they agree, the input is
+  // genuinely still where it was, and the DAC RC really is that slow.
+  int reflushIdx = -1;
+  bool reflushed = false;
+
+  // Survive transient DRDY timeouts so we get the partial trace + know where.
+  // Each timeout logs the elapsed time and attempts a stop/start recovery.
+  // Bail only after MAX_TIMEOUTS consecutive failures.
+  static constexpr int MAX_TIMEOUTS = 4;
+  int timeoutCount = 0;
+
+  int n = 0;
+  uint32_t nextStoreUs = 0;
+  int32_t s = 0;
+  while (n < PROBE_N) {
+    if (!adc.readSample24(s)) {
+      uint32_t now = micros() - t0;
+      Serial.print("  [t="); Serial.print(now / 1000); Serial.print(" ms] DRDY timeout #");
+      Serial.print(timeoutCount + 1); Serial.println(", recovering");
+      timeoutCount++;
+      if (timeoutCount >= MAX_TIMEOUTS) {
+        Serial.println("  Too many timeouts, dumping partial trace");
+        break;
+      }
+      adc.stop();
+      delayMicroseconds(SETTLE_US + TMUX_RECONNECT_US);
+      adc.start();
+      continue;
+    }
+    timeoutCount = 0;  // reset on any successful read
+    uint32_t now = micros() - t0;
+    if (now >= nextStoreUs) {
+      probeSample[n] = s;
+      probeUs[n]     = now;
+      n++;
+      nextStoreUs += STORE_INTERVAL_US;
+    }
+    if (!reflushed && now >= MID_REFLUSH_US) {
+      reflushIdx = n;  // first index AFTER the reflush
+      adc.stop();
+      delayMicroseconds(SETTLE_US + TMUX_RECONNECT_US);
+      adc.start();
+      reflushed = true;
+    }
+    if (now >= PROBE_WINDOW_US) break;
   }
-  int32_t reading = sum / numSamples;
   adc.stop();
-  // guard restores channel + DAC on scope exit
 
-  // With DAC at ~5V and VrefRaw at ~5V, the ADC should read near zero
-  // (the difference × 2000 gain). Allow up to 60% of full scale:
-  // - DAC code 32764 → 4.9994V (inherent 0.6mV offset from DAC quantization → ~4M counts)
-  // - VrefRaw may not be at exactly 5V at power-on (ADR1001 needs warm-up)
+  // Estimate the settled value from the last 10% of the trace.
+  const int settledStart = (n * 9) / 10;
+  int64_t sumSettled = 0;
+  for (int i = settledStart; i < n; i++) sumSettled += probeSample[i];
+  const int32_t settled = (n > settledStart) ? (int32_t)(sumSettled / (n - settledStart)) : 0;
+  const uint32_t windowEndUs = (n > 0) ? probeUs[n - 1] : 0;
+
+  Serial.print("  DAC step 0->code "); Serial.print(finalCode);
+  Serial.print(" (settled="); Serial.print(settled);
+  Serial.print(", N="); Serial.print(n);
+  Serial.print(", window="); Serial.print(windowEndUs / 1000); Serial.println(" ms)");
+
+  // Reflush bracket — print the sample just before the reflush and the first
+  // sample after, to expose any sinc-filter stickiness.
+  if (reflushIdx > 0 && reflushIdx < n) {
+    Serial.print("  Reflush @ ~"); Serial.print(MID_REFLUSH_US / 1000); Serial.print(" ms: ");
+    Serial.print("pre=");  Serial.print(probeSample[reflushIdx - 1]);
+    Serial.print(" post="); Serial.print(probeSample[reflushIdx]);
+    Serial.print(" delta="); Serial.println(probeSample[reflushIdx] - probeSample[reflushIdx - 1]);
+  }
+
+  // Sparse trace dump — sample closest to each requested time so we can see
+  // the shape of the settle even before threshold analysis.
+  const uint32_t traceTimesMs[] = {1, 10, 100, 500, 1000, 2000, 5000, 10000, 20000, 30000};
+  Serial.println("  Trace:");
+  for (uint32_t targetMs : traceTimesMs) {
+    uint32_t targetUs = targetMs * 1000UL;
+    int closest = -1;
+    uint32_t bestDist = UINT32_MAX;
+    for (int i = 0; i < n; i++) {
+      uint32_t d = (probeUs[i] > targetUs) ? probeUs[i] - targetUs : targetUs - probeUs[i];
+      if (d < bestDist) { bestDist = d; closest = i; }
+    }
+    if (closest < 0) continue;
+    Serial.print("    t="); Serial.print(probeUs[closest] / 1000);
+    Serial.print(" ms: ADC="); Serial.print(probeSample[closest]);
+    Serial.print(" (err="); Serial.print(probeSample[closest] - settled); Serial.println(")");
+  }
+
+  // Threshold crossings (input-referred). Counts = (Vinput × PREAMP_GAIN) / ADC_LSB_V.
+  // Reported time = LAST violation in the trace — i.e., the wait needed
+  // before subsequent samples stay within the threshold of the settled value.
+  const double countsPerVolt = PREAMP_GAIN / ADC_LSB_V;
+  struct ThrSpec { const char *name; double inputV; };
+  const ThrSpec thresholds[] = {
+    { "1mV   ", 1.0e-3 },
+    { "100uV ", 1.0e-4 },
+    { "10uV  ", 1.0e-5 },
+    { "1uV   ", 1.0e-6 },
+  };
+  for (auto &t : thresholds) {
+    int32_t thrCounts = (int32_t)(t.inputV * countsPerVolt);
+    uint32_t lastViolationUs = 0;
+    bool everViolated = false;
+    for (int i = 0; i < n; i++) {
+      int32_t err = probeSample[i] - settled;
+      if (err < 0) err = -err;
+      if (err > thrCounts) { lastViolationUs = probeUs[i]; everViolated = true; }
+    }
+    Serial.print("    "); Serial.print(t.name);
+    Serial.print("(\xc2\xb1"); Serial.print(thrCounts); Serial.print(" cts) -> ");
+    if (!everViolated) {
+      Serial.println("never violated");
+    } else if (lastViolationUs >= windowEndUs) {
+      Serial.print(">"); Serial.print(windowEndUs / 1000); Serial.println(" ms (window exhausted)");
+    } else {
+      Serial.print(lastViolationUs / 1000); Serial.print(".");
+      Serial.print((lastViolationUs / 100) % 10); Serial.println(" ms");
+    }
+  }
+
+  // --- Reference verification ---
+  // DAC is now at +FS, mux on VrefRaw. The settled value above IS the
+  // post-warm-up reference reading; reuse it rather than reading again.
+  const int32_t reading = settled;
   const int32_t refThreshold = 5'000'000;  // ~60% of 8,388,607
+  const bool pass = (reading > -refThreshold) && (reading < refThreshold);
 
-  bool pass = (reading > -refThreshold) && (reading < refThreshold);
-
+  Serial.print("POST: Reference: ");
   if (pass) {
-    Serial.print("PASS (VrefRaw=");
-    Serial.print(reading);
-    Serial.println(")");
+    Serial.print("PASS (VrefRaw="); Serial.print(reading); Serial.println(")");
   } else {
-    Serial.print("FAIL (VrefRaw=");
-    Serial.print(reading);
-    Serial.print(", expected near 0, threshold=±");
-    Serial.print(refThreshold);
-    Serial.println(")");
+    Serial.print("FAIL (VrefRaw="); Serial.print(reading);
+    Serial.print(", expected near 0, threshold=\xc2\xb1");
+    Serial.print(refThreshold); Serial.println(")");
   }
   return pass;
 }
@@ -2678,12 +2938,14 @@ bool postTestZero() {
 
   // Switch to GND input and set DAC to 0V
   inputMux.select(InputChannel::GND);
-  dac.setCode(0);
+  dac.setCode(2);
 
   // Accumulate chopped measurements for accurate zero reading
   LowerMoments zeroStats;
+  int32_t buffA[MAX_SAMPLES];
+  int32_t buffB[MAX_SAMPLES];
   for (int i = 0; i < 10; i++) {
-    if (!runOneChopCycle(zeroStats, /*searchOnOverflow=*/false)) {
+    if (!runOneChopCycle(zeroStats, buffA, buffB, false)) {
       Serial.println("FAIL (overflow during zero measurement)");
       return false;  // guard restores state
     }
@@ -2780,10 +3042,11 @@ void measureFilterError() {
 
   // Accumulate multiple chopped measurements for stability
   LowerMoments refStats;
-
+  int32_t buffA[MAX_SAMPLES];
+  int32_t buffB[MAX_SAMPLES];
   for (int i = 0; i < REF_MEASURE_ITERATIONS; i++) {
     // searchOnOverflow=false: DAC is deliberately set to ~5V; let caller handle unexpected overflow
-    if (!runOneChopCycle(refStats, /*searchOnOverflow=*/false)) {
+    if (!runOneChopCycle(refStats, buffA, buffB, false)) {
       Serial.println("WARNING: Overflow during reference measurement!");
       return;  // guard restores state
     }
@@ -3109,8 +3372,10 @@ void performAutoZero() {
   LowerMoments repeatStats;
   for (int rep = 0; rep < 2; rep++) {
     LowerMoments gndStats;
+	int32_t buffA[MAX_SAMPLES];
+	int32_t buffB[MAX_SAMPLES];
     for (int i = 0; i < AUTOZERO_CYCLES; i++) {
-      if (!runOneChopCycle(gndStats, /*searchOnOverflow=*/false)) {
+      if (!runOneChopCycle(gndStats, buffA, buffB, false)) {
         Serial.println("WARNING: Overflow during auto-zero!");
         return;  // guard restores state
       }
@@ -3639,9 +3904,11 @@ void cmdCalBuildDac() {
     dac.setCode(code);
 
     LowerMoments stats;
+	int32_t buffA[MAX_SAMPLES];
+	int32_t buffB[MAX_SAMPLES];
     bool ok = true;
     for (int i = 0; i < CAL_BUILD_CYCLES; i++) {
-      if (!runOneChopCycle(stats, /*searchOnOverflow=*/false)) { ok = false; break; }
+      if (!runOneChopCycle(stats, buffA, buffB, false)) { ok = false; break; }
     }
     if (!ok) {
       Serial.print("  WARNING: Overflow at code "); Serial.println(code);
@@ -3679,9 +3946,12 @@ void cmdCalBuildDac() {
     dac.setCode(code);
 
     LowerMoments stats;
+	int32_t buffA[MAX_SAMPLES];
+	int32_t buffB[MAX_SAMPLES];
     bool ok = true;
     for (int i = 0; i < CAL_BUILD_CYCLES; i++) {
-      if (!runOneChopCycle(stats, /*searchOnOverflow=*/false)) { ok = false; break; }
+      if (!runOneChopCycle(stats, buffA, buffB, false)) { 
+	  ok = false; break; }
     }
     if (!ok) {
       Serial.print("  WARNING: Overflow at code "); Serial.println(code);
@@ -3745,8 +4015,10 @@ void cmdCalPoint(const char* voltageStr) {
 
   // Accumulate chopped measurements
   LowerMoments stats;
+  int32_t buffA[MAX_SAMPLES];
+  int32_t buffB[MAX_SAMPLES];
   for (int i = 0; i < CAL_POINT_CYCLES; i++) {
-    if (!runOneChopCycle(stats, /*searchOnOverflow=*/false)) {
+    if (!runOneChopCycle(stats, buffA, buffB, false)) {
       Serial.println("WARNING: Overflow during cal point measurement. Aborting.");
       return;
     }
@@ -4158,6 +4430,21 @@ void outputMeasurement(InputChannel channel, LowerMoments &stats, int16_t dacCod
   fmt.beginSweep();
   fmt.formatMeasurement(data);
   fmt.endSweep();
+
+  // Demodulation outlier-rejection report. Comment-prefixed so plotters skip it.
+  // Only emits a line when a rejection actually happened in this output cycle;
+  // the cumulative session totals come along when it does.
+  if (g_demodRejSinceOutput > 0) {
+    Serial.print("# demod-clip: ");
+    Serial.print(g_demodRejSinceOutput); Serial.print('/');
+    Serial.print(g_demodPairsSinceOutput);
+    Serial.print(" since last output (cum ");
+    Serial.print((unsigned long)g_demodRejTotal); Serial.print('/');
+    Serial.print((unsigned long)g_demodPairsTotal);
+    Serial.println(")");
+  }
+  g_demodRejSinceOutput   = 0;
+  g_demodPairsSinceOutput = 0;
 }
 
 void setup() {
@@ -4318,6 +4605,73 @@ void setup() {
   Serial.println("Type 'help' for available commands.");
 }
 
+// Insertion sort for small arrays (N ≤ MAX_SAMPLES = 20). Faster than std::sort
+// for tiny N due to lower constant overhead and no recursion.
+static inline void demodSortInt32(int32_t *a, int n) {
+  for (int i = 1; i < n; i++) {
+    int32_t key = a[i];
+    int j = i - 1;
+    while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j--; }
+    a[j + 1] = key;
+  }
+}
+
+// Scratch buffer for pooled-MAD computation. BSS, not stack.
+static int32_t s_demodScratch[DEMOD_POOL_N];
+
+void demodulate(LowerMoments& stats, int32_t *phaseA, int32_t *phaseB) {
+  const int N = g_good_samples;
+  if (N <= 0) return;
+
+  int32_t diff[MAX_SAMPLES];
+  for (int i = 0; i < N; i++) diff[i] = phaseA[i] - phaseB[i];
+
+  // Push this cycle's diffs into the ring buffer.
+  for (int i = 0; i < N; i++) {
+    g_diffPool[g_diffPoolHead] = diff[i];
+    g_diffPoolHead = (g_diffPoolHead + 1) % DEMOD_POOL_N;
+    if (g_diffPoolFilled < DEMOD_POOL_N) g_diffPoolFilled++;
+  }
+
+  // Compute pooled median + MAD if we have enough history.
+  bool poolReady = (g_diffPoolFilled >= DEMOD_POOL_MIN);
+  int32_t med = 0;
+  int32_t threshold = INT32_MAX;
+  if (poolReady) {
+    const int M = g_diffPoolFilled;
+    for (int i = 0; i < M; i++) s_demodScratch[i] = g_diffPool[i];
+    demodSortInt32(s_demodScratch, M);
+    med = s_demodScratch[M / 2];
+
+    for (int i = 0; i < M; i++) {
+      int32_t d = g_diffPool[i] - med;
+      s_demodScratch[i] = d < 0 ? -d : d;
+    }
+    demodSortInt32(s_demodScratch, M);
+    int32_t mad = s_demodScratch[M / 2];
+
+    // Threshold = k · 1.4826 · MAD. (k_x10 / 10) · 1.4826 → mad·k_x10·1483/10000.
+    threshold = (int32_t)((int64_t)mad * g_demodRejKx10 * 1483 / 10000);
+    if (threshold < DEMOD_REJ_FLOOR) threshold = DEMOD_REJ_FLOOR;
+  }
+
+  for (int i = 0; i < N; i++) {
+    g_demodPairsTotal++;
+    g_demodPairsSinceOutput++;
+    int32_t signedDev = diff[i] - med;
+    int32_t absDev = signedDev < 0 ? -signedDev : signedDev;
+    if (poolReady && absDev > threshold) {
+      // Huber clip: cap influence at med ± threshold (symmetric, unbiased).
+      int32_t clipped = (signedDev > 0) ? (med + threshold) : (med - threshold);
+      stats.accumulate(((double)clipped) / 2.0);
+      g_demodRejTotal++;
+      g_demodRejSinceOutput++;
+    } else {
+      stats.accumulate(((double)diff[i]) / 2.0);
+    }
+  }
+}
+
 /**
  * Execute one complete chop cycle and accumulate the demodulated result.
  *
@@ -4333,17 +4687,21 @@ void setup() {
  * On overflow (preamp saturated), triggers binarySearchDAC() to re-center
  * the DAC and clears stats since the measurement baseline changed.
  *
- * @param stats  LowerMoments accumulator to add the demodulated sample to.
- *               Both ONE_CHANNEL and SCANNING modes pass scanner.channelStats()
- *               for the active channel.
- * @return       true if measurement succeeded, false if overflow occurred
- *               (caller should skip output and retry on next loop iteration)
+ * @param stats   LowerMoments accumulator to add the demodulated sample to.
+ *                Both ONE_CHANNEL and SCANNING modes pass scanner.channelStats()
+ *                for the active channel.
+ *
+ * @param phaseA  Buffers to accumulate good samples, used for demodulation 
+ * @param phaseB  
+ * 
+ * @return        true if measurement succeeded, false if overflow occurred
+ *                (caller should skip output and retry on next loop iteration)
  */
 // @param searchOnOverflow  If true (default), triggers binarySearchDAC() + stats.clear() on
 //                          overflow — correct for continuous measurement in loop().
 //                          If false, returns false immediately without touching the DAC —
 //                          correct for calibration routines that manage their own DAC state.
-bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow) {
+bool runOneChopCycle(LowerMoments &stats, int32_t* phaseA, int32_t* phaseB, bool searchOnOverflow) {
   // ensure that we are in a known polarity: Vx - DAC into INAMP...
   if (chopper.state()) {
     chopper.toggle();
@@ -4352,7 +4710,7 @@ bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow) {
   delayMicroseconds(CHOP_SETTLE_US);
   adc.start();
 
-  HalfCycleResult resultA = acquireHalfCycle();
+  HalfCycleResult resultA = acquireHalfCycle(phaseA);
 
   if (resultA.overflow) {
     Serial.print("DAC: Phase A overflow (DAC=");
@@ -4374,9 +4732,13 @@ bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow) {
   chopper.toggle();
   adc.stop();
   delayMicroseconds(CHOP_SETTLE_US);
+  if (stats.count() > 0) {
+	  // Demodulate A - prevB (which is in phaseB buffer...)
+	  demodulate(stats, phaseA, phaseB);
+  }
   adc.start();
 
-  HalfCycleResult resultB = acquireHalfCycle();
+  HalfCycleResult resultB = acquireHalfCycle(phaseB);
 
   if (resultB.overflow) {
     Serial.print("DAC: Phase B overflow (DAC=");
@@ -4397,9 +4759,7 @@ bool runOneChopCycle(LowerMoments &stats, bool searchOnOverflow) {
   }
 
   chopper.toggle();
-
-  double demodulated = (resultA.stats.mean() - resultB.stats.mean()) / 2.0;
-  stats.accumulate(demodulated);
+  demodulate(stats, phaseA, phaseB); // every buffer is used twice
   return true;
 }
 
@@ -4453,7 +4813,9 @@ void loop() {
     }
 
     LowerMoments &stats = scanner.channelStats((uint8_t)curCh);
-    if (!runOneChopCycle(stats)) {
+	  int32_t* bA = scanner.bufferA((uint8_t)curCh);
+	  int32_t* bB = scanner.bufferB((uint8_t)curCh);
+    if (!runOneChopCycle(stats, bA, bB)) {
       scanner.resetChannelEwma((uint8_t)curCh);  // DAC re-centered: old EWMA history is stale
       loopCounter = 0;
       return;  // Overflow handled, restart
@@ -4487,7 +4849,9 @@ void loop() {
 
   // Run one chop cycle on the current channel
   LowerMoments &stats = scanner.channelStats((uint8_t)scanCh);
-  if (!runOneChopCycle(stats)) {
+  int32_t* bA = scanner.bufferA((uint8_t)scanCh);
+  int32_t* bB = scanner.bufferB((uint8_t)scanCh);
+  if (!runOneChopCycle(stats, bA, bB)) {
     scanner.setChopCycleCount(0);  // Reset after overflow/DAC change
     scanner.setChannelDac((uint8_t)scanCh, dac.currentCode());
     scanner.resetChannelEwma((uint8_t)scanCh);  // DAC re-centered: old EWMA history is stale
@@ -4529,7 +4893,21 @@ void loop() {
       IOutputFormatter& fmt = getFormatter();
       if (scanner.currentScanIndex() == 0) fmt.beginSweep();
       fmt.formatMeasurement(data);
-      if (scanner.currentScanIndex() == scanner.config.count - 1) fmt.endSweep();
+      if (scanner.currentScanIndex() == scanner.config.count - 1) {
+        fmt.endSweep();
+        // Demod outlier-rejection report (once per sweep, comment-prefixed so plotters skip it).
+        if (g_demodRejSinceOutput > 0) {
+          Serial.print("# demod-clip: ");
+          Serial.print(g_demodRejSinceOutput); Serial.print('/');
+          Serial.print(g_demodPairsSinceOutput);
+          Serial.print(" since last output (cum ");
+          Serial.print((unsigned long)g_demodRejTotal); Serial.print('/');
+          Serial.print((unsigned long)g_demodPairsTotal);
+          Serial.println(")");
+        }
+        g_demodRejSinceOutput   = 0;
+        g_demodPairsSinceOutput = 0;
+      }
     } else {
       outputMeasurement(scanCh, stats, dac.currentCode());
     }
