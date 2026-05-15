@@ -132,6 +132,28 @@ call can only store one table entry (the code the DAC locked to). To cover the f
 ~16,380 separate measurements would be needed — in practice, a `diffvm.py` script stepping an
 external calibrated source handles this automatically.
 
+**Sparse calibration: interpolating between cardinal points.** If you do not have an automated
+sweep and instead measured ~30 representative ("cardinal") points across the range, you can
+piecewise-linearly fill in the rest:
+
+```
+cal cardinals      # list every operator-set point with idx, code, voltage, residual µV
+cal clear <code>   # remove a bad cardinal (e.g. 'cal clear 19664' if its residual is way out)
+cal interpolate    # linearly interpolate between adjacent cardinals; extrapolates outside
+                   # the cardinal range using the slope of the nearest pair
+cal save           # persist the now-fully-populated table to flash
+```
+
+`cal cardinals` is non-destructive and can be re-run any time. After `cal interpolate`, every
+slot is non-nominal so the cardinal set effectively becomes "all slots" — to refine, run
+`cal load` (reverts to the saved state) before re-interpolating.
+
+**Choosing where to put cardinal points:** the DAC INL is roughly cubic, so place a cardinal
+near each end of travel (±5 V), one near zero, and the rest spaced more densely where the INL
+gradient is largest (typically near the rails). 30 well-chosen points typically give residual
+INL well below ±10 µV across the range; the residual scales with the *missing curvature* of
+the actual INL curve at the gaps between cardinals.
+
 **Firmware constants used (nominal table initialization):**
 ```cpp
 static constexpr double DAC_LSB_V = (2.0 * DAC_VREF) / DAC_FSR_CODES;  // ~152.59 µV
@@ -139,6 +161,79 @@ static constexpr double DAC_VREF  = 5.0;  // Update if reference measurement sho
 ```
 
 **Recommended interval:** After initial build, rebuild if reference is serviced, or annually.
+
+---
+
+### CAL-02a — Keithley-validated DAC table refinement (`cal verify` / `cal smooth`)  ★★★ CRITICAL
+
+**What:** After the bulk DAC table is built (CAL-02), `cal verify` walks through a default
+list of 25 target voltages (±5, ±4, ±3, ±2.5, ±2, ±1, ±0.5, ±0.1, ±0.05, ±0.01, ±0.005,
+±0.001, 0 V) and uses a Keithley 2002 (or any traceable DMM) as a second reference to spot-check
+the calibration. Setup: a precision source (Fluke calibrator) drives the DiffVM `Vx2` input;
+the Keithley measures that same input. The firmware sets a *deterministic* 14-bit-aligned DAC
+code at each target (no binary search — so the same target always lands on the same code
+between runs), runs a full-length chop measurement, computes DiffVM's reported `Vx`, and asks
+you to type the Keithley reading. If DiffVM disagrees with Keithley by more than `--thresh`
+(default 10 µV), the cal table entry at that code is overwritten with the value that would
+make DiffVM match Keithley:
+```
+vDac_new = V_keithley − (adcMean × ADC_LSB_V / PREAMP_GAIN)
+```
+Within-threshold targets are kept as-is — most points should pass, and the cal table is only
+touched where it's genuinely wrong.
+
+**Why a separate command from `cal point`:** `cal point` uses `binarySearchDAC()` to lock onto
+a known voltage, then stores the measured DAC residual. That's fine for *building* a table but
+non-deterministic for re-verification — the code it converges to depends on noise and starting
+state. `cal verify` instead picks the DAC code by deterministic rounding, accepts the operator's
+Keithley reading as the trusted absolute value, and only updates the table when the existing
+entry is wrong by more than threshold.
+
+**Workflow per target:**
+1. Firmware prints `[i/25] Target +0.05 V, DAC code 328 (V_nom = +0.050033 V). Apply ~0.05 V; enter Keithley reading (V) or s/a/q:`.
+2. You dial the Fluke near 0.05 V, read the Keithley (e.g. `0.049902`), type that into the firmware.
+3. Firmware runs ~285 chop cycles (≈15 s, configurable via `--cycles N`) at the deterministic DAC code.
+4. It prints DiffVM, Keithley, and diff in µV. Either reports "OK: within ±10 µV — no update" or "Updated cardinal[code]: was X, now Y (Δ = Z µV)".
+5. **Smoothing between targets:** every time a target is confirmed (Updated *or* Within-threshold) the firmware linearly interpolates the slots between the previous confirmed target and the current one. This keeps the table self-consistent across the verified range and prevents the discontinuities that `interpolateGaps()` can't fix once the table is dense (`MAX_CARDINALS=256` cap is bypassed by `interpolateBetweenCodes`).
+6. Single-letter commands at the prompt: `s` skip this target, `a` abort (no save), `q` quit + smooth + suggest save.
+
+**Commands:**
+```
+cal verify                                    # interactive, default 25 targets, 10 µV thresh, ~15 s/target
+cal verify --thresh 5                         # tighter threshold for a follow-up refinement pass
+cal verify --cycles 50                        # quick pass (~3 s/target) before a careful one
+cal verify 0.05 0.1 0.5                       # override target list
+cal save                                      # persist the updated table to flash
+```
+
+**`cal smooth` — post-hoc fix without the Keithley:** if a verify session was saved before the
+inter-target smoothing was implemented (or if the session was interrupted partway), the saved
+table can have correct cardinal values at the verify codes surrounded by stale cal-build-dac
+interpolation on either side. Symptom: `cal cardinals` shows residual spikes at the verify
+codes (30–130 µV jumps relative to neighbours). Fix with no measurement:
+```
+cal smooth        # blends slots between consecutive default verify-target codes
+cal smooth 0.05 0.1   # blend just one pair (e.g. if only two cardinals are isolated)
+cal save          # persist
+```
+This reuses the existing cardinal values at each target as fixed endpoints and linearly blends
+everything between them. Safe to run with the Keithley turned off.
+
+**Implementation notes:**
+- The verify workflow lives in its own module: `CalVerify.h` / `CalVerify.cpp`, decoupled from
+  the .ino through a `CalVerifyApi` function-pointer struct (no direct dependency on
+  `DacCalibrationTable` or other internal types).
+- `DacCalibrationTable::interpolateBetweenCodes(lo, hi)` is the linear-blend primitive used by
+  both `cal verify` (mid-session) and `cal smooth` (post-hoc). Operates on the exact code range
+  specified, so it's unaffected by `MAX_CARDINALS=256`.
+- The default target list `kCalVerifyDefaultTargets[]` is exported from `CalVerify.h` so
+  `cal smooth` and `cal verify` use the exact same codes.
+- The calibration input is `Vx2` (separate from the normal Vx1 measurement port) so the
+  Keithley/Fluke setup can stay wired during normal use.
+
+**Recommended interval:** Run `cal verify` after every `cal build dac` to validate the dense
+table against an independent reference; re-run annually or after the Keithley is recertified.
+Run `cal smooth` only as a one-shot recovery for an interrupted verify session.
 
 ---
 
