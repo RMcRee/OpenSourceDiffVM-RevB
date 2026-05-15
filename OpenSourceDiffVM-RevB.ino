@@ -1324,7 +1324,7 @@ bool readSettledSample(int32_t &sample) {
  *   Phase B overflows −rail → Vdac ≪ Vx → bisect up
  *   Both in-range          → sign(sumA − sumB) decides bisection
  *
- * Side-effect cleanliness: BS calls acquireHalfCycle() but NOT demodulate(),
+ * Side-effect cleanliness: BinSrch calls acquireHalfCycle() but NOT demodulate(),
  * so the g_demod* clip-rate counters and the g_diffPool pooled-MAD ring are
  * untouched. The pool gets reset on every dac.setCode() as usual.
  *
@@ -1343,8 +1343,8 @@ bool readSettledSample(int32_t &sample) {
 bool binarySearchDAC() {
   if (g_debugDac) Serial.println("DAC: Starting binary search (chopped, full 16-bit)...");
 
-  // Defensive LPSPI4 full reset before BS does its many SPI reads.
-  // Symptom: first lpspi4_xfer in the 2nd BS (post-POST) times out with
+  // Defensive LPSPI4 full reset before BinSrch does its many SPI reads.
+  // Symptom: first lpspi4_xfer in the 2nd BinSrch (post-POST) times out with
   // SR=0x1000700 (MBF=1, stale TCF), FSR=0x1, RSR=RXEMPTY — module thinks it's
   // mid-transfer but produces no clocks. Hypothesis: the DAC bit-bang sequence
   // (which leaves MEN=1 and toggles SCK/MOSI/MISO pins through GPIO with SION)
@@ -1382,6 +1382,52 @@ bool binarySearchDAC() {
       ADC_LSB_V / (2.0 * (double)N * PREAMP_GAIN * DAC_LSB_V);
   int32_t predMidOverride = INT32_MIN;   // sentinel: no override pending
 
+  // Acquire a half-cycle with DRDY-timeout retry. acquireHalfCycle() sets
+  // overflow=true and leaves overflowSample at its default 0 when the ADC
+  // fails to deliver a sample within timeout — that's distinct from a real
+  // rail saturation (where overflowSample is the saturated value ±FS).
+  // Without this distinction, the search treats a timeout as "negative rail"
+  // (0 falls into the !(>0) branch) and bisects in the wrong direction,
+  // squeezing the bracket through the linear window so no in-range read is
+  // ever taken.
+  //
+  // Root cause of these timeouts: the AAF (C19 = 47 nF, τ ≈ 56 ms) holds
+  // the ADC input outside its range after a series of preamp-saturated iters.
+  // The AAF cap sits near the preamp supply rail (≈ 12 V) after sustained
+  // rail; when DAC steps into the linear window the preamp output recovers
+  // immediately but the AAF discharges with τ ≈ 56 ms, so it takes ~2τ
+  // (≈ 110 ms) to bring the AAF back inside the ADC's ±2.5 V window. Until
+  // then the modulator is pegged and DRDY suspends.
+  //
+  // Strategy: first attempt at normal CHOP_SETTLE_US (fine for non-rail
+  // transitions), then two recovery attempts at 150 ms and 400 ms — those
+  // cover 2.7τ and 7τ respectively, comfortably outside the rail zone.
+  // Returns false only after all three time out; caller should bail the
+  // search. On success the caller still checks out.overflow for real
+  // rail saturation.
+  auto acquireWithRetry = [&](int32_t* samples, HalfCycleResult& out) -> bool {
+    adc.stop();
+    delayMicroseconds(CHOP_SETTLE_US);
+    adc.start();
+    out = acquireHalfCycle(samples);
+    if (!(out.overflow && out.overflowSample == 0)) return true;
+
+    const uint32_t recoverSettleUs[2] = {150000, 400000};
+    for (int retry = 0; retry < 2; retry++) {
+      if (g_debugDac) {
+        Serial.print("    DRDY timeout — retry "); Serial.print(retry + 1);
+        Serial.print("/2 with "); Serial.print(recoverSettleUs[retry] / 1000);
+        Serial.println(" ms settle (AAF recovery from rail)");
+      }
+      adc.stop();
+      delayMicroseconds(recoverSettleUs[retry]);
+      adc.start();
+      out = acquireHalfCycle(samples);
+      if (!(out.overflow && out.overflowSample == 0)) return true;
+    }
+    return false;
+  };
+
   const int MAX_ITERATIONS = 17;  // 16 halvings of 65536; +1 for margin
   int iter = 0;
   for (; iter < MAX_ITERATIONS; iter++) {
@@ -1395,11 +1441,15 @@ bool binarySearchDAC() {
     dac.setCode((int16_t)mid);
 
     // Phase A: chopper LOW, ADC reads (Vx − Vdac) × G + offset
-    adc.stop();
-    delayMicroseconds(CHOP_SETTLE_US);
-    adc.start();
-    HalfCycleResult rA = acquireHalfCycle(phaseA);
+    HalfCycleResult rA;
+    if (!acquireWithRetry(phaseA, rA)) {
+      Serial.print("DAC: BinSrch bail at iter "); Serial.print(iter);
+      Serial.print(" DAC="); Serial.print(mid);
+      Serial.println(" (persistent Phase A DRDY timeout — AAF/preamp not recovering within 560 ms)");
+      break;
+    }
     if (rA.overflow) {
+      // Real rail saturation: overflowSample is the saturated value (±FS).
       if (rA.overflowSample > 0) low  = mid + 1;
       else                       high = mid - 1;
       if (g_debugDac) {
@@ -1413,11 +1463,15 @@ bool binarySearchDAC() {
 
     // Phase B: chopper HIGH, ADC reads −(Vx − Vdac) × G + offset
     chopper.toggle();
-    adc.stop();
-    delayMicroseconds(CHOP_SETTLE_US);
-    adc.start();
-    HalfCycleResult rB = acquireHalfCycle(phaseB);
+    HalfCycleResult rB;
+    bool rbOk = acquireWithRetry(phaseB, rB);
     chopper.toggle();  // restore chopper LOW for next iter / for caller
+    if (!rbOk) {
+      Serial.print("DAC: BinSrch bail at iter "); Serial.print(iter);
+      Serial.print(" DAC="); Serial.print(mid);
+      Serial.println(" (persistent Phase B DRDY timeout — AAF/preamp not recovering within 560 ms)");
+      break;
+    }
     if (rB.overflow) {
       // Phase B sign is inverted: sample > 0 ⇒ Vdac > Vx ⇒ bisect down
       if (rB.overflowSample > 0) high = mid - 1;
@@ -4178,12 +4232,12 @@ void cmdCalBuildDac() {
     Serial.println("ERROR: Binary search failed on GND. Aborting.");
     return;
   }
-  int16_t bsCode = dac.currentCode();
-  Serial.print("  Converged at code "); Serial.println(bsCode);
+  int16_t binSrchCode = dac.currentCode();
+  Serial.print("  Converged at code "); Serial.println(binSrchCode);
 
   int entriesGnd = 0;
   for (int delta = -CAL_BUILD_WINDOW; delta <= CAL_BUILD_WINDOW; delta++) {
-    int32_t code32 = (int32_t)bsCode + (int32_t)(delta * 4);
+    int32_t code32 = (int32_t)binSrchCode + (int32_t)(delta * 4);
     if (code32 < -32768) code32 = -32768;
     if (code32 >  32764) code32 =  32764;
     int16_t code = (int16_t)code32;
@@ -4220,12 +4274,12 @@ void cmdCalBuildDac() {
     Serial.println("ERROR: Binary search failed on VrefRaw. Aborting.");
     return;
   }
-  bsCode = dac.currentCode();
-  Serial.print("  Converged at code "); Serial.println(bsCode);
+  binSrchCode = dac.currentCode();
+  Serial.print("  Converged at code "); Serial.println(binSrchCode);
 
   int entriesVref = 0;
   for (int delta = -CAL_BUILD_WINDOW; delta <= CAL_BUILD_WINDOW; delta++) {
-    int32_t code32 = (int32_t)bsCode + (int32_t)(delta * 4);
+    int32_t code32 = (int32_t)binSrchCode + (int32_t)(delta * 4);
     if (code32 < -32768) code32 = -32768;
     if (code32 >  32764) code32 =  32764;
     int16_t code = (int16_t)code32;
