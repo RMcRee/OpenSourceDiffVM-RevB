@@ -15,6 +15,7 @@ before the next board revision is fabricated.
 | [ADC-1](#adc-1) | ADS127L11 anti-alias filter (C19) | 22 nF → 47 nF |
 | [ADC-2](#adc-2) | ADS127L11 VREFP series resistor | 50 Ω added in series |
 | [REF-1](#ref-1) | VrefRaw routing (J3 → MUX S3) | Unbuffered output sags under preamp loading; buffer required |
+| [IC-1](#ic-1) | U3 op-amp substitution | OPA2140AID → ADA4522-2 |
 | [MISC-1](#misc-1) | Other capacitor value changes | C16, C18, C54 |
 
 ---
@@ -136,6 +137,36 @@ is in place.
 follower configuration) between J3 and the MUX S3 input. After the buffer
 is installed, re-enable `postTestReferences()` and the runtime
 `measureFilterError()` machinery.
+
+---
+
+### IC-1 — U3 op-amp substitution  <a id="ic-1"></a>
+
+**Location:** U3 on `FrontEnd.kicad_sch` (SOIC-8 dual op-amp footprint).
+
+| | Schematic | Actual on board |
+|---|---|---|
+| U3 part number | OPA2140AID | **ADA4522-2** |
+
+**Rationale:** The ADA4522-2 is a zero-drift (chopper-stabilized) dual
+precision op-amp with substantially lower offset and 1/f noise than the
+OPA2140AID JFET op-amp originally specified:
+
+| Parameter | OPA2140AID (schematic) | ADA4522-2 (actual) |
+|---|---|---|
+| Input offset voltage (typ) | 120 µV | **0.4 µV** |
+| Offset drift (typ) | 0.35 µV/°C | **0.022 µV/°C** |
+| Input voltage noise (0.1–10 Hz, p-p) | 0.25 µV | **0.117 µV** |
+| Input bias current (typ) | 0.5 pA | 50 pA |
+| GBW | 11 MHz | 2.7 MHz |
+
+The substitution trades bandwidth and input bias current for ~300× better
+input offset and ~16× better drift. Pin-compatible SOIC-8 dual; same
+supply rails. The bias current is higher (CMOS chopper inputs vs JFET),
+so the substitution is most appropriate where source impedance is moderate
+and DC accuracy dominates over BW/Iib budget.
+
+**Firmware impact:** None directly.
 
 ---
 
