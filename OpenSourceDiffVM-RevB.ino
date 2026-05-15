@@ -5230,6 +5230,39 @@ void demodulate(LowerMoments& stats, int32_t *phaseA, int32_t *phaseB) {
 //                          overflow — correct for continuous measurement in loop().
 //                          If false, returns false immediately without touching the DAC —
 //                          correct for calibration routines that manage their own DAC state.
+// Consecutive BinSrch failure tracking for chop-loop overflow recovery.
+// Previously, when BinSrch failed repeatedly (e.g., Vx outside the DAC ±5 V
+// range or a hardware fault keeping the preamp pegged), runOneChopCycle
+// would re-invoke BinSrch on every chop cycle — flooding the log and
+// wasting time. The wrapper below caps auto-recovery at
+// BS_FAIL_STREAK_LIMIT consecutive failures and suppresses further BinSrch
+// until a chop cycle completes without overflow, which auto-resets the
+// streak. User-initiated BinSrch calls (POST tests, cal commands,
+// channel-switch first-visit) bypass this and call binarySearchDAC()
+// directly so they still get full retry behaviour.
+static int s_bsFailStreak = 0;
+static constexpr int BS_FAIL_STREAK_LIMIT = 3;
+
+static bool tryBinarySearchWithBackoff() {
+  if (s_bsFailStreak >= BS_FAIL_STREAK_LIMIT) {
+    Serial.print("DAC: BinSrch suppressed (");
+    Serial.print(s_bsFailStreak);
+    Serial.println(" consecutive failures); waiting for an in-range chop cycle to reset");
+    return false;
+  }
+  if (binarySearchDAC()) {
+    s_bsFailStreak = 0;
+    return true;
+  }
+  s_bsFailStreak++;
+  if (s_bsFailStreak == BS_FAIL_STREAK_LIMIT) {
+    Serial.print("DAC: BinSrch hit failure-streak limit (");
+    Serial.print(BS_FAIL_STREAK_LIMIT);
+    Serial.println("); further auto-retries suppressed until an in-range cycle");
+  }
+  return false;
+}
+
 bool runOneChopCycle(LowerMoments &stats, int32_t* phaseA, int32_t* phaseB, bool searchOnOverflow) {
   // ensure that we are in a known polarity: Vx - DAC into INAMP...
   if (chopper.state()) {
@@ -5254,7 +5287,7 @@ bool runOneChopCycle(LowerMoments &stats, int32_t* phaseA, int32_t* phaseB, bool
       Serial.print(' '); Serial.print(s);
     }
     Serial.println();
-    if (searchOnOverflow) { binarySearchDAC(); stats.clear(); }
+    if (searchOnOverflow) { tryBinarySearchWithBackoff(); stats.clear(); }
     return false;
   }
 
@@ -5283,12 +5316,16 @@ bool runOneChopCycle(LowerMoments &stats, int32_t* phaseA, int32_t* phaseB, bool
     }
     Serial.println();
     chopper.toggle();  // Return to original state
-    if (searchOnOverflow) { binarySearchDAC(); stats.clear(); }
+    if (searchOnOverflow) { tryBinarySearchWithBackoff(); stats.clear(); }
     return false;
   }
 
   chopper.toggle();
   demodulate(stats, phaseA, phaseB); // every buffer is used twice
+  // Successful chop cycle → DAC is centered on Vx, system is healthy.
+  // Reset the BinSrch failure streak so future overflow can re-invoke
+  // recovery if Vx drifts/changes again.
+  s_bsFailStreak = 0;
   return true;
 }
 
