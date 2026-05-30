@@ -576,6 +576,48 @@ specification).
 
 ---
 
+### CAL-12 — Ohms-Mode R_ref Values  ★★ MEDIUM (ohms mode only)
+
+**What:** When the ohms-measurement breakout (see [hardware-errata.md](hardware-errata.md#ohms-1)
+OHMS-1) is connected, the firmware computes
+`R_dut = R_ref × (Vx3 − Vx4) / (Vx2 − Vx3)`. The accuracy of `R_dut` is set by
+the precision of the stored value for whichever R_ref is currently wired into the
+manual socket — V_exc, switch R_on, and series wiring drops all cancel out of the
+ratio. The eight color-coded references and their values are listed in
+[OhmsMeasurement.md](OhmsMeasurement.md).
+
+**Impact:** Direct 1:1 ppm error in `R_dut`. Verified bringup against a 9400 Ω
+±0.005 % DUT showed −1.8 ppm error with r3 and −20 ppm with r4 (sub-ppm
+repeatability within a fixed R_ref; the ~18 ppm spread between R_refs is the
+combined transfer-cal uncertainty, not instrument error).
+
+**How to calibrate:**
+
+1. **Identify each resistor.** R_ref values live in `RREF_ALIASES[]` in
+   `OpenSourceDiffVM-RevB.ino` — they are firmware constants, not runtime state.
+   The aliases (`r1`..`r8` / color names) are labels for actual resistors that
+   get manually swapped into the breakout socket.
+
+2. **Trim against a transfer standard.** Measure each R_ref *in-circuit*
+   (post-soldering, post-thermal-cycling) with a Keithley 2002 or equivalent on
+   its matching range. Edit the corresponding `ohms` field in `RREF_ALIASES[]`,
+   recompile, and re-flash.
+
+3. **Verification.** Wire a known-good DUT into the breakout, run
+   `rref <alias>` then `meas r`. Cross-check the printed result against the
+   Keithley 2002 on the same range.
+
+**Firmware constants:** `RREF_ALIASES[8]` near the top of
+`OpenSourceDiffVM-RevB.ino` (compile-time; no flash persistence — values are
+baked into the firmware image because the resistors don't drift fast enough to
+warrant runtime cal).
+
+**Recommended interval:** Once per breakout build; re-trim annually for
+high-accuracy work or after any breakout rework. R_ref tempco is ~2 ppm/°C with
+Z-foil — usually acceptable without re-cal until thermal cycling becomes severe.
+
+---
+
 ## Calibration State Persistence
 
 | Calibration Item | Persisted? | Location | Notes |
@@ -584,6 +626,7 @@ specification).
 | Preamp gain (PREAMP_GAIN) | **Yes** | LittleFS flash | Persisted by `cal save`; adjust via `cal set gain <v>`. |
 | HV divider ratios | **Yes** | LittleFS flash | Persisted by `cal save`; adjust via `cal set div10/div100/div1000 <v>`. |
 | OPA828 buffer offset | **Yes** | LittleFS flash | Persisted by `cal save` (v2 format); adjust via `cal set opa828 <v>`. |
+| Ohms R_ref values | **No** (compile-time) | `RREF_ALIASES[]` in `OpenSourceDiffVM-RevB.ino` | Firmware constants; re-trim by editing source and re-flashing. See [CAL-12](#cal-12). |
 | Auto-zero offset | **No** | RAM only | Lost on reboot; run `zero` after every boot. |
 | Reference drift tracking (filter history) | **No** | RAM only | Reinitializes after reboot; takes ~8 s to stabilize. |
 | Scan configuration, divider ratio, auto-start | Yes | EEPROM | Persisted by `config save`; restored on boot. |

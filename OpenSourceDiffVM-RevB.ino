@@ -23,6 +23,8 @@
 #include <LittleFS.h>
 #include "AD5760.h"
 #include "CalVerify.h"
+#include "OhmsMeas.h"
+#include "RtsDetector.h"
 
 // ---------------- Forward Declarations ----------------
 // Types must be declared before Arduino auto-generates function prototypes
@@ -101,6 +103,14 @@ static constexpr uint8_t PIN_INMUX_A2   = 33;  // Input mux address bit 2
 // HV Divider tap select (MUX36D04 dual 4:1 mux, EN hardwired ON)
 static constexpr uint8_t PIN_DIVMUX_A0  = 23;  // MUX36D04 A0: divider tap address bit 0
 static constexpr uint8_t PIN_DIVMUX_A1  = 22;  // MUX36D04 A1: divider tap address bit 1
+
+// Ohms-mode breakout (OHMS-1 errata — external breakout, ribbon to Teensy).
+// R_ref selection is now manual (resistor physically wired into the socket);
+// firmware only controls excitation polarity and magnitude. The `rref` CLI
+// tells the firmware which resistor is currently installed.
+static constexpr uint8_t PIN_OHMS_POL     = 5;  // SW1 (TMUX7234) polarity: LOW = +V_exc, HIGH = -V_exc (as-built; NO/NC swapped vs schematic)
+static constexpr uint8_t PIN_OHMS_EXC_LOW = 21; // V_exc magnitude: HIGH = 1 V, LOW = 2.5 V (default)
+// Pins 6, 7, 8 are now FREE (previously R_ref MUX A0/A1/A2 — mux removed).
 
 // ---------------- Timing ----------------
 // Nominal at F_CPU=600 MHz; updated at runtime by calibrateAdcClock() from a
@@ -479,6 +489,10 @@ private:
 };
 
 static DacCalibrationTable dacCalTable;
+
+// TEMA-based RTS event detector. Fed per-chop-cycle Vx samples from loop().
+// Starts disabled; toggled via the `rts` CLI command.
+static RtsDetector g_rts;
 
 // Defined in "Voltage Divider Scale Factors" section; used by computeInputVoltage/Uncertainty below.
 double getInputDividerRatio(InputChannel channel);
@@ -2432,6 +2446,10 @@ void cmdConfigShow();
 
 // cmdCal() is defined after CalibrationStore (further below); forward declare here.
 void cmdCal(const char* arg1, const char* arg2, const char* arg3);
+void cmdMeas(int argc, const char* const* argv);
+void cmdRts(const char* arg1, const char* arg2, const char* arg3);
+void cmdRref(const char* arg1);
+void cmdOhms(const char* arg1, const char* arg2);
 
 /**
  * Parse and execute a complete command line from the serial buffer.
@@ -2539,6 +2557,22 @@ void processCommand(char* line) {
     cmdAdev(arg1);
   } else if (strcasecmp(cmd, "cal") == 0) {
     cmdCal(arg1, arg2, arg3);
+  } else if (strcasecmp(cmd, "meas") == 0) {
+    // Extra tokens beyond arg3 may be needed for `meas r <idx> --cycles N`.
+    // Collect up to 6 args (subcommand + 5 trailing) so OhmsMeas can parse
+    // its own flags. NULLs past the real end are tolerated by cmdMeas.
+    const char* extra[3] = { nullptr, nullptr, nullptr };
+    for (int i = 0; i < 3; ++i) extra[i] = strtok(NULL, " \t");
+    const char* mArgs[6] = { arg1, arg2, arg3, extra[0], extra[1], extra[2] };
+    int mArgc = 0;
+    for (int i = 0; i < 6; ++i) { if (mArgs[i]) ++mArgc; else break; }
+    cmdMeas(mArgc, mArgs);
+  } else if (strcasecmp(cmd, "rts") == 0) {
+    cmdRts(arg1, arg2, arg3);
+  } else if (strcasecmp(cmd, "rref") == 0) {
+    cmdRref(arg1);
+  } else if (strcasecmp(cmd, "ohms") == 0) {
+    cmdOhms(arg1, arg2);
   } else if (strcasecmp(cmd, "label") == 0) {
     cmdLabel(arg1, arg2);
   } else if (strcasecmp(cmd, "hold") == 0) {
@@ -3785,6 +3819,29 @@ uint16_t crc16(const uint8_t* data, size_t len) {
 
 static constexpr uint32_t CAL_CONSTS_MAGIC = 0xCA1C0001UL;  // "CALC" v1
 static constexpr uint32_t CAL_TABLE_MAGIC  = 0xDACC0002UL;  // "DACC" v2 — adds maxCodeV_ slot for code 32767
+
+// Ohms reference resistors — color-coded, physically wired one-at-a-time.
+// `rref` CLI selects which is currently installed; meas r uses g_currentRrefIdx
+// to look up the calibrated value. Values are firmware constants (each
+// resistor was previously DMM-measured against a Keithley reference).
+struct RrefAlias {
+  const char* shortName;   // "r1" .. "r8"
+  const char* colorName;   // band color
+  double      ohms;
+};
+static constexpr int      RREF_COUNT = 8;
+static constexpr RrefAlias RREF_ALIASES[RREF_COUNT] = {
+  { "r1", "green",   20.0069161   },
+  { "r2", "black",   200.014860   },
+  { "r3", "yellow",  2001.98758   },
+  { "r4", "white",   19999.8705   },
+  { "r5", "blue",    200035.097   },
+  { "r6", "red",     1898381.80   },
+  { "r7", "clear",   11018620.0   },
+  { "r8", "yellow2", 4999.9945    },
+};
+static int8_t g_currentRrefIdx = -1;   // -1 = unset; otherwise index into RREF_ALIASES
+
 static constexpr uint32_t CAL_LFS_SIZE     = 512UL * 1024UL; // 512 KB partition
 
 class CalibrationStore {
@@ -4075,6 +4132,7 @@ public:
     if (fs_.exists("/cal_consts.bin"))      ok &= fs_.remove("/cal_consts.bin");
     if (fs_.exists("/dac_table.bin"))       ok &= fs_.remove("/dac_table.bin");
     if (fs_.exists("/channel_labels.bin"))  ok &= fs_.remove("/channel_labels.bin");
+    if (fs_.exists("/cal_ohms.bin"))        ok &= fs_.remove("/cal_ohms.bin");  // legacy: remove if present
     return ok;
   }
 
@@ -4431,6 +4489,285 @@ static int16_t calSnapToCardinalCode(double v_target) {
   if (snapped < -32768) snapped = -32768;
   if (snapped >  32764) snapped =  32764;
   return (int16_t)snapped;
+}
+
+// =================== OhmsMeas adapters and command ====================
+// See OhmsMeas.h for the API contract and docs/ohms-breakout.svg for the
+// hardware. The .ino owns all GPIO + chop infrastructure; this layer
+// exposes thin shims that OhmsMeas calls via function pointers.
+
+static bool ohmsAdapter_binarySearchDac() {
+  return tryBinarySearchWithBackoff();
+}
+
+static double ohmsAdapter_runChop(int nCycles, bool* overflow) {
+  double mean = measureDemodMean(nCycles);
+  if (isnan(mean)) { if (overflow) *overflow = true; return 0.0; }
+  if (overflow) *overflow = false;
+  return mean;
+}
+
+static double ohmsAdapter_currentDacVoltage() {
+  return dacCalTable.codeToVoltage(dac.currentCode());
+}
+
+static void ohmsAdapter_selectSense(uint8_t senseIdx) {
+  switch (senseIdx) {
+    case 0: inputMux.select(InputChannel::Vx3); break;
+    case 1: inputMux.select(InputChannel::Vx4); break;
+    case 2: inputMux.select(InputChannel::Vx2); break;
+    default: break;
+  }
+}
+
+static void ohmsAdapter_setPolarity(bool pos) {
+  // As-built: PIN_OHMS_POL LOW selects +V_exc (NO/NC swapped on SW1 vs schematic).
+  digitalWriteFast(PIN_OHMS_POL, pos ? LOW : HIGH);
+}
+
+static void ohmsAdapter_setExcVoltage(bool low) {
+  digitalWriteFast(PIN_OHMS_EXC_LOW, low ? HIGH : LOW);
+}
+
+// R_ref is manually wired and selected from the host via `rref`.
+static double ohmsAdapter_getCalRref() {
+  if (g_currentRrefIdx < 0 || g_currentRrefIdx >= RREF_COUNT) return NAN;
+  return RREF_ALIASES[g_currentRrefIdx].ohms;
+}
+
+// Lookup helper: match `name` against either a shortName (r1..r8) or a
+// colorName (case-insensitive). Returns alias index, or -1 if no match.
+static int8_t rrefLookup(const char* name) {
+  if (!name) return -1;
+  for (int8_t i = 0; i < (int8_t)RREF_COUNT; ++i) {
+    if (strcasecmp(name, RREF_ALIASES[i].shortName) == 0) return i;
+    if (strcasecmp(name, RREF_ALIASES[i].colorName) == 0) return i;
+  }
+  return -1;
+}
+
+// `rref` CLI — choose which physically-wired reference resistor is installed.
+//   rref                  -- show current selection
+//   rref list             -- show all aliases
+//   rref off              -- deselect
+//   rref <r1..r8|color>   -- select by alias
+void cmdRref(const char* arg1) {
+  if (!arg1) {
+    if (g_currentRrefIdx < 0) {
+      Serial.println("rref: no R_ref selected.  Use `rref list` to see options.");
+    } else {
+      const RrefAlias& a = RREF_ALIASES[g_currentRrefIdx];
+      Serial.print("rref: "); Serial.print(a.shortName);
+      Serial.print(" ("); Serial.print(a.colorName); Serial.print(")  = ");
+      Serial.print(a.ohms, 6); Serial.println(" Ω");
+    }
+    return;
+  }
+
+  if (strcasecmp(arg1, "list") == 0) {
+    Serial.println("R_ref aliases (color-coded, manually wired one-at-a-time):");
+    for (int i = 0; i < RREF_COUNT; ++i) {
+      const RrefAlias& a = RREF_ALIASES[i];
+      Serial.print("  ");
+      Serial.print(g_currentRrefIdx == i ? "* " : "  ");
+      Serial.print(a.shortName);
+      Serial.print("  ");
+      // Pad color name to 8 chars for alignment
+      Serial.print(a.colorName);
+      for (size_t k = strlen(a.colorName); k < 8; ++k) Serial.print(' ');
+      Serial.print(" = ");
+      Serial.print(a.ohms, 6); Serial.println(" Ω");
+    }
+    return;
+  }
+
+  if (strcasecmp(arg1, "off") == 0) {
+    g_currentRrefIdx = -1;
+    Serial.println("rref: deselected (no R_ref active).");
+    return;
+  }
+
+  int8_t idx = rrefLookup(arg1);
+  if (idx < 0) {
+    Serial.print("rref: unknown alias '"); Serial.print(arg1);
+    Serial.println("'.  Use `rref list`.");
+    return;
+  }
+  g_currentRrefIdx = idx;
+  const RrefAlias& a = RREF_ALIASES[idx];
+  Serial.print("rref: selected "); Serial.print(a.shortName);
+  Serial.print(" ("); Serial.print(a.colorName); Serial.print(")  = ");
+  Serial.print(a.ohms, 6); Serial.println(" Ω");
+}
+
+// `ohms` CLI — direct manual control of the OHMS-1 breakout GPIOs for
+// hardware bringup. Bypasses the OhmsMeas measurement loop entirely.
+//
+//   ohms             -- show current pol / exc / rref state
+//   ohms pol +       -- drive PIN_OHMS_POL HIGH (+V_exc on SW1)
+//   ohms pol -       -- drive PIN_OHMS_POL LOW  (-V_exc on SW1)
+//   ohms exc 1       -- drive PIN_OHMS_EXC_LOW HIGH (1.0 V rail)
+//   ohms exc 2.5     -- drive PIN_OHMS_EXC_LOW LOW  (2.5 V rail)
+void cmdOhms(const char* arg1, const char* arg2) {
+  if (!arg1) {
+    const bool polHigh = digitalReadFast(PIN_OHMS_POL);
+    const bool excLow  = digitalReadFast(PIN_OHMS_EXC_LOW);
+    // As-built: LOW = +V_exc, HIGH = -V_exc on SW1.
+    Serial.print("ohms: pol="); Serial.print(polHigh ? '-' : '+');
+    Serial.print("  V_exc="); Serial.print(excLow ? F("1.0 V") : F("2.5 V"));
+    Serial.print("  rref=");
+    if (g_currentRrefIdx < 0) {
+      Serial.println("(not set)");
+    } else {
+      const RrefAlias& a = RREF_ALIASES[g_currentRrefIdx];
+      Serial.print(a.shortName); Serial.print(" ("); Serial.print(a.colorName);
+      Serial.print(") = "); Serial.print(a.ohms, 6); Serial.println(" Ω");
+    }
+    return;
+  }
+
+  if (strcasecmp(arg1, "pol") == 0) {
+    if (!arg2) { Serial.println("Usage: ohms pol +|-"); return; }
+    // As-built: LOW = +V_exc, HIGH = -V_exc (NO/NC swapped on SW1 vs schematic).
+    if (arg2[0] == '+') {
+      digitalWriteFast(PIN_OHMS_POL, LOW);
+      Serial.println("ohms pol: + (PIN_OHMS_POL = LOW)");
+    } else if (arg2[0] == '-') {
+      digitalWriteFast(PIN_OHMS_POL, HIGH);
+      Serial.println("ohms pol: - (PIN_OHMS_POL = HIGH)");
+    } else {
+      Serial.println("ohms pol: expected + or -");
+    }
+    return;
+  }
+
+  if (strcasecmp(arg1, "exc") == 0) {
+    if (!arg2) { Serial.println("Usage: ohms exc 1|2.5"); return; }
+    const double v = atof(arg2);
+    if (v < 1.5) {
+      digitalWriteFast(PIN_OHMS_EXC_LOW, HIGH);
+      Serial.println("ohms exc: 1.0 V (PIN_OHMS_EXC_LOW = HIGH)");
+    } else {
+      digitalWriteFast(PIN_OHMS_EXC_LOW, LOW);
+      Serial.println("ohms exc: 2.5 V (PIN_OHMS_EXC_LOW = LOW)");
+    }
+    return;
+  }
+
+  Serial.print("ohms: unknown subcommand '"); Serial.print(arg1); Serial.println("'");
+  Serial.println("Usage: ohms | ohms pol +|- | ohms exc 1|2.5");
+}
+
+// `meas r [--cycles N] [--no-emf-cancel]` — dispatches to OhmsMeas.
+// R_ref is selected ahead of time via the `rref` CLI (manual swap socket).
+// argv[0] is the subcommand ("r"); argv[1..] are the trailing args.
+void cmdMeas(int argc, const char* const* argv) {
+  if (argc < 1 || !argv[0]) {
+    Serial.println("Usage: meas r [--cycles N] [--no-emf-cancel]  (set R_ref via `rref` first)");
+    return;
+  }
+  if (strcasecmp(argv[0], "r") != 0) {
+    Serial.print("Unknown meas subcommand: "); Serial.println(argv[0]);
+    Serial.println("Usage: meas r [--cycles N] [--no-emf-cancel]  (set R_ref via `rref` first)");
+    return;
+  }
+
+  ScopedInstrumentState guard;     // restores channel + DAC on scope exit
+  OhmsMeasApi api = {
+    ohmsAdapter_binarySearchDac,
+    ohmsAdapter_runChop,
+    ohmsAdapter_currentDacVoltage,
+    ohmsAdapter_selectSense,
+    ohmsAdapter_setPolarity,
+    ohmsAdapter_setExcVoltage,
+    ohmsAdapter_getCalRref,
+    ADC_LSB_V, PREAMP_GAIN, DAC_LSB_V,
+    &Serial,
+  };
+  // Pass argv[1..] through to cmdMeasR (it expects bank_idx + flags).
+  cmdMeasR(api, argc - 1, argv + 1);
+}
+
+/**
+ * Handle `rts` command and subcommands. See RtsDetector.h for algorithm details.
+ *
+ *   rts on|off|status|events|reset
+ *   rts set alpha <v>          (0 < v < 1)
+ *   rts set k <v>              (0.5 <= v <= 20)
+ *   rts set n <v>              (1 <= v <= 64, persistence count)
+ *   rts set sigma_alpha <v>    (0 < v < 1)
+ *   rts set dead <v>           (0 <= v <= 65535)
+ *
+ * `set` flushes detector state (so a new α has clean cascade history) but
+ * preserves the enabled flag.
+ */
+void cmdRts(const char* arg1, const char* arg2, const char* arg3) {
+  if (!arg1) {
+    Serial.println("Usage: rts on|off|status|events|reset|set <param> <value>");
+    Serial.println("       set params: alpha k n sigma_alpha dead");
+    return;
+  }
+
+  if (strcasecmp(arg1, "on") == 0) {
+    g_rts.setEnabled(true);
+    Serial.println("RTS detector: ENABLED");
+    return;
+  }
+  if (strcasecmp(arg1, "off") == 0) {
+    g_rts.setEnabled(false);
+    Serial.println("RTS detector: DISABLED");
+    return;
+  }
+  if (strcasecmp(arg1, "status") == 0) {
+    g_rts.printStatus(Serial);
+    return;
+  }
+  if (strcasecmp(arg1, "events") == 0) {
+    g_rts.printEvents(Serial);
+    return;
+  }
+  if (strcasecmp(arg1, "reset") == 0) {
+    g_rts.reset();
+    Serial.println("RTS detector state reset (config preserved).");
+    return;
+  }
+  if (strcasecmp(arg1, "set") == 0) {
+    if (!arg2 || !arg3) {
+      Serial.println("Usage: rts set <alpha|k|n|sigma_alpha|dead> <value>");
+      return;
+    }
+    RtsDetector::Config& c = g_rts.mutableConfig();
+    if (strcasecmp(arg2, "alpha") == 0) {
+      double v = atof(arg3);
+      if (v <= 0.0 || v >= 1.0) { Serial.println("alpha must be in (0, 1)"); return; }
+      c.alpha = v;
+    } else if (strcasecmp(arg2, "k") == 0) {
+      double v = atof(arg3);
+      if (v < 0.5 || v > 20.0) { Serial.println("k must be in [0.5, 20]"); return; }
+      c.k_sigma = v;
+    } else if (strcasecmp(arg2, "n") == 0) {
+      long v = atol(arg3);
+      if (v < 1 || v > 64) { Serial.println("n must be in [1, 64]"); return; }
+      c.persistence_n = (uint8_t)v;
+    } else if (strcasecmp(arg2, "sigma_alpha") == 0) {
+      double v = atof(arg3);
+      if (v <= 0.0 || v >= 1.0) { Serial.println("sigma_alpha must be in (0, 1)"); return; }
+      c.sigma_alpha = v;
+    } else if (strcasecmp(arg2, "dead") == 0) {
+      long v = atol(arg3);
+      if (v < 0 || v > 65535) { Serial.println("dead must be in [0, 65535]"); return; }
+      c.dead_samples = (uint16_t)v;
+    } else {
+      Serial.print("Unknown param: '"); Serial.print(arg2); Serial.println("'");
+      return;
+    }
+    g_rts.reset();
+    Serial.print("rts ");  Serial.print(arg2);
+    Serial.print(" = ");   Serial.println(arg3);
+    return;
+  }
+
+  Serial.print("Unknown rts subcommand: '"); Serial.print(arg1); Serial.println("'");
 }
 
 /**
@@ -4996,6 +5333,14 @@ void setup() {
   inputMux.begin();
   divMux.begin();
 
+  // Ohms-mode breakout GPIOs (OHMS-1 errata).
+  // R_ref is now manually wired (no mux); firmware only controls polarity
+  // and excitation magnitude.
+  pinMode(PIN_OHMS_POL,     OUTPUT);
+  pinMode(PIN_OHMS_EXC_LOW, OUTPUT);
+  digitalWrite(PIN_OHMS_POL,     LOW);  // boot to +V_exc (as-built: LOW = +V_exc)
+  digitalWrite(PIN_OHMS_EXC_LOW, LOW);  // boot to 2.5 V (safe default before any `rref` selection)
+
   // Initialize DAC calibration table with nominal values
   dacCalTable.initNominal();
 
@@ -5112,6 +5457,12 @@ void setup() {
   Serial.println(dacCalTable.isValid() ? "CALIBRATED" : "nominal (uncalibrated)");
   Serial.println("====================================\n");
   calStore.printStatus();
+
+  // RTS detector — starts disabled with default config; enable via `rts on`.
+  {
+    RtsDetector::Config rtsCfg;
+    g_rts.begin(rtsCfg);
+  }
 
   // Load saved configuration from EEPROM (if valid)
   SavedConfig savedCfg;
@@ -5374,6 +5725,7 @@ void loop() {
     static int loopCounter = 0;
     if (curCh != lastOneChannel) {
       scanner.channelStats((uint8_t)curCh).clear();
+      g_rts.reset();                               // RTS detector history is per-channel
       loopCounter = 0;
       lastOneChannel = curCh;
     }
@@ -5381,10 +5733,35 @@ void loop() {
     LowerMoments &stats = scanner.channelStats((uint8_t)curCh);
 	  int32_t* bA = scanner.bufferA((uint8_t)curCh);
 	  int32_t* bB = scanner.bufferB((uint8_t)curCh);
+
+    // Snapshot for per-cycle pair-diff extraction (RTS detector input).
+    const double rtsN0 = stats.count();
+    const double rtsM0 = (rtsN0 > 0.0) ? stats.mean() : 0.0;
+
     if (!runOneChopCycle(stats, bA, bB)) {
       scanner.resetChannelEwma((uint8_t)curCh);  // DAC re-centered: old EWMA history is stale
+      g_rts.reset();                              // chop state cleared → detector state is stale
       loopCounter = 0;
       return;  // Overflow handled, restart
+    }
+
+    // Extract this cycle's pair-diff mean from the LowerMoments delta and feed
+    // it to the RTS detector. Cheap: zero work when disabled.
+    if (g_rts.enabled()) {
+      const double rtsN1 = stats.count();
+      const double dn    = rtsN1 - rtsN0;
+      if (dn > 0.0) {
+        const double dsum = rtsN1 * stats.mean() - rtsN0 * rtsM0;
+        const double perCycleAdc = dsum / dn;
+        const double vxCycle = computeInputVoltage(perCycleAdc, dac.currentCode(), curCh);
+        RtsDetector::Event ev;
+        if (g_rts.process(vxCycle, &ev)) {
+          Serial.print(F("** RTS #")); Serial.print(g_rts.eventCount());
+          Serial.print(F(" @cycle ")); Serial.print(ev.sampleIdx);
+          Serial.print(F(": dV = "));  Serial.print(ev.magnitude * 1e9, 3);
+          Serial.println(F(" nV"));
+        }
+      }
     }
 
     // Output every integrationCycles, then clear for fixed-window integration

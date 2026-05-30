@@ -17,6 +17,8 @@ before the next board revision is fabricated.
 | [REF-1](#ref-1) | VrefRaw routing (J3 → MUX S3) | Unbuffered output sags under preamp loading; buffer required |
 | [IC-1](#ic-1) | U3 op-amp substitution | OPA2140AID → ADA4522-2 |
 | [MISC-1](#misc-1) | Other capacitor value changes | C16, C18, C54 |
+| [OHMS-1](#ohms-1) | Ohms-measurement breakout (external for now, onboard for next rev) | New external breakout with ±2.5 V excitation, 2× MUX36S08 R_ref bank, TMUX7234 polarity switch, 4-wire Kelvin DUT header |
+| [OHMS-2](#ohms-2) | TMUX7234 polarity switch NO/NC swap | As-built SW1 has NO/NC reversed vs schematic; firmware inverts PIN_OHMS_POL sense |
 
 ---
 
@@ -184,6 +186,121 @@ against the schematic before merging.
 
 C16 and C18 were changed together (same value, paired change). C54 was
 changed independently.
+
+---
+
+### OHMS-1 — Ohms-measurement breakout (external; integrate on next rev)  <a id="ohms-1"></a>
+
+**Location:** New off-board breakout PCB; connects to DiffVM via a
+10-conductor ribbon. See `docs/ohms-breakout.svg` for the full
+schematic.
+
+**Function:** Adds resistance measurement to the instrument using the
+existing chop loop, preamp, DAC, and the unused Vx3 / Vx4 / Vx5 input-
+MUX channels. Topology is 3-Kelvin-sense ratiometric with ±2.5 V
+polarity-reversed excitation:
+
+```
+R_dut = R_ref × (Vx3 − Vx4) / (Vx5 − Vx3)
+```
+
+V_exc and the R_on of the polarity switch and Force MUX cancel out of
+the ratio — the only cal'd quantities are the R_ref bank values.
+
+**Breakout content (this revision, external):**
+
+| Component | Role |
+|---|---|
+| ADA4522-2 dual op-amp | Half A = +2.5 V follower; Half B = G=−1 inverter for −2.5 V |
+| Vishay VHP100 10 kΩ matched pair | Inverter gain-set, ≤2 ppm tracking |
+| TMUX7234 SPDT | Polarity switch (same part as the input-chop TMUXes — already qualified) |
+| 2× MUX36S08 | Force MUX + Sense MUX, both driven by the same 3 address-bit lines |
+| 7× precision R_ref (20 Ω, 200 Ω, 2 kΩ, 20 kΩ, 200 kΩ, 2 MΩ, 20 MΩ) | Vishay Z-foil / Caddock USR; matches Keithley 2002 ranges for cross-validation |
+| 4-terminal Kelvin binding posts | DUT under test |
+
+**Firmware impact:** Adds new module `OhmsMeas.{h,cpp}`. New Teensy
+GPIOs:
+
+| Function | Teensy pin |
+|---|---|
+| Excitation polarity (SW1.IN) | 5 |
+| R_ref MUX A0 (U2 & U3) | 6 |
+| R_ref MUX A1 (U2 & U3) | 7 |
+| R_ref MUX A2 (U2 & U3) | 8 |
+
+New CLI: `meas r <bank_idx>`, `cal r rref`, `cal r show`.
+CalibrationStore gains an `OhmsCalBlock` (version-bumped).
+
+**Required for next PCB revision:**
+
+1. Move the ±2.5 V generator onboard, using the spare half of the
+   board's U3 (ADA4522-2 per [IC-1](#ic-1) substitution) as the
+   G=−1 inverter. Add a matched-R pair (Vishay VHP100 footprint).
+2. Onboard 2× MUX36S08 R_ref bank (or pull the bank to onboard with
+   a smaller MUX36D04 if only 4 ranges are wanted).
+3. Onboard TMUX7234 SPDT for polarity selection.
+4. Dedicated 4-terminal Kelvin DUT header with separate force/sense
+   pads — keep sense traces away from the force-path copper.
+5. Provide Vx5 routing from the MUX36D08 S8 channel to the Sense MUX
+   output.
+6. Reserve Teensy pins 5/6/7/8 (or equivalent free GPIO) for the
+   ohms control bus.
+
+Until the next rev: the external breakout is documented here as the
+authoritative build reference. Schematic source: `docs/ohms-breakout.svg`.
+
+**Verification status (2026-05-30):**
+
+First-light bringup completed. All five phases (excitation rails, polarity
+switch, V_exc rail select, end-to-end against a known DUT, quantitative
+accuracy) passed.
+
+| Phase | Result |
+|-------|--------|
+| 1 Rails | 1.0 V and 2.5 V rails within spec; unloaded |
+| 2 Polarity | TMUX flips cleanly; NO/NC swap discovered (see [OHMS-2](#ohms-2)) |
+| 3 V_exc select | 1.0 V ↔ 2.5 V rail switch works |
+| 4 / 5 Measurement | 9400 Ω ±0.005 % DUT measured against r4 = −20 ppm; against r3 = −1.8 ppm. 18 ppm R_ref-to-R_ref spread attributed to independent transfer-cal uncertainty against the Keithley reference. Sub-ppm repeatability within a fixed R_ref. EMF cancellation absorbs ~60 µV of thermal asymmetry on DUT Kelvin posts. Ratiometric rejection holds the ratio to 0.1 ppm against ~1.3 ppm V_exc drift between runs. |
+
+Caveats discovered during bringup:
+- Cable seating: an off-by-one-row Teensy↔breakout ribbon misalignment shorted
+  every signal to GND. POST + adev after re-seating showed no chip damage.
+- TMUX polarity: see [OHMS-2](#ohms-2).
+
+---
+
+### OHMS-2 — TMUX7234 polarity switch NO/NC reversed  <a id="ohms-2"></a>
+
+**Location:** SW1 (TMUX7234) on the OHMS-1 breakout, controlled by
+`PIN_OHMS_POL` (Teensy pin 5). See `docs/ohms-breakout.svg` and
+[OHMS-1](#ohms-1).
+
+**Symptom (discovered during phase-1 bringup, 2026-05-30):**
+With `PIN_OHMS_POL = HIGH` the SW1 common pin sources −V_exc rather than
+the schematic-intended +V_exc; with `PIN_OHMS_POL = LOW` it sources
++V_exc. The NO and NC pins of the as-built SW1 are reversed relative to
+the schematic.
+
+**Status:** Accommodated in firmware rather than reworked on the
+breakout. Convention:
+
+| `PIN_OHMS_POL` | SW1 common output |
+|----------------|-------------------|
+| **LOW**        | **+V_exc**        |
+| HIGH           | −V_exc            |
+
+Inverted in:
+- `PIN_OHMS_POL` pin comment in `OpenSourceDiffVM-RevB.ino`
+- `ohmsAdapter_setPolarity()` (writes `LOW` for `pos=true`)
+- Setup default (`digitalWrite(PIN_OHMS_POL, LOW)` boots to +V_exc)
+- `ohms pol +|−` CLI in `cmdOhms()`
+
+EMF cancellation in `OhmsMeas::cmdMeasR` is sign-agnostic, so the
+measurement math is unaffected — only the human-facing labels needed
+correcting.
+
+**Fix for next rev:** correct the NO/NC tie on the breakout silkscreen
+and re-pin, then revert the firmware inversions.
 
 ---
 

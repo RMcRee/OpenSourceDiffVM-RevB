@@ -88,6 +88,9 @@ The schematic includes ~44 test points for debugging and self-test:
 | Input Mux EN | Hardwired to VDD |
 | Divider Mux A0 | 23 |
 | Divider Mux A1 | 22 |
+| Ohms Excitation Polarity (SW1.IN) | 5 |
+| Ohms Excitation Voltage Select (HIGH = 1 V, LOW = 2.5 V) | 21 |
+| (pins 6, 7, 8 free — were R_ref MUX A0/A1/A2 before R_ref went manual) | — |
 
 ## Input Multiplexer (MUX36D08)
 
@@ -98,10 +101,10 @@ An 8:1 input multiplexer allows selecting between the unknown input, calibration
 | S1 | 0 | Vx1 | Unknown input 1 (normal measurement, ±5V) |
 | S2 | 1 | GND | Zero calibration |
 | S3 | 2 | VrefRaw | Pre-filter ADR1001 average (J3) for drift compensation |
-| S4 | 3 | Vx2 | Unknown input 2 |
-| S5 | 4 | Vx3 | Unknown input 3 |
+| S4 | 3 | Vx2 | Unknown input 2 / **ohms mode: R_ref top sense (via Sense MUX)** |
+| S5 | 4 | Vx3 | Unknown input 3 / **ohms mode: DUT high Kelvin sense (S+)** |
 | S6 | 5 | HVDiv | HV divider output (ratio selected by MUX36D04) |
-| S7 | 6 | Vx4 | Unknown input 4 |
+| S7 | 6 | Vx4 | Unknown input 4 / **ohms mode: DUT low Kelvin sense (S−)** |
 | S8 | 7 | Vx5 | Unknown input 5 |
 
 ### Key Functions
@@ -462,6 +465,56 @@ POST: Zero Cal... PASS (zero=12.3 nV, threshold=±1000 nV)
 POST: ALL TESTS PASSED
 ================================================
 ```
+
+## Ohms Mode — Manual R_ref
+
+Resistance is measured 4-wire-Kelvin against a physically-wired reference
+resistor (no mux). Eight color-coded references are available; swap the one
+you want into the socket and tell the firmware via `rref`.
+
+See [`OhmsMeasurement.md`](OhmsMeasurement.md) for the topology, the
+ratiometric formula, the DUT-range-vs-R_ref selection guide, and the
+practical caveats at the extreme ends of the range.
+
+| Alias | Color   | Ohms        |
+|-------|---------|-------------|
+| r1    | green   | 20.0069161  |
+| r2    | black   | 200.014860  |
+| r3    | yellow  | 2001.98758  |
+| r4    | white   | 19999.8705  |
+| r5    | blue    | 200035.097  |
+| r6    | red     | 1898381.80  |
+| r7    | clear   | 11018620.0  |
+| r8    | yellow2 | 4999.9945   |
+
+```
+rref               -- show current selection
+rref list          -- show all aliases
+rref r4            -- select by short alias
+rref white         -- select by color name (same resistor as r4)
+rref off           -- deselect (clears current R_ref)
+meas r             -- measure (uses current R_ref)
+meas r --cycles 200 --no-emf-cancel
+```
+
+Excitation voltage auto-selects: R_ref < 500 Ω uses the 1 V rail
+(banks r1, r2), all others use 2.5 V. Selection is not persisted across
+reboots — re-issue `rref <alias>` after each power-on.
+
+## RTS Detector
+
+A TEMA-based detector watches the per-chop-cycle Vx stream for random-telegraph-signal
+events (sudden multi-nV level shifts). Implementation: `RtsDetector.h` / `RtsDetector.cpp`.
+Defaults are α=0.02, k=4.5·σ, persistence_n=4, dead_samples=250 — tuned to catch
+sub-10-s RTS without firing on TEMA overshoot. Disabled at boot; toggle via CLI:
+
+```
+rts on | rts off | rts status | rts events | rts reset
+rts set <alpha|k|n|sigma_alpha|dead> <value>
+```
+
+Detector resets automatically on channel change and on chop overflow. Fed from
+the ONE_CHANNEL branch of `loop()` — SCANNING mode does not currently feed it.
 
 ## Constraints
 
