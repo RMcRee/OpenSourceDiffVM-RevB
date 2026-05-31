@@ -1541,11 +1541,13 @@ bool binarySearchDAC() {
 
   if (foundInRange) {
     dac.setCode((int16_t)bestMid);
-    Serial.print("DAC: Converged at code ");
-    Serial.print(bestMid);
-    Serial.print(" (chop |demod|=");
-    Serial.print((unsigned long)bestAbsDemod);
-    Serial.println(")");
+    if (g_debugDac) {
+      Serial.print("DAC: Converged at code ");
+      Serial.print(bestMid);
+      Serial.print(" (chop |demod|=");
+      Serial.print((unsigned long)bestAbsDemod);
+      Serial.println(")");
+    }
     return true;
   }
 
@@ -3738,10 +3740,25 @@ void performAutoZero() {
 
   // Switch to GND
   inputMux.select(InputChannel::GND);
-  dac.setCode(0);
 
-  // Run binary search for GND (should converge quickly near 0)
-  binarySearchDAC();
+  // Cache the GND-null DAC code across AZ events: the binary search perturbs
+  // the DAC analog filter and leaves it settling when we restore the prior
+  // channel, which leaks per-AZ-block transients into subsequent readings.
+  // First AZ after boot (or after an overflow invalidates the cache) does
+  // the full search; thereafter we just slam the cached code in one step.
+  static int16_t s_azNullCached = 0;
+  static bool    s_azNullValid  = false;
+  if (s_azNullValid) {
+    dac.setCode(s_azNullCached);
+  } else {
+    dac.setCode(0);
+    if (!binarySearchDAC()) {
+      Serial.println("WARNING: AZ binary search failed; cache not updated.");
+      return;
+    }
+    s_azNullCached = dac.currentCode();
+    s_azNullValid  = true;
+  }
 
   // Take two independent AUTOZERO_CYCLES accumulations; their spread is the repeatability sdev.
   LowerMoments repeatStats;
@@ -3751,8 +3768,9 @@ void performAutoZero() {
 	int32_t buffB[MAX_SAMPLES];
     for (int i = 0; i < AUTOZERO_CYCLES; i++) {
       if (!runOneChopCycle(gndStats, buffA, buffB, false)) {
-        Serial.println("WARNING: Overflow during auto-zero!");
-        return;  // guard restores state
+        Serial.println("WARNING: Overflow during auto-zero (invalidating null cache).");
+        s_azNullValid = false;  // next AZ will re-search
+        return;
       }
     }
     repeatStats.accumulate(computeInputVoltage(gndStats.mean(), dac.currentCode(), InputChannel::GND));
@@ -5338,8 +5356,8 @@ void setup() {
   // and excitation magnitude.
   pinMode(PIN_OHMS_POL,     OUTPUT);
   pinMode(PIN_OHMS_EXC_LOW, OUTPUT);
-  digitalWrite(PIN_OHMS_POL,     LOW);  // boot to +V_exc (as-built: LOW = +V_exc)
-  digitalWrite(PIN_OHMS_EXC_LOW, LOW);  // boot to 2.5 V (safe default before any `rref` selection)
+  digitalWrite(PIN_OHMS_POL,     LOW);   // boot to +V_exc (as-built: LOW = +V_exc)
+  digitalWrite(PIN_OHMS_EXC_LOW, HIGH);  // boot to 1.0 V — minimize idle dissipation through any wired R_ref. `meas r` escalates to 2.5 V when needed.
 
   // Initialize DAC calibration table with nominal values
   dacCalTable.initNominal();

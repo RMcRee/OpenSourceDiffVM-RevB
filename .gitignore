@@ -35,3 +35,15 @@ java/.mvn/wrapper/maven-wrapper.jar
 .project
 .classpath
 .settings/
+
+# Local-only backups and old/scratch code
+*.bak
+*.ino.txt
+OldCode/
+
+# Bench captures (scope, settling-time, ad-hoc test data)
+scope-export*.csv
+*-post-test.txt
+cardinal.txt
+AllanDeviation*.txt
+*-measurements.txt

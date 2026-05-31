@@ -19,11 +19,13 @@ const char* kSenseName[kSenseCount] = { "Vx3", "Vx4", "Vx2" };
 struct OhmsConfig {
   int     cycles;
   bool    emfCancel;
+  int     repeats;   // number of full measurements; >1 enables stats summary
 };
 
 bool parseArgs(int argc, const char* const* argv, OhmsConfig& cfg, Stream& io) {
   cfg.cycles    = kDefaultCycles;
   cfg.emfCancel = true;
+  cfg.repeats   = 1;
 
   for (int i = 0; i < argc; ++i) {
     const char* a = argv[i];
@@ -40,9 +42,19 @@ bool parseArgs(int argc, const char* const* argv, OhmsConfig& cfg, Stream& io) {
       }
     } else if (!strcasecmp(a, "--no-emf-cancel")) {
       cfg.emfCancel = false;
+    } else if (!strcasecmp(a, "--repeat") || !strcasecmp(a, "-r")) {
+      if (i + 1 >= argc || !argv[i+1]) {
+        io.println(F("ERROR: --repeat needs an integer."));
+        return false;
+      }
+      cfg.repeats = atoi(argv[++i]);
+      if (cfg.repeats < 1 || cfg.repeats > 1000) {
+        io.println(F("ERROR: --repeat out of range (1 to 1000)."));
+        return false;
+      }
     } else {
       io.print(F("ERROR: unrecognized argument: ")); io.println(a);
-      io.println(F("Usage: meas r [--cycles N] [--no-emf-cancel]"));
+      io.println(F("Usage: meas r [--cycles N] [--no-emf-cancel] [--repeat N]"));
       return false;
     }
   }
@@ -109,84 +121,149 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
   api.setExcitationVoltage(lowExc);
   delay(kExcVoltageSettleMs);
 
-  // Storage: voltages[sense][polarity]
-  //   sense:    0=Vx3, 1=Vx4, 2=Vx2
-  //   polarity: 0=+,   1=−
-  double v[kSenseCount][2];
-  for (int i = 0; i < kSenseCount; ++i) v[i][0] = v[i][1] = NAN;
-
-  const int polCount = cfg.emfCancel ? 2 : 1;
-  const bool polVal[2] = { true, false };
-
+  // Header (printed once)
   io.println();
   io.print(F("meas r: R_ref = ")); io.print(rRef, 6); io.print(F(" Ω"));
   io.print(F("  V_exc=")); io.print(lowExc ? F("1.0 V") : F("2.5 V"));
   io.print(F("  cycles=")); io.print(cfg.cycles);
   if (!cfg.emfCancel) io.print(F("  [no EMF cancel]"));
+  if (cfg.repeats > 1) { io.print(F("  repeat=")); io.print(cfg.repeats); }
   io.println();
 
-  for (int p = 0; p < polCount; ++p) {
-    api.setExcitationPolarity(polVal[p]);
-    delay(kPolaritySettleMs);
+  const bool verbose = (cfg.repeats == 1);
+  const int  polCount = cfg.emfCancel ? 2 : 1;
+  const bool polVal[2] = { true, false };
 
-    for (int s = 0; s < kSenseCount; ++s) {
-      api.selectSense((uint8_t)s);
-      bool ovf = false;
-      double vs = measureSenseVolts(api, cfg.cycles, &ovf);
-      if (ovf || !isfinite(vs)) {
-        io.print(F("  ")); io.print(kSenseName[s]);
-        io.print(F(" @ pol ")); io.print(polVal[p] ? '+' : '-');
-        io.println(F(": MEASUREMENT FAILED (preamp railed or BinSrch fail). Abort."));
-        // Restore a sane polarity before returning.
-        api.setExcitationPolarity(true);
-        return;
+  // Welford accumulators for the repeat-mode summary.
+  double mean = 0.0, m2 = 0.0;
+  double rMin = INFINITY, rMax = -INFINITY;
+  int    nGood = 0;
+
+  for (int rep = 0; rep < cfg.repeats; ++rep) {
+    // Storage: voltages[sense][polarity]   sense: 0=Vx3, 1=Vx4, 2=Vx2;  pol: 0=+, 1=−
+    double v[kSenseCount][2];
+    for (int i = 0; i < kSenseCount; ++i) v[i][0] = v[i][1] = NAN;
+
+    bool aborted = false;
+    for (int p = 0; p < polCount && !aborted; ++p) {
+      api.setExcitationPolarity(polVal[p]);
+      delay(kPolaritySettleMs);
+      for (int s = 0; s < kSenseCount; ++s) {
+        api.selectSense((uint8_t)s);
+        bool ovf = false;
+        double vs = measureSenseVolts(api, cfg.cycles, &ovf);
+        if (ovf || !isfinite(vs)) {
+          if (!verbose) { io.print(F("  run ")); io.print(rep + 1); io.print(F(": ")); }
+          io.print(kSenseName[s]); io.print(F(" @ pol ")); io.print(polVal[p] ? '+' : '-');
+          io.println(F(": MEASUREMENT FAILED (preamp railed or BinSrch fail)."));
+          aborted = true;
+          break;
+        }
+        v[s][p] = vs;
       }
-      v[s][p] = vs;
     }
-  }
+    if (aborted) {
+      if (verbose) {
+        // Single-shot mode: restore a sane polarity and exit via cleanup.
+        api.setExcitationPolarity(true);
+        goto cleanup;
+      }
+      continue;  // multi-run: skip this iteration but keep going
+    }
 
-  // EMF-cancelled magnitudes (index 2 is the R_ref-top sense, on Vx2).
-  double vx3, vx4, vxRef;
-  if (cfg.emfCancel) {
-    vx3   = (v[0][0] - v[0][1]) * 0.5;
-    vx4   = (v[1][0] - v[1][1]) * 0.5;
-    vxRef = (v[2][0] - v[2][1]) * 0.5;
-  } else {
-    vx3   = v[0][0];
-    vx4   = v[1][0];
-    vxRef = v[2][0];
-  }
-
-  double vDut = vx3 - vx4;
-  double vRef = vxRef - vx3;
-
-  if (vRef == 0.0 || !isfinite(vRef)) {
-    io.println(F("ERROR: V_R_ref is zero or non-finite — check wiring & excitation polarity."));
-    return;
-  }
-
-  double ratio = vDut / vRef;
-  double rDut  = rRef * ratio;
-
-  // --- Output ---------------------------------------------------------------
-  io.println();
-  io.print(F("R = ")); printOhms(io, rDut);
-  io.println();
-
-  for (int s = 0; s < kSenseCount; ++s) {
-    io.print(F("  ")); io.print(kSenseName[s]); io.print(F(":  "));
-    printSignedV(io, v[s][0], 8); io.print(F(" V"));
+    // EMF-cancelled magnitudes (index 2 = R_ref top sense on Vx2).
+    double vx3, vx4, vxRef;
     if (cfg.emfCancel) {
-      io.print(F(" / ")); printSignedV(io, v[s][1], 8); io.print(F(" V  ⇒  ±"));
-      double mag = (s == 0 ? vx3 : (s == 1 ? vx4 : vxRef));
-      io.print(fabs(mag), 8); io.print(F(" V"));
+      vx3   = (v[0][0] - v[0][1]) * 0.5;
+      vx4   = (v[1][0] - v[1][1]) * 0.5;
+      vxRef = (v[2][0] - v[2][1]) * 0.5;
+    } else {
+      vx3 = v[0][0]; vx4 = v[1][0]; vxRef = v[2][0];
+    }
+    const double vDut  = vx3 - vx4;
+    const double vRef  = vxRef - vx3;
+    if (vRef == 0.0 || !isfinite(vRef)) {
+      io.println(F("ERROR: V_R_ref is zero or non-finite — check wiring & excitation polarity."));
+      if (verbose) goto cleanup;
+      continue;
+    }
+    const double ratio = vDut / vRef;
+    const double rDut  = rRef * ratio;
+
+    // Per-run output
+    if (verbose) {
+      io.println();
+      io.print(F("R = ")); printOhms(io, rDut);
+      io.println();
+      for (int s = 0; s < kSenseCount; ++s) {
+        io.print(F("  ")); io.print(kSenseName[s]); io.print(F(":  "));
+        printSignedV(io, v[s][0], 8); io.print(F(" V"));
+        if (cfg.emfCancel) {
+          io.print(F(" / ")); printSignedV(io, v[s][1], 8); io.print(F(" V  ⇒  ±"));
+          double mag = (s == 0 ? vx3 : (s == 1 ? vx4 : vxRef));
+          io.print(fabs(mag), 8); io.print(F(" V"));
+        }
+        io.println();
+      }
+      io.print(F("  V_R_dut = ")); printSignedV(io, vDut, 8); io.print(F(" V"));
+      io.print(F("   V_R_ref = ")); printSignedV(io, vRef, 8); io.print(F(" V"));
+      io.print(F("   ratio = ")); io.print(ratio, 8); io.println();
+      io.print(F("  R_ref = ")); io.print(rRef, 6); io.print(F(" Ω    cycles="));
+      io.print(cfg.cycles); io.print(F("/polarity"));
+      io.println();
+    } else {
+      io.print(F("  run ")); io.print(rep + 1); io.print('/'); io.print(cfg.repeats);
+      io.print(F(": R = ")); printOhms(io, rDut);
+      io.print(F("   V_dut=")); io.print(vDut, 6);
+      io.print(F("   V_ref=")); io.print(vRef, 6);
+      io.println();
+    }
+
+    // Welford stats update
+    nGood++;
+    const double delta = rDut - mean;
+    mean += delta / nGood;
+    m2   += delta * (rDut - mean);
+    if (rDut < rMin) rMin = rDut;
+    if (rDut > rMax) rMax = rDut;
+  }
+
+  // Summary footer (repeat-mode only)
+  if (cfg.repeats > 1) {
+    io.println();
+    if (nGood == 0) {
+      io.println(F("All runs failed; no statistics."));
+      return;
+    }
+    const double sd        = (nGood > 1) ? sqrt(m2 / (double)(nGood - 1)) : 0.0;
+    const double meanAbs   = fabs(mean);
+    const double sdPpm     = (meanAbs > 0.0) ? (sd / meanAbs) * 1.0e6 : 0.0;
+    const double rangeOhms = rMax - rMin;
+    const double rangePpm  = (meanAbs > 0.0) ? (rangeOhms / meanAbs) * 1.0e6 : 0.0;
+
+    io.print(F("R = ")); printOhms(io, mean);
+    if (nGood > 1) {
+      io.print(F("  ± ")); printOhms(io, sd);
+      io.print(F(" sd ("));  io.print(sdPpm, 3); io.print(F(" ppm)"));
     }
     io.println();
+    io.print(F("  n=")); io.print(nGood); io.print('/'); io.print(cfg.repeats);
+    io.print(F("  mean=")); io.print(mean, 6); io.print(F(" Ω"));
+    if (nGood > 1) {
+      io.print(F("  sd=")); io.print(sd, 6); io.print(F(" Ω"));
+      io.print(F("  min=")); io.print(rMin, 6);
+      io.print(F("  max=")); io.print(rMax, 6);
+      io.print(F("  range=")); io.print(rangePpm, 3); io.print(F(" ppm"));
+    }
+    io.println();
+    io.print(F("  R_ref = ")); io.print(rRef, 6); io.print(F(" Ω    cycles="));
+    io.print(cfg.cycles); io.print(F("/polarity"));
+    io.println();
   }
-  io.print(F("  V_R_dut = ")); printSignedV(io, vDut, 8); io.print(F(" V"));
-  io.print(F("   V_R_ref = ")); printSignedV(io, vRef, 8); io.print(F(" V"));
-  io.print(F("   ratio = ")); io.print(ratio, 8); io.println();
-  io.print(F("  R_ref = ")); io.print(rRef, 6); io.print(F(" Ω    cycles="));
-  io.print(cfg.cycles); io.print(F("/polarity"));
-  io.println();
+
+cleanup:
+  // Drop V_exc to 1 V between measurements so the breakout idles at
+  // ~6× lower continuous dissipation. The next `meas r` re-escalates
+  // (or not) based on its R_ref selection.
+  api.setExcitationVoltage(true);
 }
