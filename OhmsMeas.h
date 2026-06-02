@@ -46,6 +46,13 @@ struct OhmsMeasApi {
   //   Vx = getCurrentDacVoltage() + adcMean × adcLsbV / preampGain
   double (*getCurrentDacVoltage)();
 
+  // Pre-set the DAC code (for seeding from a cached per-sense hint, so we
+  // can skip the full BinSrch when the cache is valid).
+  void (*setDacCode)(int16_t code);
+
+  // Read the current DAC code, for caching the BinSrch-converged value.
+  int16_t (*getCurrentDacCode)();
+
   // --- Mux selectors --------------------------------------------------------
 
   // Selects which Kelvin sense feeds the preamp through the on-board MUX36D08.

@@ -1414,11 +1414,14 @@ bool binarySearchDAC() {
   // then the modulator is pegged and DRDY suspends.
   //
   // Strategy: first attempt at normal CHOP_SETTLE_US (fine for non-rail
-  // transitions), then two recovery attempts at 150 ms and 400 ms — those
-  // cover 2.7τ and 7τ respectively, comfortably outside the rail zone.
-  // Returns false only after all three time out; caller should bail the
-  // search. On success the caller still checks out.overflow for real
-  // rail saturation.
+  // transitions), then three recovery attempts at 150 ms, 400 ms, and 1500 ms
+  // — those cover 2.7τ, 7τ, and 27τ respectively. The third tier handles
+  // *cumulative* AAF saturation from many consecutive same-direction railed
+  // BinSrch iterations (each iter only gives CHOP_SETTLE_US = 10 ms between
+  // rails, so the AAF integrator can drift well past one-shot rail depth
+  // before DRDY finally suspends). Returns false only after all four time
+  // out; caller should bail the search. On success the caller still checks
+  // out.overflow for real rail saturation.
   auto acquireWithRetry = [&](int32_t* samples, HalfCycleResult& out) -> bool {
     adc.stop();
     delayMicroseconds(CHOP_SETTLE_US);
@@ -1426,19 +1429,44 @@ bool binarySearchDAC() {
     out = acquireHalfCycle(samples);
     if (!(out.overflow && out.overflowSample == 0)) return true;
 
-    const uint32_t recoverSettleUs[2] = {150000, 400000};
-    for (int retry = 0; retry < 2; retry++) {
+    // DRDY-timeout recovery: a plain delay doesn't work — the DAC is still at
+    // the test code that's driving the preamp into rail, so the AAF stays
+    // saturated for as long as we wait. To actually discharge it: disconnect
+    // the preamp input (TMUX_EN HIGH) and park the DAC at 0, so the preamp
+    // output drifts to quiescent (~0 V) and the AAF can settle. Then restore
+    // both, brief settle, retry.
+    const int16_t savedDac = dac.currentCode();
+    digitalWriteFast(PIN_TMUX_EN, HIGH);   // disconnect preamp input
+    dac.setCode(0);                        // park DAC mid-scale
+
+    const uint32_t recoverSettleUs[3] = {150000, 400000, 1500000};
+    constexpr int N_RETRIES = sizeof(recoverSettleUs) / sizeof(recoverSettleUs[0]);
+    for (int retry = 0; retry < N_RETRIES; retry++) {
       if (g_debugDac) {
         Serial.print("    DRDY timeout — retry "); Serial.print(retry + 1);
-        Serial.print("/2 with "); Serial.print(recoverSettleUs[retry] / 1000);
-        Serial.println(" ms settle (AAF recovery from rail)");
+        Serial.print('/'); Serial.print(N_RETRIES);
+        Serial.print(" with "); Serial.print(recoverSettleUs[retry] / 1000);
+        Serial.println(" ms settle (TMUX_EN=HIGH, DAC=0 for active AAF discharge)");
       }
       adc.stop();
       delayMicroseconds(recoverSettleUs[retry]);
+      // Re-engage preamp and restore the test DAC code, then read.
+      dac.setCode(savedDac);
+      digitalWriteFast(PIN_TMUX_EN, LOW);
+      delayMicroseconds(TMUX_RECONNECT_US);
       adc.start();
       out = acquireHalfCycle(samples);
-      if (!(out.overflow && out.overflowSample == 0)) return true;
+      if (!(out.overflow && out.overflowSample == 0)) {
+        return true;  // recovered; preamp/DAC state already restored
+      }
+      // Still timing out — disconnect again and try a longer delay.
+      digitalWriteFast(PIN_TMUX_EN, HIGH);
+      dac.setCode(0);
     }
+    // All retries failed; restore state before bailing so caller's next
+    // iteration sees a normal preamp + correct DAC code.
+    dac.setCode(savedDac);
+    digitalWriteFast(PIN_TMUX_EN, LOW);
     return false;
   };
 
@@ -1459,7 +1487,7 @@ bool binarySearchDAC() {
     if (!acquireWithRetry(phaseA, rA)) {
       Serial.print("DAC: BinSrch bail at iter "); Serial.print(iter);
       Serial.print(" DAC="); Serial.print(mid);
-      Serial.println(" (persistent Phase A DRDY timeout — AAF/preamp not recovering within 560 ms)");
+      Serial.println(" (persistent Phase A DRDY timeout — AAF/preamp not recovering within 2050 ms)");
       break;
     }
     if (rA.overflow) {
@@ -1483,7 +1511,7 @@ bool binarySearchDAC() {
     if (!rbOk) {
       Serial.print("DAC: BinSrch bail at iter "); Serial.print(iter);
       Serial.print(" DAC="); Serial.print(mid);
-      Serial.println(" (persistent Phase B DRDY timeout — AAF/preamp not recovering within 560 ms)");
+      Serial.println(" (persistent Phase B DRDY timeout — AAF/preamp not recovering within 2050 ms)");
       break;
     }
     if (rB.overflow) {
@@ -1878,8 +1906,8 @@ public:
     .channels = { InputChannel::Vx1 },
     .count = 1,
     .integrationCycles = 850,
-    .autoZeroEnabled = false,
-    .autoZeroInterval = 10,
+    .autoZeroEnabled = true,
+    .autoZeroInterval = 30,
     .outputMode = OutputMode::Human,
     .ewmaWindow = 10.0f,
   };
@@ -2507,7 +2535,7 @@ void processCommand(char* line) {
   } else if (strcasecmp(cmd, "integrate") == 0) {
     if (!arg1) { Serial.println("Usage: integrate <0.1-600 seconds>"); return; }
     cmdIntegrate(arg1);
-  } else if (strcasecmp(cmd, "autozero") == 0) {
+  } else if (strcasecmp(cmd, "autozero") == 0 || strcasecmp(cmd, "az") == 0) {
     if (!arg1) { Serial.println("Usage: autozero on|off | autozero interval <N>"); return; }
     if (strcasecmp(arg1, "interval") == 0) {
       if (!arg2) { Serial.println("Usage: autozero interval <1-1000>"); return; }
@@ -3593,7 +3621,7 @@ public:
     Serial.print("  raw: mean=");
     Serial.print(data.adcMean, 3);
     Serial.print(", sd=");
-    Serial.print(data.adcStdDev, 3);
+    Serial.print(data.adcStdDev, 1);     // sample-sd has ~25% own-uncertainty; 1 decimal is plenty
     Serial.print(", min=");
     Serial.print(data.adcMin, 3);
     Serial.print(", max=");
@@ -3655,7 +3683,7 @@ public:
     Serial.print(',');
     Serial.print(data.voltage, 12);
     Serial.print(',');
-    Serial.print(data.uncertainty, 12);
+    Serial.print(data.uncertainty, 9);   // nV resolution; sample-sd has ~25% own-uncertainty
     Serial.print(',');
     Serial.print(data.adcStdDev, 3);
     Serial.print(',');
@@ -3682,7 +3710,7 @@ public:
       Serial.print('\t');
       Serial.print(getChannelShortName(data.channel));
       Serial.print("_sd:");
-      Serial.print(data.uncertainty, 12);
+      Serial.print(data.uncertainty, 9);   // nV resolution
     }
     lineStarted_ = true;
   }
@@ -3851,12 +3879,12 @@ static constexpr int      RREF_COUNT = 8;
 static constexpr RrefAlias RREF_ALIASES[RREF_COUNT] = {
   { "r1", "green",   20.0069161   },
   { "r2", "black",   200.014860   },
-  { "r3", "yellow",  2001.98758   },
-  { "r4", "white",   19999.8705   },
+  { "r3", "yellow",  2002.02620   },   // refined 2026-05-31 against 1062.0233 Ω cert (was 2001.98758)
+  { "r4", "white",   20000.1229   },   // refined 2026-06-01: split-the-difference between r3 (20k anchor) and r8 (10k cross-check); was 20000.0815, was 19999.8705
   { "r5", "blue",    200035.097   },
   { "r6", "red",     1898381.80   },
   { "r7", "clear",   11018620.0   },
-  { "r8", "yellow2", 4999.9945    },
+  { "r8", "yellow2", 5000.0482    },   // refined 2026-05-31 directly against 1062.0233 Ω cert; was 4999.9945
 };
 static int8_t g_currentRrefIdx = -1;   // -1 = unset; otherwise index into RREF_ALIASES
 
@@ -4529,6 +4557,14 @@ static double ohmsAdapter_currentDacVoltage() {
   return dacCalTable.codeToVoltage(dac.currentCode());
 }
 
+static void ohmsAdapter_setDacCode(int16_t code) {
+  dac.setCode(code);
+}
+
+static int16_t ohmsAdapter_getCurrentDacCode() {
+  return dac.currentCode();
+}
+
 static void ohmsAdapter_selectSense(uint8_t senseIdx) {
   switch (senseIdx) {
     case 0: inputMux.select(InputChannel::Vx3); break;
@@ -4695,6 +4731,8 @@ void cmdMeas(int argc, const char* const* argv) {
     ohmsAdapter_binarySearchDac,
     ohmsAdapter_runChop,
     ohmsAdapter_currentDacVoltage,
+    ohmsAdapter_setDacCode,
+    ohmsAdapter_getCurrentDacCode,
     ohmsAdapter_selectSense,
     ohmsAdapter_setPolarity,
     ohmsAdapter_setExcVoltage,
@@ -5201,7 +5239,7 @@ void cmdConfigFactory() {
   scanner.config.count = 1;
   scanner.config.integrationCycles = 390;
   scanner.config.autoZeroEnabled = true;
-  scanner.config.autoZeroInterval = 10;
+  scanner.config.autoZeroInterval = 30;
   scanner.config.outputMode = OutputMode::Human;
   scanner.config.ewmaWindow = 10.0f;
   scanner.setEwmaWindow(10.0f);

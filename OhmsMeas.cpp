@@ -8,24 +8,28 @@
 
 namespace {
 
-constexpr int  kDefaultCycles    = 285;     // ≈ 15 s at OSR=12800, samples=14 (matches CalVerify)
+constexpr int  kDefaultCycles    = 75;      // ≈ 4 s per sense at OSR=12800, samples=14; → ~22 s per `meas r` (6 sense·pol combos). Override with --cycles N for higher precision.
 constexpr int  kSenseCount       = 3;       // Vx3, Vx4, Vx2 (R_ref top)
 constexpr uint32_t kPolaritySettleMs = 200; // V_exc + AAF settle after polarity flip
 constexpr uint32_t kExcVoltageSettleMs = 200; // V_exc rail change + AAF settle
 constexpr double   kLowExcThresholdOhms = 500.0; // R_ref below this → 1 V rail
+constexpr double   kMinAbsVrefVolts     = 1.0e-4;  // 100 µV: below = R_ref sense path broken (DUT open or clip off)
+constexpr double   kMaxAbsROhms         = 1.0e10;  // 10 GΩ ceiling; beyond is physically implausible for this design
 
 const char* kSenseName[kSenseCount] = { "Vx3", "Vx4", "Vx2" };
 
 struct OhmsConfig {
   int     cycles;
   bool    emfCancel;
-  int     repeats;   // number of full measurements; >1 enables stats summary
+  int     repeats;          // number of full measurements; >1 enables stats summary
+  int8_t  excOverride;      // 0 = auto by R_ref, 1 = force 1.0 V, 2 = force 2.5 V
 };
 
 bool parseArgs(int argc, const char* const* argv, OhmsConfig& cfg, Stream& io) {
-  cfg.cycles    = kDefaultCycles;
-  cfg.emfCancel = true;
-  cfg.repeats   = 1;
+  cfg.cycles      = kDefaultCycles;
+  cfg.emfCancel   = true;
+  cfg.repeats     = 1;
+  cfg.excOverride = 0;
 
   for (int i = 0; i < argc; ++i) {
     const char* a = argv[i];
@@ -52,20 +56,70 @@ bool parseArgs(int argc, const char* const* argv, OhmsConfig& cfg, Stream& io) {
         io.println(F("ERROR: --repeat out of range (1 to 1000)."));
         return false;
       }
+    } else if (!strcasecmp(a, "--exc")) {
+      if (i + 1 >= argc || !argv[i+1]) {
+        io.println(F("ERROR: --exc needs a value (1 or 2.5)."));
+        return false;
+      }
+      double v = atof(argv[++i]);
+      if      (v > 0.5 && v < 1.5) cfg.excOverride = 1;  // → 1.0 V rail
+      else if (v > 2.0 && v < 3.0) cfg.excOverride = 2;  // → 2.5 V rail
+      else {
+        io.println(F("ERROR: --exc must be 1 or 2.5 (only those two rails exist)."));
+        return false;
+      }
     } else {
       io.print(F("ERROR: unrecognized argument: ")); io.println(a);
-      io.println(F("Usage: meas r [--cycles N] [--no-emf-cancel] [--repeat N]"));
+      io.println(F("Usage: meas r [--cycles N] [--no-emf-cancel] [--repeat N] [--exc 1|2.5]"));
       return false;
     }
   }
   return true;
 }
 
-// Measure Vx at the current channel for the current polarity. Locks the DAC
-// via BinSrch first, then integrates `cycles` chop cycles, then converts the
-// demodulated ADC residual to volts at the input. Returns NAN on failure.
-double measureSenseVolts(const OhmsMeasApi& api, int cycles, bool* outOverflow) {
+// Per-(sense, polarity) DAC code cache. After a successful BinSrch, the
+// converged code is stashed here and reused on subsequent calls — skipping
+// the full BinSrch entirely (which can fail when many consecutive
+// same-direction railed iterations saturate the AAF; see CHOP_SETTLE
+// notes in binarySearchDAC). On overflow during a cached integration
+// (the cached code is stale) the entry is invalidated and we fall back
+// to a full BinSrch.
+//
+// Invalidated en masse at the start of each cmdMeasR when R_ref or V_exc
+// changes (those shift every Vx value, so all cached codes are wrong).
+static int16_t s_dacCache[kSenseCount][2]      = { {0,0}, {0,0}, {0,0} };
+static bool    s_dacCacheValid[kSenseCount][2] = { {false,false}, {false,false}, {false,false} };
+
+static void invalidateDacCache() {
+  for (int s = 0; s < kSenseCount; ++s) {
+    for (int p = 0; p < 2; ++p) s_dacCacheValid[s][p] = false;
+  }
+}
+
+// Measure Vx at the current channel for the current polarity. Uses the
+// per-(sense, polarity) cached DAC code when valid (skips BinSrch entirely);
+// otherwise runs a full BinSrch and caches the converged code.
+// Returns NAN on failure.
+double measureSenseVolts(const OhmsMeasApi& api, int cycles, bool* outOverflow,
+                         int senseIdx, int polIdx) {
   if (outOverflow) *outOverflow = false;
+
+  // Cache hit: pre-set DAC, integrate directly. If overflow, the cached
+  // code is stale (Vx drifted out of the preamp linear range); invalidate
+  // and fall through to the BinSrch path.
+  if (s_dacCacheValid[senseIdx][polIdx]) {
+    api.setDacCode(s_dacCache[senseIdx][polIdx]);
+    bool ovf = false;
+    double adcMean = api.runChopCycles(cycles, &ovf);
+    if (!ovf) {
+      double vdac  = api.getCurrentDacVoltage();
+      double delta = adcMean * api.adcLsbV / api.preampGain;
+      return vdac + delta;
+    }
+    s_dacCacheValid[senseIdx][polIdx] = false;  // stale; fall back to BinSrch
+  }
+
+  // Cache miss (or no cache yet): full BinSrch, then cache the result.
   if (!api.binarySearchDac()) {
     if (outOverflow) *outOverflow = true;
     return NAN;
@@ -76,13 +130,19 @@ double measureSenseVolts(const OhmsMeasApi& api, int cycles, bool* outOverflow) 
     if (outOverflow) *outOverflow = true;
     return NAN;
   }
+  s_dacCache[senseIdx][polIdx]      = api.getCurrentDacCode();
+  s_dacCacheValid[senseIdx][polIdx] = true;
+
   double vdac  = api.getCurrentDacVoltage();
   double delta = adcMean * api.adcLsbV / api.preampGain;
   return vdac + delta;
 }
 
-void printOhms(Stream& io, double r) {
-  // SI-prefix print: TΩ, GΩ, MΩ, kΩ, Ω, mΩ, µΩ
+// SI-prefix print with `sigDigits` significant digits regardless of unit.
+// Default 9 matches 8.5-9.5 digit DMM display precision. Use ~4 for sd and
+// similar uncertainty quantities (a sample-sd estimate's own uncertainty
+// is ~25% at n=9, so more digits than that are spurious).
+void printOhms(Stream& io, double r, int sigDigits = 9) {
   if (!isfinite(r)) { io.print(F("NaN Ω")); return; }
   double ar = fabs(r);
   const char* unit = "Ω";
@@ -94,7 +154,15 @@ void printOhms(Stream& io, double r) {
   else if (ar >= 1.0)    { unit = "Ω";  scale = 1.0; }
   else if (ar >= 1.0e-3) { unit = "mΩ"; scale = 1.0e3; }
   else                   { unit = "µΩ"; scale = 1.0e6; }
-  io.print(r * scale, 6); io.print(' '); io.print(unit);
+  const double scaled = r * scale;
+  const double absScaled = fabs(scaled);
+  int decimals = sigDigits;
+  if (absScaled >= 1.0) {
+    const int digitsBefore = (int)floor(log10(absScaled)) + 1;
+    decimals = sigDigits - digitsBefore;
+    if (decimals < 0) decimals = 0;
+  }
+  io.print(scaled, decimals); io.print(' '); io.print(unit);
 }
 
 void printSignedV(Stream& io, double v, int decimals = 8) {
@@ -116,15 +184,29 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
     return;
   }
 
-  // Select excitation magnitude from R_ref value, then let V_exc + AAF settle.
-  const bool lowExc = (rRef < kLowExcThresholdOhms);
+  // Select excitation magnitude: --exc override wins over auto-select.
+  bool lowExc;
+  if      (cfg.excOverride == 1) lowExc = true;
+  else if (cfg.excOverride == 2) lowExc = false;
+  else                           lowExc = (rRef < kLowExcThresholdOhms);
   api.setExcitationVoltage(lowExc);
   delay(kExcVoltageSettleMs);
+
+  // Invalidate the DAC-code cache when R_ref or V_exc changes — those
+  // shift every Vx value so all cached per-sense codes are stale.
+  static double s_cachedRref     = 0.0;
+  static bool   s_cachedLowExc   = false;
+  if (rRef != s_cachedRref || lowExc != s_cachedLowExc) {
+    invalidateDacCache();
+    s_cachedRref   = rRef;
+    s_cachedLowExc = lowExc;
+  }
 
   // Header (printed once)
   io.println();
   io.print(F("meas r: R_ref = ")); io.print(rRef, 6); io.print(F(" Ω"));
   io.print(F("  V_exc=")); io.print(lowExc ? F("1.0 V") : F("2.5 V"));
+  if (cfg.excOverride) io.print(F(" [forced]"));
   io.print(F("  cycles=")); io.print(cfg.cycles);
   if (!cfg.emfCancel) io.print(F("  [no EMF cancel]"));
   if (cfg.repeats > 1) { io.print(F("  repeat=")); io.print(cfg.repeats); }
@@ -151,7 +233,7 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
       for (int s = 0; s < kSenseCount; ++s) {
         api.selectSense((uint8_t)s);
         bool ovf = false;
-        double vs = measureSenseVolts(api, cfg.cycles, &ovf);
+        double vs = measureSenseVolts(api, cfg.cycles, &ovf, s, p);
         if (ovf || !isfinite(vs)) {
           if (!verbose) { io.print(F("  run ")); io.print(rep + 1); io.print(F(": ")); }
           io.print(kSenseName[s]); io.print(F(" @ pol ")); io.print(polVal[p] ? '+' : '-');
@@ -190,6 +272,27 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
     const double ratio = vDut / vRef;
     const double rDut  = rRef * ratio;
 
+    // Physical-plausibility checks: catch fallen Kelvin clips, open DUTs,
+    // sense lines disconnected, etc. Abort the whole batch on detection —
+    // these failure modes are usually persistent, so continuing wastes time.
+    const __FlashStringHelper* invalidReason = nullptr;
+    if (fabs(vRef) < kMinAbsVrefVolts) {
+      invalidReason = F("|V_R_ref| < 100 µV — R_ref sense disconnected, R_ref unwired, or DUT open?");
+    } else if (!isfinite(rDut)) {
+      invalidReason = F("R is non-finite (computation failure)");
+    } else if (rDut < 0.0) {
+      invalidReason = F("R is negative — Kelvin sense leads swapped, or a contact opened mid-measurement?");
+    } else if (rDut > kMaxAbsROhms) {
+      invalidReason = F("R exceeds 10 GΩ ceiling — likely an open circuit somewhere in the chain");
+    }
+    if (invalidReason) {
+      io.print(F("ABORT: ")); io.println(invalidReason);
+      io.print(F("       V_R_dut=")); io.print(vDut, 6);
+      io.print(F("   V_R_ref=")); io.print(vRef, 6);
+      io.print(F("   R=")); printOhms(io, rDut); io.println();
+      break;  // exit the for-rep loop; falls through to summary (which prints partial stats)
+    }
+
     // Per-run output
     if (verbose) {
       io.println();
@@ -216,8 +319,15 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
       io.print(F(": R = ")); printOhms(io, rDut);
       io.print(F("   V_dut=")); io.print(vDut, 6);
       io.print(F("   V_ref=")); io.print(vRef, 6);
+      if (cfg.repeats > 1 && rep == 0) io.print(F("   [primer, excluded from stats]"));
       io.println();
     }
+
+    // Discard the first run in repeat-mode as a thermal primer: when V_exc
+    // steps from idle-1V to measurement-2.5V on meas-r entry, R_ref + DUT
+    // self-heat for ~1-3 s (SMT thermal time constant). Run 1 captures the
+    // transient; runs 2..N capture the steady state.
+    if (cfg.repeats > 1 && rep == 0) continue;
 
     // Welford stats update
     nGood++;
@@ -232,8 +342,8 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
   if (cfg.repeats > 1) {
     io.println();
     if (nGood == 0) {
-      io.println(F("All runs failed; no statistics."));
-      return;
+      io.println(F("No counted runs completed; no statistics."));
+      goto cleanup;
     }
     const double sd        = (nGood > 1) ? sqrt(m2 / (double)(nGood - 1)) : 0.0;
     const double meanAbs   = fabs(mean);
@@ -243,14 +353,14 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
 
     io.print(F("R = ")); printOhms(io, mean);
     if (nGood > 1) {
-      io.print(F("  ± ")); printOhms(io, sd);
+      io.print(F("  ± ")); printOhms(io, sd, 4);
       io.print(F(" sd ("));  io.print(sdPpm, 3); io.print(F(" ppm)"));
     }
     io.println();
     io.print(F("  n=")); io.print(nGood); io.print('/'); io.print(cfg.repeats);
     io.print(F("  mean=")); io.print(mean, 6); io.print(F(" Ω"));
     if (nGood > 1) {
-      io.print(F("  sd=")); io.print(sd, 6); io.print(F(" Ω"));
+      io.print(F("  sd=")); printOhms(io, sd, 4);
       io.print(F("  min=")); io.print(rMin, 6);
       io.print(F("  max=")); io.print(rMax, 6);
       io.print(F("  range=")); io.print(rangePpm, 3); io.print(F(" ppm"));
