@@ -8,7 +8,7 @@
 
 namespace {
 
-constexpr int  kDefaultCycles    = 75;      // ≈ 4 s per sense at OSR=12800, samples=14; → ~22 s per `meas r` (6 sense·pol combos). Override with --cycles N for higher precision.
+constexpr int  kDefaultCycles    = 150;     // ≈ 8 s per sense at OSR=12800, samples=14; with default --repeat 5 → ~210 s per `meas r` with primer-shortening, sd ≈ 0.5 ppm on cert resistors. Sweet spot for sd/time per the optimum k=√(N/30) analysis.
 constexpr int  kSenseCount       = 3;       // Vx3, Vx4, Vx2 (R_ref top)
 constexpr uint32_t kPolaritySettleMs = 200; // V_exc + AAF settle after polarity flip
 constexpr uint32_t kExcVoltageSettleMs = 200; // V_exc rail change + AAF settle
@@ -28,7 +28,7 @@ struct OhmsConfig {
 bool parseArgs(int argc, const char* const* argv, OhmsConfig& cfg, Stream& io) {
   cfg.cycles      = kDefaultCycles;
   cfg.emfCancel   = true;
-  cfg.repeats     = 1;
+  cfg.repeats     = 5;            // default to repeat-mode with primer; gives sd ≈ 0.5 ppm at cycles=150
   cfg.excOverride = 0;
 
   for (int i = 0; i < argc; ++i) {
@@ -222,6 +222,15 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
   int    nGood = 0;
 
   for (int rep = 0; rep < cfg.repeats; ++rep) {
+    // Primer (rep=0 in repeat mode) only needs to let R_ref + DUT reach
+    // thermal equilibrium under load — the precision integration happens in
+    // runs 2..N. Half-cycles for the primer cuts ~10% off total wall-clock
+    // without changing the counted-run sd.
+    const bool isPrimer = (cfg.repeats > 1 && rep == 0);
+    const int  thisCycles = isPrimer
+        ? (cfg.cycles / 2 > 20 ? cfg.cycles / 2 : 20)
+        : cfg.cycles;
+
     // Storage: voltages[sense][polarity]   sense: 0=Vx3, 1=Vx4, 2=Vx2;  pol: 0=+, 1=−
     double v[kSenseCount][2];
     for (int i = 0; i < kSenseCount; ++i) v[i][0] = v[i][1] = NAN;
@@ -233,7 +242,7 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
       for (int s = 0; s < kSenseCount; ++s) {
         api.selectSense((uint8_t)s);
         bool ovf = false;
-        double vs = measureSenseVolts(api, cfg.cycles, &ovf, s, p);
+        double vs = measureSenseVolts(api, thisCycles, &ovf, s, p);
         if (ovf || !isfinite(vs)) {
           if (!verbose) { io.print(F("  run ")); io.print(rep + 1); io.print(F(": ")); }
           io.print(kSenseName[s]); io.print(F(" @ pol ")); io.print(polVal[p] ? '+' : '-');
@@ -319,7 +328,7 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
       io.print(F(": R = ")); printOhms(io, rDut);
       io.print(F("   V_dut=")); io.print(vDut, 6);
       io.print(F("   V_ref=")); io.print(vRef, 6);
-      if (cfg.repeats > 1 && rep == 0) io.print(F("   [primer, excluded from stats]"));
+      if (isPrimer) { io.print(F("   [primer @ ")); io.print(thisCycles); io.print(F(" cycles, excluded from stats]")); }
       io.println();
     }
 

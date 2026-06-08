@@ -54,34 +54,48 @@ speed.
 
 ### Excitation magnitude
 
-The firmware auto-selects 1 V excitation for R_ref < 500 Ω (aliases r1 and
-r2) and 2.5 V for everything else. This keeps R_ref dissipation reasonable
-at the low-Ω end without giving up signal-to-noise on the high-Ω end.
+The firmware auto-selects 1 V excitation for R_ref < 500 Ω (just r2 in
+the current jig) and 2.5 V for everything else. This keeps R_ref
+dissipation reasonable at the low-Ω end without giving up
+signal-to-noise on the high-Ω end.
 
 ## Reference resistors
 
-Eight resistors are physically wired one-at-a-time into the breakout socket.
-Each is identified by color band and by short alias. The firmware tracks
-which one is currently installed via the `rref` CLI command (selection is
-not persisted across reboots).
+Five resistors are physically wired one-at-a-time into the breakout
+socket. Each is identified by color band and by short alias. The
+firmware tracks which one is currently installed via the `rref` CLI
+command (selection is not persisted across reboots).
 
-| Alias | Color   | R_ref (Ω)     | V_exc  |
-|-------|---------|---------------|--------|
-| r1    | green   | 20.0069161    | 1.0 V  |
-| r2    | black   | 200.014860    | 1.0 V  |
-| r3    | yellow  | 2002.02620    | 2.5 V  |
-| r8    | yellow2 | 5000.0482     | 2.5 V  |
-| r4    | white   | 20000.1229    | 2.5 V  |
-| r5    | blue    | 200035.097    | 2.5 V  |
-| r6    | red     | 1898381.80    | 2.5 V  |
-| r7    | clear   | 11018620.0    | 2.5 V  |
+| Alias | Color  | R_ref (Ω)   | V_exc  |
+|-------|--------|-------------|--------|
+| r2    | black  | 200.04825   | 1.0 V  |
+| r3    | yellow | 2002.07822  | 2.5 V  |
+| r8    | green  | 5000.06199  | 2.5 V  |
+| r4    | white  | 19999.9472  | 2.5 V  |
+| r5    | blue   | 50010.4165  | 2.5 V  |
 
-Values are firmware constants in `RREF_ALIASES[]` (see the .ino source);
-they were established by DMM comparison against a Keithley reference.
+Values are firmware constants in `RREF_ALIASES[]` (see the .ino source).
+All five rrefs were re-calibrated 2026-06-05 using a Fluke 5450
+calibrator as a transfer standard. The 5450 had been self-cal'd a few
+years prior against a Keithley 2002 that was in calibration at the
+time. For each rref, two 5450 decade values were measured to span
+ρ ≈ 0.5–2; for r3, r4, and r8 the prior 1062.0233 Ω cert anchor was
+retained as a third point. The stored value is the average of all
+candidates per rref.
 
-The "r8 yellow2" 5 kΩ value deliberately bridges the decade gap between
-r3 (2 kΩ) and r4 (20 kΩ), so the 1 kΩ–10 kΩ range is well-served at the
-optimum ratio (see below) rather than at a 5× mismatch.
+**Hardware jig revisions (2026-06-05):** the original r1 (20 Ω), r6
+(1.9 MΩ), and r7 (11 MΩ) were physically removed — at the
+low-Ω/high-current end r1 caused TMUX charge-injection issues, and at
+the high-Ω end (r5 = 200 kΩ, r6, r7) BinSrch could not converge,
+likely due to AD8428 oscillation at high source impedance. The new r5
+is a 50 kΩ blue resistor (was 200 kΩ blue), kept under the practical
+threshold where AAF + preamp behave linearly. r8 was re-color-coded
+from yellow2 to green.
+
+The r8 5 kΩ value deliberately bridges the decade gap between r3
+(2 kΩ) and r4 (20 kΩ), so the 1 kΩ–10 kΩ range is well-served at the
+optimum ratio (see below) rather than at a 5× mismatch. The r5 50 kΩ
+similarly bridges between r4 (20 kΩ) and the absent 200 kΩ slot.
 
 ## Choosing R_ref for a given DUT
 
@@ -114,18 +128,17 @@ the noise advantage of ratiometric measurement collapses.
 
 | Alias | R_ref      | Sweet R_dut (ρ≈1) | Good range (0.1 ≤ ρ ≤ 10) | Sane usable (0.01 ≤ ρ ≤ 100) |
 |-------|------------|-------------------|----------------------------|-------------------------------|
-| r1    | 20 Ω       | ~20 Ω             | 2 Ω – 200 Ω                | 0.2 Ω – 2 kΩ                  |
 | r2    | 200 Ω      | ~200 Ω            | 20 Ω – 2 kΩ                | 2 Ω – 20 kΩ                   |
 | r3    | 2 kΩ       | ~2 kΩ             | 200 Ω – 20 kΩ              | 20 Ω – 200 kΩ                 |
 | r8    | 5 kΩ       | ~5 kΩ             | 500 Ω – 50 kΩ              | 50 Ω – 500 kΩ                 |
 | r4    | 20 kΩ      | ~20 kΩ            | 2 kΩ – 200 kΩ              | 200 Ω – 2 MΩ                  |
-| r5    | 200 kΩ     | ~200 kΩ           | 20 kΩ – 2 MΩ               | 2 kΩ – 20 MΩ                  |
-| r6    | 1.9 MΩ     | ~1.9 MΩ           | 190 kΩ – 19 MΩ             | 19 kΩ – 190 MΩ                |
-| r7    | 11 MΩ      | ~11 MΩ            | 1.1 MΩ – 110 MΩ            | 110 kΩ – 1.1 GΩ               |
+| r5    | 50 kΩ      | ~50 kΩ            | 5 kΩ – 500 kΩ              | 500 Ω – 5 MΩ                  |
 
-The "good" ranges overlap by design. For a 5 kΩ DUT you could pick r3
-(ρ=2.5, ~1.7× penalty), r8 (ρ=1, optimal), or r4 (ρ=0.25, ~1.8× penalty).
-Pick the one nearest ρ=1 when you have the choice.
+The "good" ranges overlap by design. For a 10 kΩ DUT you could pick r3
+(ρ=5, ~3× penalty), r8 (ρ=2, ~1.2× penalty), r4 (ρ=0.5, ~1.2× penalty),
+or r5 (ρ=0.2, ~1.5× penalty). Pick the one nearest ρ=1 when you have
+the choice. **Practical coverage with the current jig is roughly 50 Ω
+to 500 kΩ at sub-ppm precision.**
 
 ## Practical caveats outside the math
 
