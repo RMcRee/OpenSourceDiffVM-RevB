@@ -132,13 +132,66 @@ the noise advantage of ratiometric measurement collapses.
 | r3    | 2 kΩ       | ~2 kΩ             | 200 Ω – 20 kΩ              | 20 Ω – 200 kΩ                 |
 | r8    | 5 kΩ       | ~5 kΩ             | 500 Ω – 50 kΩ              | 50 Ω – 500 kΩ                 |
 | r4    | 20 kΩ      | ~20 kΩ            | 2 kΩ – 200 kΩ              | 200 Ω – 2 MΩ                  |
-| r5    | 50 kΩ      | ~50 kΩ            | 5 kΩ – 500 kΩ              | 500 Ω – 5 MΩ                  |
+| r5    | 50 kΩ      | ~50 kΩ            | 5 kΩ – 50 kΩ (Z ceiling; see below) | 500 Ω – 50 kΩ         |
 
 The "good" ranges overlap by design. For a 10 kΩ DUT you could pick r3
 (ρ=5, ~3× penalty), r8 (ρ=2, ~1.2× penalty), r4 (ρ=0.5, ~1.2× penalty),
 or r5 (ρ=0.2, ~1.5× penalty). Pick the one nearest ρ=1 when you have
 the choice. **Practical coverage with the current jig is roughly 50 Ω
-to 500 kΩ at sub-ppm precision.**
+to 200 kΩ at sub-ppm precision.** Above ~50 kΩ use r4, not r5 — the
+front-end source-impedance ceiling caps r5 at DUTs ≤ ~50 kΩ (see
+below); r4 reaches MΩ-scale DUTs at reduced precision.
+
+**High source impedance ceiling: Z_src = R_ref ∥ R_dut ≤ ~25 kΩ
+(characterized 2026-06-10).** The noise math says r5 should be good
+through 500 kΩ DUTs, but the front end has a hard stability ceiling
+that the noise math knows nothing about. The AD8428 bank's input
+current varies with its differential input voltage; through a high
+source impedance at the sense node that variation feeds back into the
+input. Loop gain scales with Z_src: harmless below ~20 kΩ, near unity
+at ~30 kΩ. Consequences, measured with `dacsweep` at r5 + 100 kΩ
+(Z_src ≈ 33 kΩ):
+
+- The static chop-demod transfer compresses ~16–27×: full +FS → −FS
+  transition in 1–2 DAC codes instead of the nominal ~15, even with
+  100 ms of settle per half-cycle. The both-phase acceptance window is
+  essentially empty.
+- At normal chop cadence the kicked node locks into a chop-synchronous
+  **period-2 limit cycle** (~±1.2 mV at the input, with a ~6-pair beat),
+  so readings flip between soft rails of either sign. No search
+  strategy converges on that, and an integration through it would be
+  meaningless even if one did.
+- Control: the identical sweep on a low-Z sense (Vx2) is textbook —
+  16-code window, slope exactly gain 2000.
+
+This is the same project-level constraint as voltage mode ("low source
+impedance only"), now with a number attached. It is also, in hindsight,
+what retired the original 200 kΩ r5 / 1.9 MΩ r6 / 11 MΩ r7 — those
+could never have worked.
+
+**Design rule:** keep **R_ref ∥ R_dut ≤ 25 kΩ** at the Vx3 node.
+Since R_ref ∥ R_dut < R_ref, any R_ref ≤ 20 kΩ (r2/r3/r8/r4) satisfies
+the rule for *every* DUT — for big DUTs, use r4 and accept the ρ
+penalty (ρ = 50 ≈ 18× noise vs ρ = 1; still usable). r5 (50 kΩ) is
+safe only for DUTs ≤ ~50 kΩ (ρ ≤ 1, Z_src ≤ 25 kΩ), where it gives the
+best precision in its band. The firmware warns when
+`--nominal` implies Z_src over the ceiling, and explains the ceiling
+when a Vx3 search fails at R_ref ≥ 30 kΩ.
+
+**Search improvements that came out of this investigation** (kept —
+they benefit all R_refs): `meas r` seeds every BinSrch from physics
+(Vx4 ≈ 0 V, Vx2 ≈ ±V_exc, Vx3 from the divider given `--nominal`, the
+opposite-polarity code by mirror), bisects inside a small bracket with
+flush chop pairs at normal cadence, and resets the AAF through the
+preamp's linear region (input mux → GND + autozero-null DAC code) on
+cold entry. Cold convergence on the low-Z senses dropped from ~17
+probes to 3.
+
+**Diagnostics** (see `help`): `dacsweep <ch> <a> <b> [step] [pairs]
+[settleUs]` plots the chop window per DAC code (a == b gives a
+time-series at one code); `dacset <code>` parks the DAC for scope work
+with `hold`; `ohms pol +|-` / `ohms exc 1|2.5` drive the excitation
+manually.
 
 ## Practical caveats outside the math
 
@@ -208,7 +261,8 @@ reversed vs schematic; firmware inverts `PIN_OHMS_POL` sense).
 
 > Pick R_ref ≈ R_dut. Within a factor of 3 you are at near-optimal
 > precision; within a factor of 10 you are still excellent. Don't
-> overthink it.
+> overthink it — but keep R_ref ∥ R_dut ≤ 25 kΩ: for DUTs above
+> ~50 kΩ that means r4, not r5.
 
 If you genuinely don't know R_dut yet, start with r4 (20 kΩ) at 2.5 V and
 look at the V_dut / V_ref ratio in the output. The ratio tells you ρ,

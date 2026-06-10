@@ -18,18 +18,52 @@ constexpr double   kMaxAbsROhms         = 1.0e10;  // 10 GΩ ceiling; beyond is 
 
 const char* kSenseName[kSenseCount] = { "Vx3", "Vx4", "Vx2" };
 
+// Acquisition order: low-impedance, predictable nodes first (Vx4 ≈ 0 V,
+// Vx2 ≈ ±V_exc), then the hard one (Vx3: unknown voltage AND high source
+// impedance R_ref ∥ R_dut). By the time Vx3 is attacked, the measured
+// Vx2/Vx4 of the same polarity are available to seed its search.
+const uint8_t kAcqOrder[kSenseCount] = { 1, 2, 0 };
+
+// Seeded-search brackets (DAC codes; LSB ≈ 152.6 µV).
+constexpr int32_t kMirrorHalfBracket = 64;   // opposite-polarity mirror: EMF ~60 µV ≈ 0.4 codes + offset/INL margin
+constexpr int32_t kVx4HalfBracket    = 256;  // Vx4 ≈ 0 V + wiring drops (µV-scale)
+constexpr int32_t kVx2HalfBracket    = 768;  // Vx2 ≈ ±V_exc nominal; covers ~±2 % rail tolerance
+constexpr double  kHighRrefOhms      = 30.0e3;  // above this, cold full-range search gets the AAF-reset variant
+// Front-end stability ceiling: the AD8428 bank is regenerative when the
+// sense-node source impedance R_ref ∥ R_dut exceeds ~25 kΩ (input-current
+// feedback through Z_src; static transfer compresses ~16×, chopping excites a
+// limit cycle). Measured 2026-06-10 via dacsweep at r5 + 100 kΩ; see
+// OhmsMeasurement.md "high source impedance ceiling".
+constexpr double  kZsrcStabilityOhms = 25.0e3;
+
 struct OhmsConfig {
   int     cycles;
   bool    emfCancel;
   int     repeats;          // number of full measurements; >1 enables stats summary
   int8_t  excOverride;      // 0 = auto by R_ref, 1 = force 1.0 V, 2 = force 2.5 V
+  double  nominalOhms;      // user's rough DUT estimate (0 = unset); seeds the Vx3 search
 };
+
+// "470", "200k", "1.5M", "2G" → ohms; NAN if unparseable. 'm' counts as mega
+// too — milliohm nominals don't occur at seed-bracket resolution.
+double parseOhmsValue(const char* s) {
+  if (!s) return NAN;
+  char* end = nullptr;
+  double v = strtod(s, &end);
+  if (end == s) return NAN;
+  if      (*end == 'k' || *end == 'K') { v *= 1.0e3; ++end; }
+  else if (*end == 'M' || *end == 'm') { v *= 1.0e6; ++end; }
+  else if (*end == 'G' || *end == 'g') { v *= 1.0e9; ++end; }
+  if (*end != '\0') return NAN;
+  return v;
+}
 
 bool parseArgs(int argc, const char* const* argv, OhmsConfig& cfg, Stream& io) {
   cfg.cycles      = kDefaultCycles;
   cfg.emfCancel   = true;
   cfg.repeats     = 5;            // default to repeat-mode with primer; gives sd ≈ 0.5 ppm at cycles=150
   cfg.excOverride = 0;
+  cfg.nominalOhms = 0.0;
 
   for (int i = 0; i < argc; ++i) {
     const char* a = argv[i];
@@ -56,6 +90,17 @@ bool parseArgs(int argc, const char* const* argv, OhmsConfig& cfg, Stream& io) {
         io.println(F("ERROR: --repeat out of range (1 to 1000)."));
         return false;
       }
+    } else if (!strcasecmp(a, "--nominal")) {
+      if (i + 1 >= argc || !argv[i+1]) {
+        io.println(F("ERROR: --nominal needs a resistance (e.g. 470, 200k, 1.5M)."));
+        return false;
+      }
+      double r = parseOhmsValue(argv[++i]);
+      if (!isfinite(r) || r <= 0.0 || r > 1.0e12) {
+        io.println(F("ERROR: --nominal could not be parsed or is out of range."));
+        return false;
+      }
+      cfg.nominalOhms = r;
     } else if (!strcasecmp(a, "--exc")) {
       if (i + 1 >= argc || !argv[i+1]) {
         io.println(F("ERROR: --exc needs a value (1 or 2.5)."));
@@ -70,7 +115,7 @@ bool parseArgs(int argc, const char* const* argv, OhmsConfig& cfg, Stream& io) {
       }
     } else {
       io.print(F("ERROR: unrecognized argument: ")); io.println(a);
-      io.println(F("Usage: meas r [--cycles N] [--no-emf-cancel] [--repeat N] [--exc 1|2.5]"));
+      io.println(F("Usage: meas r [--cycles N] [--no-emf-cancel] [--repeat N] [--exc 1|2.5] [--nominal R]"));
       return false;
     }
   }
@@ -96,46 +141,74 @@ static void invalidateDacCache() {
   }
 }
 
-// Measure Vx at the current channel for the current polarity. Uses the
-// per-(sense, polarity) cached DAC code when valid (skips BinSrch entirely);
-// otherwise runs a full BinSrch and caches the converged code.
-// Returns NAN on failure.
+// Measure Vx at the current channel for the current polarity. Seed ladder,
+// first success wins:
+//   1. cached DAC code for this (sense, polarity) — integrate directly
+//   2. polarity mirror: negated opposite-polarity cache, tight bracket
+//   3. physics seed (caller-supplied predicted voltage + bracket)
+//   4. cold fallback: full-range search (AAF-reset variant at high R_ref)
+// Every successful search caches its converged code. Returns NAN on failure.
 double measureSenseVolts(const OhmsMeasApi& api, int cycles, bool* outOverflow,
-                         int senseIdx, int polIdx) {
+                         int senseIdx, int polIdx,
+                         double seedVolts, int32_t seedHalfBracket, double rRef) {
   if (outOverflow) *outOverflow = false;
 
-  // Cache hit: pre-set DAC, integrate directly. If overflow, the cached
-  // code is stale (Vx drifted out of the preamp linear range); invalidate
-  // and fall through to the BinSrch path.
-  if (s_dacCacheValid[senseIdx][polIdx]) {
-    api.setDacCode(s_dacCache[senseIdx][polIdx]);
+  // Integrate at the current DAC code; cache it on success. (Recovery from
+  // the static dwells around the search — DAC settle, channel switch — is the
+  // runChopCycles adapter's flush cycles, not a delay here: at high source
+  // impedance the node only re-centers *while chopping*.)
+  auto integrateAndCache = [&](double& out) -> bool {
     bool ovf = false;
     double adcMean = api.runChopCycles(cycles, &ovf);
-    if (!ovf) {
-      double vdac  = api.getCurrentDacVoltage();
-      double delta = adcMean * api.adcLsbV / api.preampGain;
-      return vdac + delta;
+    if (ovf) return false;
+    s_dacCache[senseIdx][polIdx]      = api.getCurrentDacCode();
+    s_dacCacheValid[senseIdx][polIdx] = true;
+    out = api.getCurrentDacVoltage() + adcMean * api.adcLsbV / api.preampGain;
+    return true;
+  };
+  double result;
+
+  // 1. Cache hit: pre-set DAC, integrate directly. If overflow, the cached
+  // code is stale (Vx drifted out of the preamp linear range); invalidate
+  // and fall down the ladder.
+  if (s_dacCacheValid[senseIdx][polIdx]) {
+    api.setDacCode(s_dacCache[senseIdx][polIdx]);
+    if (integrateAndCache(result)) return result;
+    s_dacCacheValid[senseIdx][polIdx] = false;
+  }
+
+  // 2. Polarity mirror: Vx(−pol) ≈ −Vx(+pol) (thermal EMF asymmetry is
+  // sub-code), so the opposite polarity's converged code negated is a
+  // near-exact seed.
+  const int oppPol = 1 - polIdx;
+  if (s_dacCacheValid[senseIdx][oppPol]) {
+    int32_t mirror = -(int32_t)s_dacCache[senseIdx][oppPol];
+    if (mirror > 32767) mirror = 32767;   // -(-32768)
+    if (api.binarySearchDacSeeded((int16_t)mirror, kMirrorHalfBracket) &&
+        integrateAndCache(result)) {
+      return result;
     }
-    s_dacCacheValid[senseIdx][polIdx] = false;  // stale; fall back to BinSrch
   }
 
-  // Cache miss (or no cache yet): full BinSrch, then cache the result.
-  if (!api.binarySearchDac()) {
+  // 3. Physics seed from the caller (predicted node voltage).
+  if (isfinite(seedVolts) && seedHalfBracket > 0) {
+    if (api.binarySearchDacSeeded(api.dacVoltsToCode(seedVolts), seedHalfBracket) &&
+        integrateAndCache(result)) {
+      return result;
+    }
+  }
+
+  // 4. Cold full-range fallback. At high R_ref use the seeded entry point for
+  // its GND+null AAF reset — plain full-range bisection cannot converge there
+  // (cumulative AAF saturation; see OhmsMeasurement.md "r5 high-ρ limit").
+  const bool ok = (rRef >= kHighRrefOhms)
+      ? api.binarySearchDacSeeded(0, 65536)
+      : api.binarySearchDac();
+  if (!ok || !integrateAndCache(result)) {
     if (outOverflow) *outOverflow = true;
     return NAN;
   }
-  bool ovf = false;
-  double adcMean = api.runChopCycles(cycles, &ovf);
-  if (ovf) {
-    if (outOverflow) *outOverflow = true;
-    return NAN;
-  }
-  s_dacCache[senseIdx][polIdx]      = api.getCurrentDacCode();
-  s_dacCacheValid[senseIdx][polIdx] = true;
-
-  double vdac  = api.getCurrentDacVoltage();
-  double delta = adcMean * api.adcLsbV / api.preampGain;
-  return vdac + delta;
+  return result;
 }
 
 // SI-prefix print with `sigDigits` significant digits regardless of unit.
@@ -184,6 +257,17 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
     return;
   }
 
+  // Pre-flight stability check when the operator told us the DUT size.
+  if (cfg.nominalOhms > 0.0) {
+    const double zSrc = rRef * cfg.nominalOhms / (rRef + cfg.nominalOhms);
+    if (zSrc > kZsrcStabilityOhms) {
+      io.println(F("WARNING: R_ref ∥ R_dut(nominal) exceeds the ~25 kΩ front-end stability"));
+      io.println(F("         ceiling — the preamp limit-cycles at this source impedance and"));
+      io.println(F("         the Vx3 search will not converge. Use a smaller R_ref: r4 (20 kΩ)"));
+      io.println(F("         keeps R_ref ∥ R_dut < 20 kΩ for ANY DUT. Proceeding anyway..."));
+    }
+  }
+
   // Select excitation magnitude: --exc override wins over auto-select.
   bool lowExc;
   if      (cfg.excOverride == 1) lowExc = true;
@@ -208,6 +292,7 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
   io.print(F("  V_exc=")); io.print(lowExc ? F("1.0 V") : F("2.5 V"));
   if (cfg.excOverride) io.print(F(" [forced]"));
   io.print(F("  cycles=")); io.print(cfg.cycles);
+  if (cfg.nominalOhms > 0.0) { io.print(F("  nominal=")); printOhms(io, cfg.nominalOhms, 4); }
   if (!cfg.emfCancel) io.print(F("  [no EMF cancel]"));
   if (cfg.repeats > 1) { io.print(F("  repeat=")); io.print(cfg.repeats); }
   io.println();
@@ -239,14 +324,49 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
     for (int p = 0; p < polCount && !aborted; ++p) {
       api.setExcitationPolarity(polVal[p]);
       delay(kPolaritySettleMs);
-      for (int s = 0; s < kSenseCount; ++s) {
+      const double polSign = polVal[p] ? 1.0 : -1.0;
+      for (int k = 0; k < kSenseCount; ++k) {
+        const int s = kAcqOrder[k];   // Vx4, Vx2, then Vx3 (see kAcqOrder)
         api.selectSense((uint8_t)s);
+
+        // Physics seed for the ladder in measureSenseVolts (rung 3).
+        double  seedV  = NAN;
+        int32_t halfBr = 0;
+        if (s == 1) {                 // Vx4: DUT low Kelvin ≈ ground
+          seedV  = 0.0;
+          halfBr = kVx4HalfBracket;
+        } else if (s == 2) {          // Vx2: R_ref top ≈ ±V_exc (SW1 drop is µV)
+          seedV  = polSign * (lowExc ? 1.0 : 2.5);
+          halfBr = kVx2HalfBracket;
+        } else if (cfg.nominalOhms > 0.0 &&
+                   isfinite(v[1][p]) && isfinite(v[2][p])) {
+          // Vx3 from the divider: Vx3 = Vx4 + (Vx2−Vx4)·R_dut/(R_ref+R_dut),
+          // with this polarity's measured Vx2/Vx4 and the user's nominal R_dut.
+          // Bracket spans the divider evaluated at R_nom×[0.7, 1.4] + margin.
+          const double vx4  = v[1][p], vx2 = v[2][p];
+          const double rN   = cfg.nominalOhms;
+          const double frac   = rN / (rRef + rN);
+          const double fracLo = (0.7 * rN) / (rRef + 0.7 * rN);
+          const double fracHi = (1.4 * rN) / (rRef + 1.4 * rN);
+          seedV  = vx4 + (vx2 - vx4) * frac;
+          halfBr = (int32_t)(fabs(vx2 - vx4) * (fracHi - fracLo) * 0.5 / api.dacLsbV) + 64;
+        }
+
         bool ovf = false;
-        double vs = measureSenseVolts(api, thisCycles, &ovf, s, p);
+        double vs = measureSenseVolts(api, thisCycles, &ovf, s, p, seedV, halfBr, rRef);
         if (ovf || !isfinite(vs)) {
           if (!verbose) { io.print(F("  run ")); io.print(rep + 1); io.print(F(": ")); }
           io.print(kSenseName[s]); io.print(F(" @ pol ")); io.print(polVal[p] ? '+' : '-');
           io.println(F(": MEASUREMENT FAILED (preamp railed or BinSrch fail)."));
+          if (s == 0 && rRef >= kHighRrefOhms) {
+            io.println(F("  note: Vx3 failure at high R_ref usually means R_ref ∥ R_dut exceeds the"));
+            io.println(F("  ~25 kΩ front-end stability ceiling — switch to a smaller R_ref (r4 = 20 kΩ"));
+            io.println(F("  works for any DUT; ρ > 1 costs noise, not validity)."));
+            if (cfg.nominalOhms <= 0.0) {
+              io.println(F("  Supplying --nominal <approx DUT ohms> seeds the search and enables the"));
+              io.println(F("  stability pre-flight check."));
+            }
+          }
           aborted = true;
           break;
         }

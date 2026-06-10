@@ -1315,6 +1315,48 @@ bool readSettledSample(int32_t &sample) {
   return ok;
 }
 
+// DAC code that nulls the GND channel (≈ code 2: signal-chain offset only).
+// Written by performAutoZero() on its first full search and reused both there
+// and by the AAF reset below. Invalidated when an AZ integration overflows.
+static int16_t g_azNullCode  = 0;
+static bool    g_azNullValid = false;
+
+// AAF reset through the preamp's *linear region*: park the input mux on GND
+// with the DAC at the autozero null, so the preamp output actively drives the
+// 47 nF AAF cap back to ~0 V with a clean exponential. This is fundamentally
+// different from the TMUX-disconnect discharge used in the DRDY-timeout
+// recovery tiers: there the preamp input floats and the output has to drift
+// out of supply-rail saturation through its long non-exponential recovery
+// tail. Restores the caller's input channel before returning; the DAC is left
+// at the null code (caller sets its next probe code itself).
+static constexpr uint32_t AAF_RESET_PARK_MS   = 120;  // GND+null park: preamp desaturation + AAF discharge
+static constexpr uint32_t AAF_RESET_RESUME_MS = 80;   // post-park DAC Bessel coarse settle before probing (mV-scale suffices)
+
+// Flush chop pairs before each probe decision (gndDischarge mode). At high
+// source impedance the sense node slews between phase-dependent bias-current
+// equilibria (shift ≈ IB × Z_src, τ = Z_src × C_in); it only holds an
+// in-window operating point *while chopping at normal cadence*. Any static
+// dwell (park recovery, a long settle) walks the node to a single-phase
+// equilibrium that can sit outside the window even at the correct DAC code —
+// bench at r5 + 100 kΩ: readings diverged from soft to hard rail the longer
+// the probe waited. So: never dwell; flush at cadence, decide on the last pair.
+static constexpr int BS_FLUSH_PAIRS       = 3;
+static constexpr int BS_FINAL_FLUSH_PAIRS = 6;  // extended flush for the last-chance straddle probe
+
+// 24-bit code rails: a hard-clipped sample means the modulator is pegged
+// (preamp truly railed); an overflow short of the code rail means the chain
+// is inside the rails (settling, or just past the 90 % threshold). Used for
+// dacsweep flagging.
+static constexpr int32_t ADC_CODE_RAIL = 8388600;
+static bool isHardClip(int32_t s) { return s >= ADC_CODE_RAIL || s <= -ADC_CODE_RAIL; }
+static void aafGndNullPark(uint32_t parkMs) {
+  const InputChannel savedCh = inputMux.current();
+  inputMux.select(InputChannel::GND);
+  dac.setCodeFast(g_azNullValid ? g_azNullCode : 0);  // true null is ~2 codes; 0 is inside the ±8-code window
+  delay(parkMs);
+  inputMux.select(savedCh);
+}
+
 /**
  * Binary search to find DAC code that brings ADC into range.
  * Returns true if successful, false if unable to find valid code.
@@ -1351,11 +1393,30 @@ bool readSettledSample(int32_t &sample) {
  * bisection then mops up. Collapses the near-edge case (e.g. zero-cal, Vx≈0)
  * from ~16 rail-bisection iterations to ~3.
  *
- * Full 16-bit search range. INL table holds cardinals at 14-bit-aligned codes
- * (+ the 32767 slot); voltages at unaligned codes are linear interpolations.
+ * INL table holds cardinals at 14-bit-aligned codes (+ the 32767 slot);
+ * voltages at unaligned codes are linear interpolations.
+ *
+ * Seeded variant: bisection restricted to [seed−halfBracket, seed+halfBracket]
+ * (clamped to int16 range); the first probe is the seed itself. With
+ * gndDischarge=true, every probe that follows a railed/timed-out probe is
+ * preceded by aafGndNullPark() — the preamp never accumulates rail saturation
+ * across probes, which is the mechanism that defeats full-range bisection in
+ * ohms mode at high R_ref (see OhmsMeasurement.md "r5 high-ρ limit"). In
+ * discharge mode probes use setCodeFast + AAF_RESET_RESUME_MS instead of
+ * setCode's µV-precision settle: probing needs only mV-scale DAC accuracy and
+ * the shorter slew bounds per-probe rail exposure.
+ *
+ * binarySearchDAC() = full range, no discharge — behavior identical to before
+ * the refactor (first probe at code 0, as (−32768+32767)/2 truncates to 0).
  */
-bool binarySearchDAC() {
-  if (g_debugDac) Serial.println("DAC: Starting binary search (chopped, full 16-bit)...");
+bool binarySearchDACSeeded(int16_t seedCode, int32_t halfBracket, bool gndDischarge) {
+  if (g_debugDac) {
+    Serial.print("DAC: Starting binary search (chopped, seed=");
+    Serial.print(seedCode);
+    Serial.print(" halfBracket="); Serial.print(halfBracket);
+    Serial.print(gndDischarge ? ", GND+null AAF reset)..." : ")...");
+    Serial.println();
+  }
 
   // Defensive LPSPI4 full reset before BinSrch does its many SPI reads.
   // Symptom: first lpspi4_xfer in the 2nd BinSrch (post-POST) times out with
@@ -1381,8 +1442,10 @@ bool binarySearchDAC() {
     chopper.toggle();
   }
 
-  int32_t low  = -32768;
-  int32_t high =  32767;
+  int32_t low  = (int32_t)seedCode - halfBracket;
+  int32_t high = (int32_t)seedCode + halfBracket;
+  if (low  < -32768) low  = -32768;
+  if (high >  32767) high =  32767;
   int32_t bestMid = 0;
   uint64_t bestAbsDemod = UINT64_MAX;
   bool foundInRange = false;
@@ -1431,13 +1494,16 @@ bool binarySearchDAC() {
 
     // DRDY-timeout recovery: a plain delay doesn't work — the DAC is still at
     // the test code that's driving the preamp into rail, so the AAF stays
-    // saturated for as long as we wait. To actually discharge it: disconnect
-    // the preamp input (TMUX_EN HIGH) and park the DAC at 0, so the preamp
-    // output drifts to quiescent (~0 V) and the AAF can settle. Then restore
-    // both, brief settle, retry.
+    // saturated for as long as we wait. Recovery is the GND+null park (see
+    // aafGndNullPark): input mux to GND, DAC at the autozero null, so the
+    // preamp sits *in its linear region actively driving* the AAF back to
+    // ~0 V. (The previous scheme — TMUX disconnect + DAC=0 — left the preamp
+    // input floating and relied on the output drifting out of supply-rail
+    // saturation, which has a long non-exponential tail.)
     const int16_t savedDac = dac.currentCode();
-    digitalWriteFast(PIN_TMUX_EN, HIGH);   // disconnect preamp input
-    dac.setCode(0);                        // park DAC mid-scale
+    const InputChannel savedCh = inputMux.current();
+    inputMux.select(InputChannel::GND);
+    dac.setCodeFast(g_azNullValid ? g_azNullCode : 0);
 
     const uint32_t recoverSettleUs[3] = {150000, 400000, 1500000};
     constexpr int N_RETRIES = sizeof(recoverSettleUs) / sizeof(recoverSettleUs[0]);
@@ -1446,41 +1512,90 @@ bool binarySearchDAC() {
         Serial.print("    DRDY timeout — retry "); Serial.print(retry + 1);
         Serial.print('/'); Serial.print(N_RETRIES);
         Serial.print(" with "); Serial.print(recoverSettleUs[retry] / 1000);
-        Serial.println(" ms settle (TMUX_EN=HIGH, DAC=0 for active AAF discharge)");
+        Serial.println(" ms GND+null park (preamp linear, active AAF discharge)");
       }
       adc.stop();
       delayMicroseconds(recoverSettleUs[retry]);
-      // Re-engage preamp and restore the test DAC code, then read.
-      dac.setCode(savedDac);
-      digitalWriteFast(PIN_TMUX_EN, LOW);
-      delayMicroseconds(TMUX_RECONNECT_US);
+      // Restore sense channel + test DAC code, brief coarse settle, then read.
+      inputMux.select(savedCh);
+      dac.setCodeFast(savedDac);
+      delay(AAF_RESET_RESUME_MS);
       adc.start();
       out = acquireHalfCycle(samples);
       if (!(out.overflow && out.overflowSample == 0)) {
-        return true;  // recovered; preamp/DAC state already restored
+        return true;  // recovered; channel/DAC state already restored
       }
-      // Still timing out — disconnect again and try a longer delay.
-      digitalWriteFast(PIN_TMUX_EN, HIGH);
-      dac.setCode(0);
+      // Still timing out — park again and try a longer delay.
+      inputMux.select(InputChannel::GND);
+      dac.setCodeFast(g_azNullValid ? g_azNullCode : 0);
     }
     // All retries failed; restore state before bailing so caller's next
     // iteration sees a normal preamp + correct DAC code.
-    dac.setCode(savedDac);
-    digitalWriteFast(PIN_TMUX_EN, LOW);
+    inputMux.select(savedCh);
+    dac.setCodeFast(savedDac);
     return false;
   };
 
+  // Run N full chop pairs at normal cadence, tolerating overflow: pulls the
+  // high-Z sense node from wherever a static dwell (park, DAC slew) left it
+  // back to its chopping midpoint before the decision read. Returns false
+  // only on persistent DRDY timeout.
+  auto flushChopPairs = [&](int nPairs) -> bool {
+    for (int pair = 0; pair < nPairs; pair++) {
+      HalfCycleResult fA, fB;
+      if (!acquireWithRetry(phaseA, fA)) return false;
+      chopper.toggle();
+      const bool okB = acquireWithRetry(phaseB, fB);
+      chopper.toggle();
+      if (!okB) return false;
+    }
+    return true;
+  };
+
   const int MAX_ITERATIONS = 17;  // 16 halvings of 65536; +1 for margin
+  // Park once on cold entry only — the caller typically invokes a seeded
+  // search precisely because the preamp railed, and the AAF state is unknown.
+  // Never park mid-search: bench (r5 + 100 kΩ DUT) showed each GND park
+  // discharges the high-Z sense node, which then recharges through Z_src far
+  // slower than a probe lasts — every near-null reading rode a multi-mV
+  // recharge residual. (Vx4 ≈ GND and Vx2, low-Z, converged cleanly with the
+  // same parks; Vx3 failed at the very codes that straddle its null.) The
+  // far-from-seed probes give the entry park's residual ~1 s to die before
+  // the search reaches the near-null codes.
+  bool needAafReset = gndDischarge;
   int iter = 0;
   for (; iter < MAX_ITERATIONS; iter++) {
     int32_t mid;
-    if (predMidOverride != INT32_MIN) {
+    if (iter == 0) {
+      mid = seedCode;   // probe the seed itself first
+    } else if (predMidOverride != INT32_MIN) {
       mid = predMidOverride;
       predMidOverride = INT32_MIN;
     } else {
       mid = (low + high) / 2;
     }
-    dac.setCode((int16_t)mid);
+    if (gndDischarge) {
+      if (needAafReset) {
+        aafGndNullPark(AAF_RESET_PARK_MS);
+        needAafReset = false;
+      }
+      // setCodeFast + fixed coarse settle: probing needs only mV-scale DAC
+      // accuracy, and the shorter slew bounds per-probe rail exposure so the
+      // AAF never integrates deep into the rail between resets.
+      dac.setCodeFast((int16_t)mid);
+      delay(AAF_RESET_RESUME_MS);
+      // Re-establish the chopping midpoint before the decision read (see
+      // BS_FLUSH_PAIRS comment): both the park and the DAC slew are static
+      // dwells that displaced the high-Z sense node.
+      if (!flushChopPairs(BS_FLUSH_PAIRS)) {
+        Serial.print("DAC: BinSrch bail at iter "); Serial.print(iter);
+        Serial.print(" DAC="); Serial.print(mid);
+        Serial.println(" (persistent DRDY timeout during flush pairs)");
+        break;
+      }
+    } else {
+      dac.setCode((int16_t)mid);
+    }
 
     // Phase A: chopper LOW, ADC reads (Vx − Vdac) × G + offset
     HalfCycleResult rA;
@@ -1491,7 +1606,8 @@ bool binarySearchDAC() {
       break;
     }
     if (rA.overflow) {
-      // Real rail saturation: overflowSample is the saturated value (±FS).
+      // Rail: overflowSample is the saturated value. No park (see the
+      // needAafReset note above); the flush pairs keep the chain exercised.
       if (rA.overflowSample > 0) low  = mid + 1;
       else                       high = mid - 1;
       if (g_debugDac) {
@@ -1515,7 +1631,8 @@ bool binarySearchDAC() {
       break;
     }
     if (rB.overflow) {
-      // Phase B sign is inverted: sample > 0 ⇒ Vdac > Vx ⇒ bisect down
+      // Phase B sign is inverted: sample > 0 ⇒ Vdac > Vx ⇒ bisect down.
+      // No park here either (see needAafReset note).
       if (rB.overflowSample > 0) high = mid - 1;
       else                       low  = mid + 1;
       if (g_debugDac) {
@@ -1567,6 +1684,36 @@ bool binarySearchDAC() {
     }
   }
 
+  if (!foundInRange && gndDischarge) {
+    // Bracket exhausted without an in-range read — the bisection straddled
+    // the null on dwell-displaced readings. Last chance: sit at the straddle
+    // code and chop at cadence long enough for the node to find its chopping
+    // midpoint, then take a normal decision pair. No park, no static dwell —
+    // those are what displaced the node in the first place.
+    int32_t cand = (low + high) / 2;   // brackets crossed: between them lies the null
+    if (cand < -32768) cand = -32768;
+    if (cand >  32767) cand =  32767;
+    if (g_debugDac) {
+      Serial.print("DAC: bracket exhausted — final cadence probe at ");
+      Serial.println(cand);
+    }
+    dac.setCodeFast((int16_t)cand);
+    delay(AAF_RESET_RESUME_MS);
+    if (flushChopPairs(BS_FINAL_FLUSH_PAIRS)) {
+      HalfCycleResult rA, rB;
+      if (acquireWithRetry(phaseA, rA) && !rA.overflow) {
+        chopper.toggle();
+        const bool okB = acquireWithRetry(phaseB, rB) && !rB.overflow;
+        chopper.toggle();
+        if (okB) {
+          foundInRange = true;
+          bestMid = cand;
+          if (g_debugDac) Serial.println("DAC: final probe in range — accepting straddle code");
+        }
+      }
+    }
+  }
+
   if (foundInRange) {
     dac.setCode((int16_t)bestMid);
     if (g_debugDac) {
@@ -1581,6 +1728,12 @@ bool binarySearchDAC() {
 
   Serial.println("DAC: Binary search failed to converge!");
   return false;
+}
+
+// Full-range search, no AAF discharge — the pre-refactor behavior, used by
+// voltage mode (POST, autozero, channel changes, chop-overflow recovery).
+bool binarySearchDAC() {
+  return binarySearchDACSeeded(0, 65536, false);
 }
 
 // ================== AdcDriver method implementations ==================
@@ -2403,6 +2556,9 @@ void printHelp() {
   Serial.println("label <ch>             Show label for channel");
   Serial.println("label reset            Clear all labels and save to flash");
   Serial.println("hold a|b               Force chopper state for scope probing (any key to exit)");
+  Serial.println("dacsweep <ch> <a> <b> [step] [pairs] [settleUs]  Sweep DAC codes, print per-code chop readings");
+  Serial.println("                       (a==b: time-series mode; settleUs probes the static transfer)");
+  Serial.println("dacset <code>          Raw DAC set (no restore) for scope work with hold");
   Serial.println("debug [on|off]         Toggle binary-search trace prints (default off)");
   Serial.println("help                   Show this help");
   Serial.println("=======================\n");
@@ -2603,6 +2759,13 @@ void processCommand(char* line) {
     cmdRref(arg1);
   } else if (strcasecmp(cmd, "ohms") == 0) {
     cmdOhms(arg1, arg2);
+  } else if (strcasecmp(cmd, "dacsweep") == 0) {
+    const char* arg4 = strtok(NULL, " \t");   // optional stepCodes
+    const char* arg5 = strtok(NULL, " \t");   // optional pairs/code
+    const char* arg6 = strtok(NULL, " \t");   // optional settleUs per half
+    cmdDacSweep(arg1, arg2, arg3, arg4, arg5, arg6);
+  } else if (strcasecmp(cmd, "dacset") == 0) {
+    cmdDacSet(arg1);
   } else if (strcasecmp(cmd, "label") == 0) {
     cmdLabel(arg1, arg2);
   } else if (strcasecmp(cmd, "hold") == 0) {
@@ -2963,6 +3126,10 @@ bool postTestSignalChain() {
     return false;
   }
   s_postZeroDac = dac.currentCode();
+  // Same null also seeds the AZ/AAF-reset cache, so aafGndNullPark() and the
+  // first performAutoZero() have a valid park code right after POST.
+  g_azNullCode  = s_postZeroDac;
+  g_azNullValid = true;
 
   // At the null, the demodulated reading should be near zero.
   const double demod = measureDemodMean(5);
@@ -3774,18 +3941,18 @@ void performAutoZero() {
   // channel, which leaks per-AZ-block transients into subsequent readings.
   // First AZ after boot (or after an overflow invalidates the cache) does
   // the full search; thereafter we just slam the cached code in one step.
-  static int16_t s_azNullCached = 0;
-  static bool    s_azNullValid  = false;
-  if (s_azNullValid) {
-    dac.setCode(s_azNullCached);
+  // (Cache lives at file scope — g_azNullCode — because aafGndNullPark()
+  // reuses it as the linear-region park code for AAF discharge.)
+  if (g_azNullValid) {
+    dac.setCode(g_azNullCode);
   } else {
     dac.setCode(0);
     if (!binarySearchDAC()) {
       Serial.println("WARNING: AZ binary search failed; cache not updated.");
       return;
     }
-    s_azNullCached = dac.currentCode();
-    s_azNullValid  = true;
+    g_azNullCode  = dac.currentCode();
+    g_azNullValid = true;
   }
 
   // Take two independent AUTOZERO_CYCLES accumulations; their spread is the repeatability sdev.
@@ -3797,7 +3964,7 @@ void performAutoZero() {
     for (int i = 0; i < AUTOZERO_CYCLES; i++) {
       if (!runOneChopCycle(gndStats, buffA, buffB, false)) {
         Serial.println("WARNING: Overflow during auto-zero (invalidating null cache).");
-        s_azNullValid = false;  // next AZ will re-search
+        g_azNullValid = false;  // next AZ will re-search
         return;
       }
     }
@@ -4552,7 +4719,32 @@ static bool ohmsAdapter_binarySearchDac() {
   return tryBinarySearchWithBackoff();
 }
 
+// Seeded search with GND+null AAF reset between railed probes — the variant
+// that converges at high R_ref where plain full-range bisection cannot.
+static bool ohmsAdapter_binarySearchDacSeeded(int16_t seedCode, int32_t halfBracket) {
+  return binarySearchDACSeeded(seedCode, halfBracket, /*gndDischarge=*/true);
+}
+
+// Nominal-LSB inversion; INL-level accuracy is irrelevant at bracket scale.
+static int16_t ohmsAdapter_dacVoltsToCode(double v) {
+  long code = lround(v / DAC_LSB_V);
+  if (code < -32768) code = -32768;
+  if (code >  32767) code =  32767;
+  return (int16_t)code;
+}
+
 static double ohmsAdapter_runChop(int nCycles, bool* overflow) {
+  // Flush cycles: the integration follows a static dwell (BinSrch hand-off
+  // ends with a full setCode settle; cache hits with a channel switch). At
+  // high source impedance the sense node sits at a bias-current-displaced
+  // point after any dwell and only re-centers while chopping (see
+  // BS_FLUSH_PAIRS in the .ino) — tolerate overflow for a few cycles instead
+  // of letting one early overflow abort the whole integration.
+  LowerMoments flushStats;
+  int32_t fA[MAX_SAMPLES], fB[MAX_SAMPLES];
+  for (int i = 0; i < 3; i++) {
+    (void)runOneChopCycle(flushStats, fA, fB, false);
+  }
   double mean = measureDemodMean(nCycles);
   if (isnan(mean)) { if (overflow) *overflow = true; return 0.0; }
   if (overflow) *overflow = false;
@@ -4718,6 +4910,152 @@ void cmdOhms(const char* arg1, const char* arg2) {
   Serial.println("Usage: ohms | ohms pol +|- | ohms exc 1|2.5");
 }
 
+/**
+ * `dacsweep <channel> <startCode> <endCode> [stepCodes] [pairs] [settleUs]`
+ *
+ * Diagnostic: walk the DAC across a code range at the given input channel and
+ * print the Phase A / Phase B readings at chop cadence — `pairs` chop pairs
+ * per code (default 3; the first pairs flush, the last is printed), no parks.
+ * This shows the chop-demod linear window as the search actually experiences
+ * it (width, center, soft-rail behavior, hysteresis between adjacent codes).
+ *
+ * `settleUs` overrides the per-half-cycle settle (default CHOP_SETTLE_US =
+ * 10 ms; max 1 s). Long settles probe the *static* per-phase transfer: at
+ * high source impedance the node needs ~3–5 τ (τ = Z_src × C_in) to reach its
+ * bias-current equilibrium, revealing the two phase-offset static windows
+ * that the normal cadence turns into a chop-synchronous limit cycle.
+ *
+ * Single-code time-series mode: when startCode == endCode, EVERY pair is
+ * printed with its index — a time evolution at one code, for separating
+ * static signal from settling/oscillation (e.g. `dacsweep vx3 10904 10904 1 40`).
+ *
+ * For a Kelvin-sense sweep in ohms mode, set up excitation manually first:
+ *   ohms exc 2.5
+ *   ohms pol +
+ *   dacsweep vx3 10880 10930 1
+ *
+ * Output per code: code, PhaseA, PhaseB (mean of the in-range samples, or the
+ * overflow sample flagged R=hard code rail / o=soft overflow / T=DRDY
+ * timeout), and demod=sumA−sumB when both phases are in range.
+ * Any serial input aborts the sweep. Channel and DAC are restored on exit.
+ */
+void cmdDacSweep(const char* chName, const char* startStr, const char* endStr,
+                 const char* stepStr, const char* pairsStr, const char* settleStr) {
+  InputChannel ch;
+  if (!chName || !startStr || !endStr || !parseChannelName(chName, ch)) {
+    Serial.println("Usage: dacsweep <channel> <startCode> <endCode> [stepCodes] [pairs] [settleUs]");
+    Serial.println("       channels: Vx1, GND, VrefRaw, Vx2-Vx5, HVDiv");
+    return;
+  }
+  long start = atol(startStr);
+  long end   = atol(endStr);
+  long step  = stepStr ? atol(stepStr) : 1;
+  if (step <= 0) step = 1;
+  long nPairs = pairsStr ? atol(pairsStr) : 3;
+  if (nPairs < 1)   nPairs = 1;
+  if (nPairs > 200) nPairs = 200;
+  long settleUs = settleStr ? atol(settleStr) : (long)CHOP_SETTLE_US;
+  if (settleUs < 1000)    settleUs = 1000;
+  if (settleUs > 1000000) settleUs = 1000000;
+  if (start > end) { long t = start; start = end; end = t; }
+  if (start < -32768) start = -32768;
+  if (end   >  32767) end   =  32767;
+  if ((end - start) / step + 1 > 500) {
+    Serial.println("ERROR: more than 500 points; increase stepCodes.");
+    return;
+  }
+
+  ScopedInstrumentState guard;   // restores channel + DAC on scope exit
+  inputMux.select(ch);
+  digitalWriteFast(PIN_TMUX_EN, LOW);
+  if (chopper.state()) chopper.toggle();   // Phase A = chopper LOW
+
+  const bool timeSeries = (start == end);
+  Serial.print("dacsweep: ch="); Serial.print(getChannelShortName(ch));
+  Serial.print("  codes "); Serial.print(start);
+  Serial.print(".."); Serial.print(end);
+  Serial.print(" step "); Serial.print(step);
+  Serial.print("  pairs/code "); Serial.print(nPairs);
+  Serial.print("  settle "); Serial.print(settleUs / 1000); Serial.print(" ms/half");
+  if (timeSeries) Serial.print("  [time-series: every pair printed]");
+  Serial.println("  (any key aborts)");
+  Serial.println("  code  |  PhaseA  |  PhaseB  |  demod");
+
+  int32_t bufA[MAX_SAMPLES], bufB[MAX_SAMPLES];
+  const int N = g_good_samples;
+
+  auto half = [&](int32_t* buf, HalfCycleResult& r) {
+    adc.stop();
+    delayMicroseconds((uint32_t)settleUs);
+    adc.start();
+    r = acquireHalfCycle(buf);
+  };
+  auto printPhase = [&](const HalfCycleResult& r, const int32_t* buf) {
+    if (r.overflow) {
+      Serial.print(r.overflowSample);
+      if (r.overflowSample == 0)               Serial.print('T');
+      else if (isHardClip(r.overflowSample))   Serial.print('R');
+      else                                     Serial.print('o');
+    } else {
+      int64_t sum = 0;
+      for (int i = 0; i < N; i++) sum += buf[i];
+      Serial.print((long)(sum / N));
+    }
+  };
+
+  for (long code = start; code <= end; code += step) {
+    if (Serial.available()) {
+      Serial.read();
+      Serial.println("dacsweep: aborted.");
+      break;
+    }
+    dac.setCodeFast((int16_t)code);
+    delay(30);   // coarse DAC settle only; stay near chop cadence
+
+    for (long p = 0; p < nPairs; p++) {
+      HalfCycleResult rA, rB;
+      half(bufA, rA);
+      chopper.toggle();
+      half(bufB, rB);
+      chopper.toggle();
+
+      // Normal sweep: first pairs are silent flushes, last pair is printed.
+      // Time-series mode: every pair is printed with its index.
+      if (!timeSeries && p < nPairs - 1) continue;
+      Serial.print("  "); Serial.print(code);
+      if (timeSeries) { Serial.print(" #"); Serial.print(p); }
+      Serial.print("  ");
+      printPhase(rA, bufA); Serial.print("  ");
+      printPhase(rB, bufB);
+      if (!rA.overflow && !rB.overflow) {
+        int64_t sumA = 0, sumB = 0;
+        for (int i = 0; i < N; i++) { sumA += bufA[i]; sumB += bufB[i]; }
+        Serial.print("  demod="); Serial.print((long)(sumA - sumB));
+      }
+      Serial.println();
+    }
+  }
+}
+
+/**
+ * `dacset <code>` — raw DAC set for bench work: scope probing with `hold`,
+ * manual exploration of the chop window. Full setCode settle. Deliberately
+ * NOT restored on exit — subsequent commands and the chop loop proceed from
+ * this code (stop scanning first or the auto-BinSrch will move it back).
+ */
+void cmdDacSet(const char* codeStr) {
+  if (!codeStr) { Serial.println("Usage: dacset <code>  (-32768..32767)"); return; }
+  long code = atol(codeStr);
+  if (code < -32768 || code > 32767) {
+    Serial.println("ERROR: code out of range (-32768..32767).");
+    return;
+  }
+  dac.setCode((int16_t)code);
+  Serial.print("dacset: code "); Serial.print(code);
+  Serial.print(" = "); Serial.print(dacCalTable.codeToVoltage((int16_t)code), 7);
+  Serial.println(" V");
+}
+
 // `meas [r] [--cycles N] [--no-emf-cancel] [--repeat N] [--exc 1|2.5]`
 // — dispatches to OhmsMeas. `r` subcommand is optional (bare `meas` is the
 // same as `meas r`). R_ref is selected ahead of time via the `rref` CLI.
@@ -4729,17 +5067,19 @@ void cmdMeas(int argc, const char* const* argv) {
     skipArgs = 1;
   } else if (argc >= 1 && argv[0] && argv[0][0] != '-') {
     Serial.print("Unknown meas subcommand: "); Serial.println(argv[0]);
-    Serial.println("Usage: meas [r] [--cycles N] [--no-emf-cancel] [--repeat N] [--exc 1|2.5]");
+    Serial.println("Usage: meas [r] [--cycles N] [--no-emf-cancel] [--repeat N] [--exc 1|2.5] [--nominal R]");
     return;
   }
 
   ScopedInstrumentState guard;     // restores channel + DAC on scope exit
   OhmsMeasApi api = {
     ohmsAdapter_binarySearchDac,
+    ohmsAdapter_binarySearchDacSeeded,
     ohmsAdapter_runChop,
     ohmsAdapter_currentDacVoltage,
     ohmsAdapter_setDacCode,
     ohmsAdapter_getCurrentDacCode,
+    ohmsAdapter_dacVoltsToCode,
     ohmsAdapter_selectSense,
     ohmsAdapter_setPolarity,
     ohmsAdapter_setExcVoltage,
@@ -5656,11 +5996,42 @@ void demodulate(LowerMoments& stats, int32_t *phaseA, int32_t *phaseB) {
 static int s_bsFailStreak = 0;
 static constexpr int BS_FAIL_STREAK_LIMIT = 3;
 
+// While in failure-streak suppression mode (input disconnected, or rails
+// persistent), the chop loop would otherwise hot-print "overflow" + "BinSrch
+// suppressed" pairs every ~17 ms. Throttle the suppression message to a
+// once-every-5-s reminder so the serial log stays readable.
+static uint32_t s_lastSuppressedPrintMs = 0;
+static constexpr uint32_t SUPPRESSED_PRINT_THROTTLE_MS = 5000;
+// Slow the chop loop while suppressed so we're not burning ADC + serial
+// bandwidth waiting for a reconnect.
+static constexpr uint32_t SUPPRESSED_LOOP_DELAY_MS = 250;
+// While suppressed, try a fresh BinSrch every this many ms — once the input
+// is reconnected, the retry succeeds and we re-center the DAC. Without this
+// the DAC stays parked at the rail where the last failure left it, every
+// chop cycle keeps overflowing, and s_bsFailStreak never gets cleared.
+static uint32_t s_suppressedRetryMs = 0;
+static constexpr uint32_t SUPPRESSED_RETRY_INTERVAL_MS = 3000;
+
 static bool tryBinarySearchWithBackoff() {
   if (s_bsFailStreak >= BS_FAIL_STREAK_LIMIT) {
-    Serial.print("DAC: BinSrch suppressed (");
-    Serial.print(s_bsFailStreak);
-    Serial.println(" consecutive failures); waiting for an in-range chop cycle to reset");
+    const uint32_t nowMs = millis();
+    // Periodic retry: this is the only path back from suppression. A successful
+    // chop cycle cannot reset the streak by itself because the DAC stays
+    // stranded at the rail until BinSrch repositions it.
+    if (nowMs - s_suppressedRetryMs >= SUPPRESSED_RETRY_INTERVAL_MS) {
+      s_suppressedRetryMs = nowMs;
+      if (binarySearchDAC()) {
+        Serial.println("DAC: BinSrch recovered during suppression — input back in range");
+        s_bsFailStreak = 0;
+        return true;
+      }
+    }
+    if (nowMs - s_lastSuppressedPrintMs >= SUPPRESSED_PRINT_THROTTLE_MS) {
+      Serial.print("DAC: BinSrch still suppressed (");
+      Serial.print(s_bsFailStreak);
+      Serial.println(" consecutive failures); input appears disconnected — auto-retrying every 3 s");
+      s_lastSuppressedPrintMs = nowMs;
+    }
     return false;
   }
   if (binarySearchDAC()) {
@@ -5671,7 +6042,9 @@ static bool tryBinarySearchWithBackoff() {
   if (s_bsFailStreak == BS_FAIL_STREAK_LIMIT) {
     Serial.print("DAC: BinSrch hit failure-streak limit (");
     Serial.print(BS_FAIL_STREAK_LIMIT);
-    Serial.println("); further auto-retries suppressed until an in-range cycle");
+    Serial.println("); further auto-retries throttled to every 3 s");
+    s_lastSuppressedPrintMs = millis();  // anchor the throttle window to the entry point
+    s_suppressedRetryMs = millis();      // first retry fires after SUPPRESSED_RETRY_INTERVAL_MS
   }
   return false;
 }
@@ -5688,19 +6061,27 @@ bool runOneChopCycle(LowerMoments &stats, int32_t* phaseA, int32_t* phaseB, bool
   HalfCycleResult resultA = acquireHalfCycle(phaseA);
 
   if (resultA.overflow) {
-    Serial.print("DAC: Phase A overflow (DAC=");
-    Serial.print(dac.currentCode());
-    Serial.print(" chopState="); Serial.print(chopper.state() ? 'B' : 'A');
-    Serial.print(" sample="); Serial.print(resultA.overflowSample);
-    Serial.println(")");
-    Serial.print("  post-overflow trace:");
-    for (int i = 0; i < 6; ++i) {
-      int32_t s;
-      if (!adc.readSample24(s)) break;
-      Serial.print(' '); Serial.print(s);
+    // When BinSrch has already given up (input disconnected, sustained rail),
+    // skip the overflow + trace prints; the throttled "BinSrch still suppressed"
+    // reminder is enough. Also slow the loop so we don't burn ~60 Hz of CPU
+    // and serial waiting for the input to come back.
+    const bool inSuppression = (s_bsFailStreak >= BS_FAIL_STREAK_LIMIT);
+    if (!inSuppression) {
+      Serial.print("DAC: Phase A overflow (DAC=");
+      Serial.print(dac.currentCode());
+      Serial.print(" chopState="); Serial.print(chopper.state() ? 'B' : 'A');
+      Serial.print(" sample="); Serial.print(resultA.overflowSample);
+      Serial.println(")");
+      Serial.print("  post-overflow trace:");
+      for (int i = 0; i < 6; ++i) {
+        int32_t s;
+        if (!adc.readSample24(s)) break;
+        Serial.print(' '); Serial.print(s);
+      }
+      Serial.println();
     }
-    Serial.println();
     if (searchOnOverflow) { tryBinarySearchWithBackoff(); stats.clear(); }
+    if (s_bsFailStreak >= BS_FAIL_STREAK_LIMIT) delay(SUPPRESSED_LOOP_DELAY_MS);
     return false;
   }
 
@@ -5716,28 +6097,33 @@ bool runOneChopCycle(LowerMoments &stats, int32_t* phaseA, int32_t* phaseB, bool
   HalfCycleResult resultB = acquireHalfCycle(phaseB);
 
   if (resultB.overflow) {
-    Serial.print("DAC: Phase B overflow (DAC=");
-    Serial.print(dac.currentCode());
-    Serial.print(" chopState="); Serial.print(chopper.state() ? 'B' : 'A');
-    Serial.print(" sample="); Serial.print(resultB.overflowSample);
-    Serial.println(")");
-    Serial.print("  post-overflow trace:");
-    for (int i = 0; i < 6; ++i) {
-      int32_t s;
-      if (!adc.readSample24(s)) break;
-      Serial.print(' '); Serial.print(s);
+    const bool inSuppression = (s_bsFailStreak >= BS_FAIL_STREAK_LIMIT);
+    if (!inSuppression) {
+      Serial.print("DAC: Phase B overflow (DAC=");
+      Serial.print(dac.currentCode());
+      Serial.print(" chopState="); Serial.print(chopper.state() ? 'B' : 'A');
+      Serial.print(" sample="); Serial.print(resultB.overflowSample);
+      Serial.println(")");
+      Serial.print("  post-overflow trace:");
+      for (int i = 0; i < 6; ++i) {
+        int32_t s;
+        if (!adc.readSample24(s)) break;
+        Serial.print(' '); Serial.print(s);
+      }
+      Serial.println();
     }
-    Serial.println();
     chopper.toggle();  // Return to original state
     if (searchOnOverflow) { tryBinarySearchWithBackoff(); stats.clear(); }
+    if (s_bsFailStreak >= BS_FAIL_STREAK_LIMIT) delay(SUPPRESSED_LOOP_DELAY_MS);
     return false;
   }
 
   chopper.toggle();
   demodulate(stats, phaseA, phaseB); // every buffer is used twice
-  // Successful chop cycle → DAC is centered on Vx, system is healthy.
-  // Reset the BinSrch failure streak so future overflow can re-invoke
-  // recovery if Vx drifts/changes again.
+  // Successful chop cycle → DAC is centered on Vx. Reset the BinSrch failure
+  // streak so future overflow can re-invoke recovery if Vx drifts/changes
+  // again. Recovery from suppression itself happens inside
+  // tryBinarySearchWithBackoff's periodic retry, not here.
   s_bsFailStreak = 0;
   return true;
 }

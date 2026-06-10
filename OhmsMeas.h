@@ -36,6 +36,15 @@ struct OhmsMeasApi {
   // the preamp into linear range. Returns true on success.
   bool   (*binarySearchDac)();
 
+  // Seeded variant: bisection restricted to [seed−halfBracket, seed+halfBracket]
+  // with proactive AAF reset (input mux → GND, DAC → autozero null) between
+  // railed probes. The reset keeps preamp rail saturation from accumulating
+  // across probes — the mechanism that defeats full-range BinSrch in ohms mode
+  // at high R_ref (OhmsMeasurement.md, "r5 high-ρ limit"). Use whenever the
+  // target voltage is predictable: cached/mirrored codes, V_exc-derived senses,
+  // or a --nominal DUT estimate.
+  bool   (*binarySearchDacSeeded)(int16_t seedCode, int32_t halfBracket);
+
   // Run `nCycles` chop cycles at the locked DAC code; returns the demodulated
   // mean in ADC counts. Sets *overflow=true if the preamp railed during the
   // integration; in that case the returned value is undefined.
@@ -52,6 +61,10 @@ struct OhmsMeasApi {
 
   // Read the current DAC code, for caching the BinSrch-converged value.
   int16_t (*getCurrentDacCode)();
+
+  // Convert a predicted input voltage to the nearest DAC code. Nominal-LSB
+  // inversion (no INL table) — seed accuracy is bracket-scale, not µV-scale.
+  int16_t (*dacVoltsToCode)(double v);
 
   // --- Mux selectors --------------------------------------------------------
 
@@ -83,7 +96,7 @@ struct OhmsMeasApi {
   // --- Constants for voltage arithmetic ------------------------------------
   double adcLsbV;       // ADC LSB in volts at the input
   double preampGain;    // AD8428 chain cumulative gain (~2000)
-  double dacLsbV;       // (not currently used; kept for parity with CalVerifyApi)
+  double dacLsbV;       // DAC LSB in volts; used to size seed brackets in codes
 
   // --- I/O -----------------------------------------------------------------
   Stream* io;
@@ -95,4 +108,6 @@ struct OhmsMeasApi {
 //   meas r --cycles 100
 //   meas r --no-emf-cancel
 //   meas r --cycles 100 --no-emf-cancel
+//   meas r --nominal 200k     (seeds the Vx3 search; needed for cold starts
+//                              at high R_ref, e.g. r5 + DUT ≥ ~100 kΩ)
 void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv);

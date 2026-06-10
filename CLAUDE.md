@@ -469,36 +469,36 @@ POST: ALL TESTS PASSED
 ## Ohms Mode — Manual R_ref
 
 Resistance is measured 4-wire-Kelvin against a physically-wired reference
-resistor (no mux). Eight color-coded references are available; swap the one
+resistor (no mux). Five color-coded references are available; swap the one
 you want into the socket and tell the firmware via `rref`.
 
 See [`OhmsMeasurement.md`](OhmsMeasurement.md) for the topology, the
 ratiometric formula, the DUT-range-vs-R_ref selection guide, and the
-practical caveats at the extreme ends of the range.
+practical caveats at the extreme ends of the range. Calibrated values
+live in `RREF_ALIASES[]` in the .ino — that table is the source of truth.
 
-| Alias | Color   | Ohms        |
-|-------|---------|-------------|
-| r1    | green   | 20.0069161  |
-| r2    | black   | 200.014860  |
-| r3    | yellow  | 2001.98758  |
-| r4    | white   | 19999.8705  |
-| r5    | blue    | 200035.097  |
-| r6    | red     | 1898381.80  |
-| r7    | clear   | 11018620.0  |
-| r8    | yellow2 | 4999.9945   |
+| Alias | Color  | Ohms (nominal) |
+|-------|--------|----------------|
+| r2    | black  | 200            |
+| r3    | yellow | 2k             |
+| r8    | green  | 5k             |
+| r4    | white  | 20k            |
+| r5    | blue   | 50k            |
 
 ```
 rref               -- show current selection
-rref list          -- show all aliases
+rref list          -- show all aliases (with calibrated values)
 rref r4            -- select by short alias
 rref white         -- select by color name (same resistor as r4)
 rref off           -- deselect (clears current R_ref)
 meas r             -- measure (uses current R_ref)
 meas r --cycles 200 --no-emf-cancel
+meas r --nominal 200k   -- seed the Vx3 search with a rough DUT value;
+                           needed for cold starts at high R_ref (r5 + DUT ≥ ~100 kΩ)
 ```
 
 Excitation voltage auto-selects: R_ref < 500 Ω uses the 1 V rail
-(banks r1, r2), all others use 2.5 V. Selection is not persisted across
+(bank r2), all others use 2.5 V. Selection is not persisted across
 reboots — re-issue `rref <alias>` after each power-on.
 
 ## RTS Detector
