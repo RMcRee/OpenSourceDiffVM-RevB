@@ -2475,6 +2475,14 @@ void printStatus() {
   Serial.print(scanner.channelEwma(0).window(), 1);
   Serial.println(" (equivalent SMA length)");
 
+  Serial.print("Demod rejection k: ");
+  Serial.print(g_demodRejKx10 / 10.0, 1);
+  Serial.print("  (rej ");
+  Serial.print((unsigned long)g_demodRejTotal);
+  Serial.print('/');
+  Serial.print((unsigned long)g_demodPairsTotal);
+  Serial.println(" cum)");
+
   if (scanner.autoZeroValid) {
     Serial.print("Auto-zero offset: ");
     Serial.print(scanner.autoZeroOffset * 1e9, 1);
@@ -3988,7 +3996,7 @@ void performAutoZero() {
 // Written by cmdConfigSave(), read by loadConfigFromEEPROM() at startup
 // and by cmdConfigLoad()/cmdConfigShow().
 
-static constexpr uint32_t EEPROM_MAGIC = 0xD1FF0002UL;  // "DIFF" v2 — adds ewmaWindow field
+static constexpr uint32_t EEPROM_MAGIC = 0xD1FF0003UL;  // "DIFF" v3 — adds demodRejKx10 field
 static constexpr int EEPROM_BASE_ADDR = 0;
 
 /**
@@ -4003,6 +4011,7 @@ struct SavedConfig {
   ScanConfig scanConfig;    // Full scan configuration (channels, integration, etc.)
   bool autoStart;           // If true, cmdScanStart() runs automatically in setup()
   DividerRatio dividerRatio;  // HV divider ratio setting to restore
+  int32_t demodRejKx10;     // Demod outlier rejection k ×10 (`drj` CLI); v3
   uint16_t checksum;        // CRC16 over all preceding fields
 };
 
@@ -5510,6 +5519,7 @@ void cmdConfigSave() {
   saved.scanConfig = scanner.config;
   saved.autoStart = configAutoStart;
   saved.dividerRatio = divMux.current();
+  saved.demodRejKx10 = g_demodRejKx10;
 
   // Compute checksum over everything except the checksum field itself
   saved.checksum = crc16((const uint8_t*)&saved, offsetof(SavedConfig, checksum));
@@ -5562,6 +5572,11 @@ void applyConfig(const SavedConfig &saved) {
     divMux.select(saved.dividerRatio);
   }
   scanner.setEwmaWindow(scanner.config.ewmaWindow);
+  // Same validity bound as the `drj` CLI (k >= 0.1); CRC already screens
+  // corruption, this just guards a hand-edited blob.
+  if (saved.demodRejKx10 >= 1) {
+    g_demodRejKx10 = saved.demodRejKx10;
+  }
 }
 
 void cmdConfigLoad() {
@@ -5590,6 +5605,7 @@ void cmdConfigFactory() {
   scanner.config.ewmaWindow = 10.0f;
   scanner.setEwmaWindow(10.0f);
   configAutoStart = false;
+  g_demodRejKx10 = 80;  // k = 8.0, the compile-time default
   scanner.autoZeroOffset = 0.0;
   scanner.autoZeroValid = false;
   scanner.clearDacCache();
@@ -5627,6 +5643,8 @@ void cmdConfigShow() {
     Serial.println(saved.scanConfig.autoZeroInterval);
     Serial.print("EWMA window: ");
     Serial.println(saved.scanConfig.ewmaWindow, 1);
+    Serial.print("Demod rejection k: ");
+    Serial.println(saved.demodRejKx10 / 10.0, 1);
     Serial.print("Scan channels: ");
     Serial.println(saved.scanConfig.count);
     for (int i = 0; i < saved.scanConfig.count; i++) {
