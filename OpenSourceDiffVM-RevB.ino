@@ -3996,7 +3996,7 @@ void performAutoZero() {
 // Written by cmdConfigSave(), read by loadConfigFromEEPROM() at startup
 // and by cmdConfigLoad()/cmdConfigShow().
 
-static constexpr uint32_t EEPROM_MAGIC = 0xD1FF0003UL;  // "DIFF" v3 — adds demodRejKx10 field
+static constexpr uint32_t EEPROM_MAGIC = 0xD1FF0004UL;  // "DIFF" v4 — adds demodRejKx10 (v3) + goodSamples (v4)
 static constexpr int EEPROM_BASE_ADDR = 0;
 
 /**
@@ -4012,6 +4012,7 @@ struct SavedConfig {
   bool autoStart;           // If true, cmdScanStart() runs automatically in setup()
   DividerRatio dividerRatio;  // HV divider ratio setting to restore
   int32_t demodRejKx10;     // Demod outlier rejection k ×10 (`drj` CLI); v3
+  uint8_t goodSamples;      // Samples averaged per half-cycle (`samples` CLI); v4
   uint16_t checksum;        // CRC16 over all preceding fields
 };
 
@@ -5520,6 +5521,7 @@ void cmdConfigSave() {
   saved.autoStart = configAutoStart;
   saved.dividerRatio = divMux.current();
   saved.demodRejKx10 = g_demodRejKx10;
+  saved.goodSamples = g_good_samples;
 
   // Compute checksum over everything except the checksum field itself
   saved.checksum = crc16((const uint8_t*)&saved, offsetof(SavedConfig, checksum));
@@ -5577,6 +5579,12 @@ void applyConfig(const SavedConfig &saved) {
   if (saved.demodRejKx10 >= 1) {
     g_demodRejKx10 = saved.demodRejKx10;
   }
+  // Direct assignment, deliberately NOT via cmdSetSamples(): that rescales
+  // integrationCycles to preserve wall-clock, but the saved (samples,
+  // integrationCycles) pair is already mutually consistent.
+  if (saved.goodSamples >= 1 && saved.goodSamples <= MAX_SAMPLES) {
+    g_good_samples = saved.goodSamples;
+  }
 }
 
 void cmdConfigLoad() {
@@ -5606,6 +5614,7 @@ void cmdConfigFactory() {
   scanner.setEwmaWindow(10.0f);
   configAutoStart = false;
   g_demodRejKx10 = 80;  // k = 8.0, the compile-time default
+  g_good_samples = 14;  // compile-time default (see declaration)
   scanner.autoZeroOffset = 0.0;
   scanner.autoZeroValid = false;
   scanner.clearDacCache();
@@ -5645,6 +5654,8 @@ void cmdConfigShow() {
     Serial.println(saved.scanConfig.ewmaWindow, 1);
     Serial.print("Demod rejection k: ");
     Serial.println(saved.demodRejKx10 / 10.0, 1);
+    Serial.print("Samples/half-cycle: ");
+    Serial.println(saved.goodSamples);
     Serial.print("Scan channels: ");
     Serial.println(saved.scanConfig.count);
     for (int i = 0; i < saved.scanConfig.count; i++) {
