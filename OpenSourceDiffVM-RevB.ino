@@ -4796,6 +4796,10 @@ static double ohmsAdapter_getSignalChainOffset() {
   return scanner.autoZeroValid ? scanner.autoZeroOffset : 0.0;
 }
 
+static void ohmsAdapter_performAutoZero() {
+  performAutoZero();
+}
+
 static double ohmsAdapter_getCalRref() {
   if (g_currentRrefIdx < 0 || g_currentRrefIdx >= RREF_COUNT) return NAN;
   return RREF_ALIASES[g_currentRrefIdx].ohms;
@@ -5099,6 +5103,7 @@ void cmdMeas(int argc, const char* const* argv) {
     ohmsAdapter_setExcVoltage,
     ohmsAdapter_getCalRref,
     ohmsAdapter_getSignalChainOffset,
+    ohmsAdapter_performAutoZero,
     ADC_LSB_V, PREAMP_GAIN, DAC_LSB_V,
     &Serial,
   };

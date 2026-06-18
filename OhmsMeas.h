@@ -103,6 +103,12 @@ struct OhmsMeasApi {
   // Returns 0.0 if no auto-zero measurement has been taken yet.
   double (*getSignalChainOffset)();
 
+  // Triggers one auto-zero measurement (GND channel, DAC null code). Uses
+  // ScopedInstrumentState internally so mux + DAC are restored on return.
+  // Called at the start of cmdMeasR and after every other run to keep the
+  // signal-chain offset current during long measurement sequences.
+  void (*performAutoZero)();
+
   // --- Constants for voltage arithmetic ------------------------------------
   double adcLsbV;       // ADC LSB in volts at the input
   double preampGain;    // AD8428 chain cumulative gain (~2000)

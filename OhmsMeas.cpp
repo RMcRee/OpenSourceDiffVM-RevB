@@ -308,6 +308,15 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
   int    nGood = 0;
 
   for (int rep = 0; rep < cfg.repeats; ++rep) {
+    // Auto-zero at start and before every other run (keeps DAC offset tracking
+    // fresh: run 1/primer, then before run 3, 5, ... i.e. rep 0, 2, 4, ...).
+    if (rep % 2 == 0) {
+      api.performAutoZero();
+      io.print(F("  [zero: "));
+      io.print(api.getSignalChainOffset() * 1e9, 1);
+      io.println(F(" nV]"));
+    }
+
     // Primer (rep=0 in repeat mode) only needs to let R_ref + DUT reach
     // thermal equilibrium under load — the precision integration happens in
     // runs 2..N. Half-cycles for the primer cuts ~10% off total wall-clock
