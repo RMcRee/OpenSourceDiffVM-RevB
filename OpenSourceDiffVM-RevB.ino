@@ -296,7 +296,9 @@ static bool refTrackingInitialized = false;            // True after first refer
 static constexpr int CAL_BUILD_CYCLES  = 5;   // Chop cycles per table entry during auto build
 static constexpr int CAL_POINT_CYCLES  = 20;  // Chop cycles per cal point capture
 static constexpr int CAL_BUILD_WINDOW  = 2;   // Table entries swept each side of anchor (±2 = 5 total)
-static constexpr int AUTOZERO_CYCLES   = 20;  // Chop cycles per auto-zero measurement
+static constexpr int      AUTOZERO_CYCLES      = 20;    // Chop cycles per auto-zero measurement
+static constexpr uint32_t AZ_EXTRA_SETTLE_MS   = 250;   // dwell before each attempt: mux-switch transient recovery
+static constexpr double   AZ_REP_SDEV_MAX_V    = 250e-9; // 250 nV: max two-rep spread before rejecting as unsettled
 
 // ---------------- Debug Flags ----------------
 // Toggle with 'debug on|off' command. Off by default — keeps normal operation quiet.
@@ -3963,27 +3965,43 @@ void performAutoZero() {
     g_azNullValid = true;
   }
 
-  // Take two independent AUTOZERO_CYCLES accumulations; their spread is the repeatability sdev.
-  LowerMoments repeatStats;
-  for (int rep = 0; rep < 2; rep++) {
-    LowerMoments gndStats;
-	int32_t buffA[MAX_SAMPLES];
-	int32_t buffB[MAX_SAMPLES];
-    for (int i = 0; i < AUTOZERO_CYCLES; i++) {
-      if (!runOneChopCycle(gndStats, buffA, buffB, false)) {
-        Serial.println("WARNING: Overflow during auto-zero (invalidating null cache).");
-        g_azNullValid = false;  // next AZ will re-search
-        return;
-      }
-    }
-    repeatStats.accumulate(computeInputVoltage(gndStats.mean(), dac.currentCode(), InputChannel::GND));
-  }
+  // Up to 2 attempts. Each attempt starts with a dwell to let the input-mux
+  // Vx→GND switch transient decay through the ×2000 preamp/AAF before
+  // measuring. Guard: if the two half-accumulations disagree by more than
+  // AZ_REP_SDEV_MAX_V the measurement is still settling — reject and retry.
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    delay(AZ_EXTRA_SETTLE_MS);
 
-  double rawAz = repeatStats.mean();
-  scanner.autoZeroRaw    = rawAz;
-  scanner.autoZeroSdev   = repeatStats.standardDeviation();
-  scanner.autoZeroOffset = scanner.autoZeroEwma_.update(rawAz);  // EWMA-filtered applied offset
-  scanner.autoZeroValid  = true;
+    LowerMoments repeatStats;
+    for (int rep = 0; rep < 2; rep++) {
+      LowerMoments gndStats;
+      int32_t buffA[MAX_SAMPLES];
+      int32_t buffB[MAX_SAMPLES];
+      for (int i = 0; i < AUTOZERO_CYCLES; i++) {
+        if (!runOneChopCycle(gndStats, buffA, buffB, false)) {
+          Serial.println("WARNING: Overflow during auto-zero (invalidating null cache).");
+          g_azNullValid = false;
+          return;
+        }
+      }
+      repeatStats.accumulate(computeInputVoltage(gndStats.mean(), dac.currentCode(), InputChannel::GND));
+    }
+
+    double sdev  = repeatStats.standardDeviation();
+    double rawAz = repeatStats.mean();
+    if (sdev <= AZ_REP_SDEV_MAX_V) {
+      scanner.autoZeroRaw    = rawAz;
+      scanner.autoZeroSdev   = sdev;
+      scanner.autoZeroOffset = scanner.autoZeroEwma_.update(rawAz);
+      scanner.autoZeroValid  = true;
+      return;  // guard restores channel + DAC on scope exit
+    }
+    Serial.print(F("WARNING: auto-zero unsettled (sdev="));
+    Serial.print(sdev * 1e9, 1);
+    Serial.print(F(" nV > "));
+    Serial.print(AZ_REP_SDEV_MAX_V * 1e9, 0);
+    Serial.println(attempt == 0 ? F(" nV cap) -- retrying.") : F(" nV cap) -- keeping previous offset."));
+  }
   // guard restores channel + DAC on scope exit
 }
 
