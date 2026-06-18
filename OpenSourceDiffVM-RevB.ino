@@ -122,7 +122,7 @@ static float              ADC_FMOD_HZ       = 12'500'000.0f;   // fMOD = fCLK/2 
 static constexpr uint32_t SETTLE_US         = 600;             // generic post-event guard (mux changes, POST tests)
 static constexpr uint32_t CHOP_SETTLE_US    = 10000;           // post-chop-edge settle: preamp + TMUX + AAF (τ≈56ms after 47nF cap, was 21nF)
 static constexpr uint8_t  DISCARD_SAMPLES   = 0;               // sinc4+sinc1 settles in one DRDY (sinc1 stage primes immediately)
-static constexpr uint8_t  MAX_SAMPLES       = 20;              // max ADC readings per each chop phase
+static constexpr uint8_t  MAX_SAMPLES       = 27;              // max ADC readings per each chop phase
 static constexpr int      CI_PRE_EDGE_US    = 50;              // CI cancel switches HIGH before TMUXSEL flip
 static constexpr int      CI_POST_EDGE_US   = 100;             // CI cancel switches HIGH after TMUXSEL flip
 uint8_t                   g_good_samples    = 14;              // samples to average per half-cycle; runtime-tunable via `samples N`
@@ -4792,6 +4792,10 @@ static void ohmsAdapter_setExcVoltage(bool low) {
 }
 
 // R_ref is manually wired and selected from the host via `rref`.
+static double ohmsAdapter_getSignalChainOffset() {
+  return scanner.autoZeroValid ? scanner.autoZeroOffset : 0.0;
+}
+
 static double ohmsAdapter_getCalRref() {
   if (g_currentRrefIdx < 0 || g_currentRrefIdx >= RREF_COUNT) return NAN;
   return RREF_ALIASES[g_currentRrefIdx].ohms;
@@ -5094,6 +5098,7 @@ void cmdMeas(int argc, const char* const* argv) {
     ohmsAdapter_setPolarity,
     ohmsAdapter_setExcVoltage,
     ohmsAdapter_getCalRref,
+    ohmsAdapter_getSignalChainOffset,
     ADC_LSB_V, PREAMP_GAIN, DAC_LSB_V,
     &Serial,
   };

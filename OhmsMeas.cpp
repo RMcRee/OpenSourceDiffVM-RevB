@@ -163,7 +163,8 @@ double measureSenseVolts(const OhmsMeasApi& api, int cycles, bool* outOverflow,
     if (ovf) return false;
     s_dacCache[senseIdx][polIdx]      = api.getCurrentDacCode();
     s_dacCacheValid[senseIdx][polIdx] = true;
-    out = api.getCurrentDacVoltage() + adcMean * api.adcLsbV / api.preampGain;
+    out = api.getCurrentDacVoltage() + adcMean * api.adcLsbV / api.preampGain
+          - api.getSignalChainOffset();
     return true;
   };
   double result;

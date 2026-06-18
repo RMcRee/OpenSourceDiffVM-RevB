@@ -93,6 +93,16 @@ struct OhmsMeasApi {
   // NAN if no R_ref has been selected.
   double (*getCalRref)();
 
+  // Returns the current signal-chain zero offset in volts, as tracked by
+  // the auto-zero subsystem (GND-channel measurement at the DAC null code).
+  // Subtracting this from each sense voltage removes DAC zero-code drift
+  // (ε₀) and preamp chain residual from the reported V_dut and V_ref.
+  // With EMF cancellation (default) a constant offset cancels in the ratio
+  // anyway; the correction matters for --no-emf-cancel and for keeping the
+  // ± polarity readings symmetric for mirror-seed bracket accuracy.
+  // Returns 0.0 if no auto-zero measurement has been taken yet.
+  double (*getSignalChainOffset)();
+
   // --- Constants for voltage arithmetic ------------------------------------
   double adcLsbV;       // ADC LSB in volts at the input
   double preampGain;    // AD8428 chain cumulative gain (~2000)

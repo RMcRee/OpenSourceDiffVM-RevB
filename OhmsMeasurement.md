@@ -52,6 +52,20 @@ voltage at **both excitation polarities** and forming `(V+ − V−)/2`. The
 firmware handles this automatically; pass `--no-emf-cancel` to skip it for
 speed.
 
+### Signal-chain zero offset
+
+Each sense voltage has the auto-zero offset subtracted
+(`OhmsMeasApi::getSignalChainOffset`). The auto-zero tracks DAC zero-code
+drift (ε₀) plus the preamp chain residual via a GND-channel measurement at
+the DAC null code. Removing ε₀ from each sense before forming the ratio
+matters because: even though gain drift (ε₁) already cancels in
+V_dut/V_ref, offset drift does not — it creates a differential error
+proportional to (V_ref − V_dut)/(V_dut × V_ref). With EMF cancellation
+(default) a constant offset cancels anyway; the correction mainly matters
+for `--no-emf-cancel` and for keeping the ± polarity readings symmetric for
+the mirror-seed bracket math. Run `zero` before precision ohms work so the
+offset is current.
+
 ### Excitation magnitude
 
 The firmware auto-selects 1 V excitation for R_ref < 500 Ω (just r2 in
