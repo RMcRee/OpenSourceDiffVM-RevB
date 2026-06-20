@@ -15,9 +15,9 @@
 // Only the stored R_ref bank values need calibration (see Calibration.md
 // CAL-12).
 //
-// Excitation magnitude (1 V vs 2.5 V) is auto-selected by bank index to
-// keep R_ref dissipation reasonable: banks 0 (20 Ω) and 1 (200 Ω) use 1 V,
-// all other banks use 2.5 V. Either way V_exc cancels out of the ratio.
+// Excitation magnitude (1 V vs 2.5 V) is auto-selected by R_ref value to
+// keep R_ref dissipation reasonable: R_ref < 500 Ω (r2) uses 1 V, all
+// others use 2.5 V. Either way V_exc cancels out of the ratio.
 //
 // This module is decoupled from the .ino: all DAC, ADC, chop, mux, and
 // GPIO operations go through function pointers in OhmsMeasApi. The .ino

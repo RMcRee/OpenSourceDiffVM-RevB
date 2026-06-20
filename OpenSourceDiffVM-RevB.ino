@@ -252,8 +252,8 @@ static double OPA828_OFFSET = OPA828_OFFSET_DEFAULT;
 // By measuring J3 vs the DAC reference (TP1), we can predict and correct
 // for temperature-induced reference drift in real-time.
 
-static constexpr double NOMINAL_REF_V = 5.0;           // Nominal reference voltage
-static constexpr int16_t REF_MEASURE_DAC_CODE = 32764; // DAC code for ~5V (14-bit aligned)
+static constexpr double NOMINAL_REF_V = 5.0000055;  // Keithley-measured J3
+static constexpr int16_t REF_MEASURE_DAC_CODE = 32767; // DAC code for +FS (~5V), matches BinSrch-converged code for VrefRaw
 static constexpr uint32_t REF_SAMPLE_INTERVAL = 385;   // Sample ref every ~385 chop cycles (~1 second)
 
 // Effective time constant of reference filter (from step response 63% point)
@@ -2182,7 +2182,7 @@ const char* getChannelShortName(InputChannel channel) {
 
 // Forward declarations for command handlers and shared helpers
 bool runOneChopCycle(LowerMoments &stats, int32_t* bA, int32_t* bB, bool searchOnOverflow = true);
-void performAutoZero();
+void performAutoZero(int maxAttempts = 2);
 void printCsvHeader();
 void cmdLabel(const char* arg1, const char* arg2);
 
@@ -2570,6 +2570,13 @@ void printHelp() {
   Serial.println("                       (a==b: time-series mode; settleUs probes the static transfer)");
   Serial.println("dacset <code>          Raw DAC set (no restore) for scope work with hold");
   Serial.println("debug [on|off]         Toggle binary-search trace prints (default off)");
+  Serial.println("rref list              Show reference resistors with calibrated values");
+  Serial.println("rref <alias|color>     Select R_ref (r2/r3/r4/r5/r8 or black/yellow/white/blue/green)");
+  Serial.println("rref off               Deselect R_ref");
+  Serial.println("meas [r] [--cycles N] [--no-emf-cancel] [--repeat N] [--exc 1|2.5] [--nominal R]");
+  Serial.println("                       Ratiometric 4-wire resistance measurement (set rref first)");
+  Serial.println("  After reflash: DAC cache is cold. If BinSrch hangs at high R_ref,");
+  Serial.println("  add --nominal <R_dut> to seed the search. e.g.: meas r --nominal 1k");
   Serial.println("help                   Show this help");
   Serial.println("=======================\n");
 }
@@ -3569,10 +3576,7 @@ PostResult runPOST() {
   result.polarity = postTestPolarity();
   result.chop_symmetry = postTestChopSymmetry();
   result.input_mux = postTestInputMux();
-  // Bypassed: the VrefRaw node is unbuffered, so the preamp's input current
-  // sags the reference during the measurement and the test always fails.
-  // Re-enable once a hardware buffer is installed.
-  result.references = true;  // postTestReferences();
+  result.references = postTestReferences();
   result.zero_cal = postTestZero();
 
   Serial.println("================================================");
@@ -3634,7 +3638,8 @@ void measureFilterError() {
     }
   }
 
-  // Convert mean to volts: this IS the filter error (J3 - TP1) × preamp_gain
+  // Convert mean to volts: this IS the filter error (J3 - TP1) × preamp_gain.
+  // Convert mean to volts: this IS the filter error (J3 - TP1).
   double filterError = (refStats.mean() * ADC_LSB_V) / PREAMP_GAIN;
 
   // Update drift rate estimate using previous measurement
@@ -3940,7 +3945,7 @@ IOutputFormatter& getFormatter() {
  * Takes ~200ms (20 chop cycles + DAC settling). During this time,
  * normal measurements are paused.
  */
-void performAutoZero() {
+void performAutoZero(int maxAttempts) {
   ScopedInstrumentState guard;
 
   // Switch to GND
@@ -3965,11 +3970,14 @@ void performAutoZero() {
     g_azNullValid = true;
   }
 
-  // Up to 2 attempts. Each attempt starts with a dwell to let the input-mux
-  // Vx→GND switch transient decay through the ×2000 preamp/AAF before
-  // measuring. Guard: if the two half-accumulations disagree by more than
-  // AZ_REP_SDEV_MAX_V the measurement is still settling — reject and retry.
-  for (int attempt = 0; attempt < 2; ++attempt) {
+  // Up to maxAttempts attempts. Each attempt starts with a dwell to let the
+  // input-mux Vx→GND switch transient decay through the ×2000 preamp/AAF
+  // before measuring. Guard: if the two half-accumulations disagree by more
+  // than AZ_REP_SDEV_MAX_V the measurement is still settling — reject and
+  // retry. The first attempt is always silent on failure: the mux-switch
+  // transient on the first call in any context (especially right after
+  // ohms sense channels) reliably requires one extra settle.
+  for (int attempt = 0; attempt < maxAttempts; ++attempt) {
     delay(AZ_EXTRA_SETTLE_MS);
 
     LowerMoments repeatStats;
@@ -3996,11 +4004,13 @@ void performAutoZero() {
       scanner.autoZeroValid  = true;
       return;  // guard restores channel + DAC on scope exit
     }
-    Serial.print(F("WARNING: auto-zero unsettled (sdev="));
-    Serial.print(sdev * 1e9, 1);
-    Serial.print(F(" nV > "));
-    Serial.print(AZ_REP_SDEV_MAX_V * 1e9, 0);
-    Serial.println(attempt == 0 ? F(" nV cap) -- retrying.") : F(" nV cap) -- keeping previous offset."));
+    if (attempt == maxAttempts - 1) {
+      Serial.print(F("WARNING: auto-zero unsettled (sdev="));
+      Serial.print(sdev * 1e9, 1);
+      Serial.print(F(" nV > "));
+      Serial.print(AZ_REP_SDEV_MAX_V * 1e9, 0);
+      Serial.println(F(" nV cap) -- keeping previous offset."));
+    }
   }
   // guard restores channel + DAC on scope exit
 }
@@ -4081,11 +4091,11 @@ struct RrefAlias {
 // is the average of all candidates.
 static constexpr int      RREF_COUNT = 5;
 static constexpr RrefAlias RREF_ALIASES[RREF_COUNT] = {
-  { "r2", "black",  200.04825    },   // 2026-06-08: re-anchored via r3 transfer on SR1010-1k/5 after DUT thermal equilibration (Keithley cross-check at -20 ppm = within its spec); was 200.05353 (initial r3 anchor with DUT warm), was 200.13550 (5450), was 200.014860 (Keithley)
-  { "r3", "yellow", 2002.07822   },   // 2026-06-05: 5450 + 1062-cert 3-way avg; was 2002.02620 (cert), was 2001.98758 (Keithley)
+  { "r2", "black",  200.04316    },   // 2026-06-19: anchored via Hamon divider (R_true=200.00313080, R_meas=200.008218→scale 200.04825×200.00313080/200.008218); was 200.04825 (2026-06-08 r3 transfer)
+  { "r3", "yellow", 2002.02859   },   // 2026-06-19: 2nd-pass anchor via 1062.0233 Ω cert (R_meas=1062.02851→scale 2002.03841×1062.0233/1062.02851); was 2002.03841
   { "r4", "white",  19999.9472   },   // 2026-06-05: 5450 + transfer 3-way avg; was 20000.1229 (transfer), was 19999.8705 (Keithley)
   { "r5", "blue",   50010.4165   },   // 2026-06-07: anchored via r4 transfer on SR1010 100k-parallel DUT (ρ=0.5 vs r4 = near-optimal); was 50010.7052 (5450 2-way avg ρ=0.38,2.0)
-  { "r8", "green",  5000.06199   },   // 2026-06-05: 5450 + 1062-cert 3-way avg; was 5000.0482 (cert), was 4999.9945 (Keithley)
+  { "r8", "green",  5000.12373   },   // 2026-06-19: 2nd-pass anchor via 1062.0233 Ω cert (R_meas=1062.02114→scale 5000.11354×1062.0233/1062.02114); was 5000.11354
 };
 static int8_t g_currentRrefIdx = -1;   // -1 = unset; otherwise index into RREF_ALIASES
 
@@ -4815,7 +4825,7 @@ static double ohmsAdapter_getSignalChainOffset() {
 }
 
 static void ohmsAdapter_performAutoZero() {
-  performAutoZero();
+  performAutoZero(3);
 }
 
 static double ohmsAdapter_getCalRref() {
@@ -5721,7 +5731,9 @@ void outputMeasurement(InputChannel channel, LowerMoments &stats, int16_t dacCod
   double vxRaw = computeInputVoltage(adcMean, dacCode, channel);
   double vxUncertainty = computeInputUncertainty(adcStdDev, channel);
 
-  double refCorrection = getRefCorrectionFactor();
+  // VrefRaw (J3) is the source of the drift correction, so applying J3/TP1
+  // to it would give J3²/TP1 instead of J3. Skip refCorrection for VrefRaw.
+  double refCorrection = (channel == InputChannel::VrefRaw) ? 1.0 : getRefCorrectionFactor();
   double vxCorrected = vxRaw * refCorrection;
   if (scanner.autoZeroValid) {
     vxCorrected -= scanner.autoZeroOffset;
@@ -6323,7 +6335,7 @@ void loop() {
       double adcMean = stats.mean();
       double adcStdDev = stats.standardDeviation();
       double vxRaw = computeInputVoltage(adcMean, dac.currentCode(), scanCh);
-      double refCorrection = getRefCorrectionFactor();
+      double refCorrection = (scanCh == InputChannel::VrefRaw) ? 1.0 : getRefCorrectionFactor();
       double vxCorrected = vxRaw * refCorrection;
       if (scanner.autoZeroValid) vxCorrected -= scanner.autoZeroOffset;
       double vxUncertainty = computeInputUncertainty(adcStdDev, scanCh);
