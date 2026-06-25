@@ -2194,11 +2194,6 @@ void cmdScanAdd(const char* arg) {
     Serial.println("'. Use: Vx1, GND, VrefRaw, Vx2-Vx5, HVDiv");
     return;
   }
-  // GND is reserved for auto-zero, not meaningful as a scan channel
-  if (ch == InputChannel::GND) {
-    Serial.println("ERROR: GND cannot be added to scan list (use 'autozero on' instead).");
-    return;
-  }
   // Check for duplicates
   for (int i = 0; i < scanner.config.count; i++) {
     if (scanner.config.channels[i] == ch) {
