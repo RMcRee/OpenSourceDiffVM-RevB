@@ -82,26 +82,19 @@ command (selection is not persisted across reboots).
 
 | Alias | Color  | R_ref (Ω)   | V_exc  |
 |-------|--------|-------------|--------|
-| r2    | black  | 200.04316   | 1.0 V  |
-| r3    | yellow | 2002.02859  | 2.5 V  |
-| r8    | green  | 5000.12373  | 2.5 V  |
-| r4    | white  | 19999.9472  | 2.5 V  |
-| r5    | blue   | 50010.4165  | 2.5 V  |
+| r2    | black  | 200.13237   | 1.0 V  |
+| r3    | yellow | 2002.03982  | 2.5 V  |
+| r8    | green  | 5000.15707  | 2.5 V  |
+| r4    | white  | 20000.07073 | 2.5 V  |
+| r5    | blue   | 50009.54528 | 2.5 V  |
 
 Values are firmware constants in `RREF_ALIASES[]` (see the .ino source).
-All five rrefs were initially calibrated 2026-06-05 using a Fluke 5450
-calibrator as a transfer standard. The 5450 had been self-cal'd a few
-years prior against a Keithley 2002 that was in calibration at the
-time. For each rref, two 5450 decade values were measured to span
-ρ ≈ 0.5–2; for r3, r4, and r8 the prior 1062.0233 Ω cert anchor was
-retained as a third point. The stored value is the average of all
-candidates per rref.
 
-**r3 and r8 were re-anchored twice** (2026-06-18, 2026-06-19) against the
-1062.0233 Ω certified resistor (Keithley transfer). Each pass applied
-`R_ref_new = R_ref_old × (R_true / R_measured)` from a fresh measurement
-of the cert. The two-pass residuals were −0.25 ppm (r8) and −4.9 ppm (r3)
-after the first pass, tightened below 0.5 ppm after the second.
+**2026-06-22: Full re-anchor** of all five rrefs via Keithley 2002 direct measurement
+using Krasimir 1.0620233K cert and Keithley-traceable 5450 decade standards with
+temperature correction applied. Formula: `R_ref_new = R_ref_old × (R_true / R_measured)`;
+multiple DUT measurements averaged per rref. DUTs: 5450 190Ω/1k/1.9k/10k/19k/100k,
+SR1010 1k/100k (all assigned values K2002-traceable).
 
 **Hardware jig revisions (2026-06-05):** the original r1 (20 Ω), r6
 (1.9 MΩ), and r7 (11 MΩ) were physically removed — at the

@@ -4084,18 +4084,16 @@ struct RrefAlias {
 // physically removed (didn't work as intended); r5 replaced with a new 50 kΩ
 // blue resistor (was 200 kΩ blue); r8 re-color-coded green (was yellow2).
 //
-// Cal values refined 2026-06-05 via Fluke 5450 self-cal (5450 itself was
-// self-cal'd against a then-in-cal Keithley 2002 a few years ago). For
-// each rref two 5450 decade values were measured to bracket ρ; for r3/r4/r8
-// the prior 1062.0233 Ω cert anchor was kept as a third point. Final cal
-// is the average of all candidates.
+// 2026-06-22: Full re-anchor via K2002 + Krasimir 1.0620233K cert with temp correction.
+// For each rref, all DUT measurements averaged: R_ref_new = R_ref_old × (R_true/R_meas).
+// DUTs used: 5450 190Ω/1k/1.9k/10k/19k/100k, SR1010 1k/100k (K2002-assigned values).
 static constexpr int      RREF_COUNT = 5;
 static constexpr RrefAlias RREF_ALIASES[RREF_COUNT] = {
-  { "r2", "black",  200.04316    },   // 2026-06-19: anchored via Hamon divider (R_true=200.00313080, R_meas=200.008218→scale 200.04825×200.00313080/200.008218); was 200.04825 (2026-06-08 r3 transfer)
-  { "r3", "yellow", 2002.02859   },   // 2026-06-19: 2nd-pass anchor via 1062.0233 Ω cert (R_meas=1062.02851→scale 2002.03841×1062.0233/1062.02851); was 2002.03841
-  { "r4", "white",  19999.9472   },   // 2026-06-05: 5450 + transfer 3-way avg; was 20000.1229 (transfer), was 19999.8705 (Keithley)
-  { "r5", "blue",   50010.4165   },   // 2026-06-07: anchored via r4 transfer on SR1010 100k-parallel DUT (ρ=0.5 vs r4 = near-optimal); was 50010.7052 (5450 2-way avg ρ=0.38,2.0)
-  { "r8", "green",  5000.12373   },   // 2026-06-19: 2nd-pass anchor via 1062.0233 Ω cert (R_meas=1062.02114→scale 5000.11354×1062.0233/1062.02114); was 5000.11354
+  { "r2", "black",  200.13237    },   // 2026-06-22: K2002 anchor via 5450 190Ω (true=190.002949, meas=189.918256→×1.00044594); was 200.04316
+  { "r3", "yellow", 2002.03982   },   // 2026-06-25: anchored to K2002 SR1010 1K s-p reading; was 2002.09473 (2026-06-22 avg)
+  { "r4", "white",  20000.07073  },   // 2026-06-22: avg of 5450 10k (→20000.12565) + 5450 19k (→20000.01580); was 19999.9472
+  { "r5", "blue",   50009.54528  },   // 2026-06-22: avg of 5450 19k (→50010.33084) + 5450 100k (→50009.01072) + SR1010 100k (→50009.29428); was 50010.4165
+  { "r8", "green",  5000.15707   },   // 2026-06-22: avg of 5450 1k (→5000.25008) + 5450 1.9k (→5000.17051) + 5450 10k (→5000.04902) + SR1010 1k (→5000.15866); was 5000.12373
 };
 static int8_t g_currentRrefIdx = -1;   // -1 = unset; otherwise index into RREF_ALIASES
 
