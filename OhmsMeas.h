@@ -47,8 +47,12 @@ struct OhmsMeasApi {
 
   // Run `nCycles` chop cycles at the locked DAC code; returns the demodulated
   // mean in ADC counts. Sets *overflow=true if the preamp railed during the
-  // integration; in that case the returned value is undefined.
-  double (*runChopCycles)(int nCycles, bool* overflow);
+  // integration; in that case the returned value is undefined. If outSdCounts
+  // is non-null, receives the population sd (ADC counts, same units as the
+  // mean) of the per-chop-pair demod values — used to build a within-run
+  // standard-error estimate instead of relying solely on across-repeat
+  // scatter.
+  double (*runChopCycles)(int nCycles, bool* overflow, double* outSdCounts);
 
   // Calibrated DAC voltage at the *current* DAC code. Used to convert the
   // demodulated ADC residual into an absolute input voltage:

@@ -8,7 +8,7 @@
 
 namespace {
 
-constexpr int  kDefaultCycles    = 150;     // ≈ 8 s per sense at OSR=12800, samples=14; with default --repeat 5 → ~210 s per `meas r` with primer-shortening, sd ≈ 0.5 ppm on cert resistors. Sweet spot for sd/time per the optimum k=√(N/30) analysis.
+constexpr int  kDefaultCycles    = 100;     // ≈ 5.3 s per sense at OSR≈38000, samples=7 (Ts≈3040 µs); with default --repeat 5 → ~200 s per `meas r`. Matches wall-clock time of the old OSR=12800/150-cycle default. Precision is ~0.013 ppm per sense at 2.5 V excitation — well below R_ref cal uncertainty (~20 ppm).
 constexpr int  kSenseCount       = 3;       // Vx3, Vx4, Vx2 (R_ref top)
 constexpr uint32_t kPolaritySettleMs = 200; // V_exc + AAF settle after polarity flip
 constexpr uint32_t kExcVoltageSettleMs = 200; // V_exc rail change + AAF settle
@@ -150,7 +150,8 @@ static void invalidateDacCache() {
 // Every successful search caches its converged code. Returns NAN on failure.
 double measureSenseVolts(const OhmsMeasApi& api, int cycles, bool* outOverflow,
                          int senseIdx, int polIdx,
-                         double seedVolts, int32_t seedHalfBracket, double rRef) {
+                         double seedVolts, int32_t seedHalfBracket, double rRef,
+                         double* outSemVolts = nullptr) {
   if (outOverflow) *outOverflow = false;
 
   // Integrate at the current DAC code; cache it on success. (Recovery from
@@ -159,12 +160,19 @@ double measureSenseVolts(const OhmsMeasApi& api, int cycles, bool* outOverflow,
   // impedance the node only re-centers *while chopping*.)
   auto integrateAndCache = [&](double& out) -> bool {
     bool ovf = false;
-    double adcMean = api.runChopCycles(cycles, &ovf);
+    double sdCounts = 0.0;
+    double adcMean = api.runChopCycles(cycles, &ovf, &sdCounts);
     if (ovf) return false;
     s_dacCache[senseIdx][polIdx]      = api.getCurrentDacCode();
     s_dacCacheValid[senseIdx][polIdx] = true;
     out = api.getCurrentDacVoltage() + adcMean * api.adcLsbV / api.preampGain
           - api.getSignalChainOffset();
+    // Standard error of `out`'s mean: per-sample sd (converted to volts)
+    // over sqrt(cycles). `cycles` here is whatever this call actually ran
+    // (thisCycles for a primer, cfg.cycles otherwise) — always the true N.
+    if (outSemVolts) {
+      *outSemVolts = (sdCounts * api.adcLsbV / api.preampGain) / sqrt((double)cycles);
+    }
     return true;
   };
   double result;
@@ -306,6 +314,7 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
   double mean = 0.0, m2 = 0.0;
   double rMin = INFINITY, rMax = -INFINITY;
   int    nGood = 0;
+  double sumSemRPpm = 0.0;   // sum of each counted run's within-run sigma_R, for the internal estimate
 
   for (int rep = 0; rep < cfg.repeats; ++rep) {
     // Auto-zero at start and before every other run (keeps DAC offset tracking
@@ -327,8 +336,13 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
         : cfg.cycles;
 
     // Storage: voltages[sense][polarity]   sense: 0=Vx3, 1=Vx4, 2=Vx2;  pol: 0=+, 1=−
+    // sem[][] is the within-run standard error of each mean (sd/sqrt(cycles)) —
+    // built from the `cycles` chop pairs of THIS run, so it has far more
+    // degrees of freedom than the across-repeat scatter the final summary
+    // reports (repeat=N gives only N-1 dof; cycles=200 gives ~200).
     double v[kSenseCount][2];
-    for (int i = 0; i < kSenseCount; ++i) v[i][0] = v[i][1] = NAN;
+    double sem[kSenseCount][2];
+    for (int i = 0; i < kSenseCount; ++i) { v[i][0] = v[i][1] = NAN; sem[i][0] = sem[i][1] = 0.0; }
 
     bool aborted = false;
     for (int p = 0; p < polCount && !aborted; ++p) {
@@ -363,7 +377,8 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
         }
 
         bool ovf = false;
-        double vs = measureSenseVolts(api, thisCycles, &ovf, s, p, seedV, halfBr, rRef);
+        double semV = 0.0;
+        double vs = measureSenseVolts(api, thisCycles, &ovf, s, p, seedV, halfBr, rRef, &semV);
         if (ovf || !isfinite(vs)) {
           if (!verbose) { io.print(F("  run ")); io.print(rep + 1); io.print(F(": ")); }
           io.print(kSenseName[s]); io.print(F(" @ pol ")); io.print(polVal[p] ? '+' : '-');
@@ -381,6 +396,7 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
           break;
         }
         v[s][p] = vs;
+        sem[s][p] = semV;
       }
     }
     if (aborted) {
@@ -394,12 +410,18 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
 
     // EMF-cancelled magnitudes (index 2 = R_ref top sense on Vx2).
     double vx3, vx4, vxRef;
+    double semVx3, semVx4, semVxRef;   // standard error of each, combined across polarity
     if (cfg.emfCancel) {
       vx3   = (v[0][0] - v[0][1]) * 0.5;
       vx4   = (v[1][0] - v[1][1]) * 0.5;
       vxRef = (v[2][0] - v[2][1]) * 0.5;
+      // Independent polarity measurements: sem(avg) = sqrt(sem0^2+sem1^2)/2.
+      semVx3   = 0.5 * sqrt(sem[0][0]*sem[0][0] + sem[0][1]*sem[0][1]);
+      semVx4   = 0.5 * sqrt(sem[1][0]*sem[1][0] + sem[1][1]*sem[1][1]);
+      semVxRef = 0.5 * sqrt(sem[2][0]*sem[2][0] + sem[2][1]*sem[2][1]);
     } else {
       vx3 = v[0][0]; vx4 = v[1][0]; vxRef = v[2][0];
+      semVx3 = sem[0][0]; semVx4 = sem[1][0]; semVxRef = sem[2][0];
     }
     const double vDut  = vx3 - vx4;
     const double vRef  = vxRef - vx3;
@@ -410,6 +432,19 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
     }
     const double ratio = vDut / vRef;
     const double rDut  = rRef * ratio;
+
+    // Within-run propagated uncertainty on R (delta method / error propagation).
+    // vDut = vx3-vx4 and vRef = vxRef-vx3 share the vx3 term, so they're
+    // negatively correlated: Cov(vDut,vRef) = Cov(vx3-vx4, vxRef-vx3) = -Var(vx3).
+    //   Var(R)/R^2 = Var(vDut)/vDut^2 + Var(vRef)/vRef^2 - 2*Cov(vDut,vRef)/(vDut*vRef)
+    //              = semDut^2/vDut^2 + semRef^2/vRef^2 + 2*semVx3^2/(vDut*vRef)
+    // Uses this run's own `cycles` samples (dof ~ cycles), not the across-repeat
+    // scatter — far more statistically powerful for comparing cycles/samples settings.
+    const double semDut = sqrt(semVx3*semVx3 + semVx4*semVx4);
+    const double semRef = sqrt(semVxRef*semVxRef + semVx3*semVx3);
+    const double relVarR = (semDut*semDut) / (vDut*vDut) + (semRef*semRef) / (vRef*vRef)
+                          + 2.0 * semVx3*semVx3 / (vDut*vRef);
+    const double semR_ppm = sqrt(fabs(relVarR)) * 1.0e6;
 
     // Physical-plausibility checks: catch fallen Kelvin clips, open DUTs,
     // sense lines disconnected, etc. Abort the whole batch on detection —
@@ -452,12 +487,14 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
       io.print(F("   ratio = ")); io.print(ratio, 8); io.println();
       io.print(F("  R_ref = ")); io.print(rRef, 6); io.print(F(" Ω    cycles="));
       io.print(cfg.cycles); io.print(F("/polarity"));
+      io.print(F("    sigma_R(internal) = ")); io.print(semR_ppm, 4); io.print(F(" ppm"));
       io.println();
     } else {
       io.print(F("  run ")); io.print(rep + 1); io.print('/'); io.print(cfg.repeats);
       io.print(F(": R = ")); printOhms(io, rDut);
       io.print(F("   V_dut=")); io.print(vDut, 6);
       io.print(F("   V_ref=")); io.print(vRef, 6);
+      io.print(F("   sigma_R="));   io.print(semR_ppm, 4); io.print(F(" ppm"));
       if (isPrimer) { io.print(F("   [primer @ ")); io.print(thisCycles); io.print(F(" cycles, excluded from stats]")); }
       io.println();
     }
@@ -475,6 +512,7 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
     m2   += delta * (rDut - mean);
     if (rDut < rMin) rMin = rDut;
     if (rDut > rMax) rMax = rDut;
+    sumSemRPpm += semR_ppm;
   }
 
   // Summary footer (repeat-mode only)
@@ -484,25 +522,41 @@ void cmdMeasR(const OhmsMeasApi& api, int argc, const char* const* argv) {
       io.println(F("No counted runs completed; no statistics."));
       goto cleanup;
     }
+    const double meanAbs = fabs(mean);
+
+    // Pooled within-run estimate: average per-run sigma_R (dof ~ cycles each)
+    // divided by sqrt(nGood). This is now the headline ± — far more dof than
+    // the across-repeat sd (nGood-1) and confirmed reproducible run-to-run,
+    // whereas across-repeat sd at nGood=2-4 is itself so noisy it isn't a
+    // trustworthy number (see external_sd below, kept only as a diagnostic).
+    const double avgInternalPpm      = sumSemRPpm / (double)nGood;
+    const double pooledInternalPpm   = avgInternalPpm / sqrt((double)nGood);
+    const double pooledInternalOhms  = meanAbs * pooledInternalPpm * 1.0e-6;
+
     const double sd        = (nGood > 1) ? sqrt(m2 / (double)(nGood - 1)) : 0.0;
-    const double meanAbs   = fabs(mean);
     const double sdPpm     = (meanAbs > 0.0) ? (sd / meanAbs) * 1.0e6 : 0.0;
     const double rangeOhms = rMax - rMin;
     const double rangePpm  = (meanAbs > 0.0) ? (rangeOhms / meanAbs) * 1.0e6 : 0.0;
 
     io.print(F("R = ")); printOhms(io, mean);
-    if (nGood > 1) {
-      io.print(F("  ± ")); printOhms(io, sd, 4);
-      io.print(F(" sd ("));  io.print(sdPpm, 3); io.print(F(" ppm)"));
-    }
+    io.print(F("  ± ")); printOhms(io, pooledInternalOhms, 4);
+    io.print(F(" ("));  io.print(pooledInternalPpm, 4); io.print(F(" ppm, internal pooled)"));
     io.println();
     io.print(F("  n=")); io.print(nGood); io.print('/'); io.print(cfg.repeats);
     io.print(F("  mean=")); io.print(mean, 6); io.print(F(" Ω"));
+    io.print(F("  avg/run sigma_R=")); io.print(avgInternalPpm, 4); io.print(F(" ppm"));
     if (nGood > 1) {
-      io.print(F("  sd=")); printOhms(io, sd, 4);
+      io.print(F("  external_sd=")); io.print(sdPpm, 3); io.print(F(" ppm"));
       io.print(F("  min=")); io.print(rMin, 6);
       io.print(F("  max=")); io.print(rMax, 6);
       io.print(F("  range=")); io.print(rangePpm, 3); io.print(F(" ppm"));
+    } else {
+      // Only one counted run: no across-repeat comparison is possible at all
+      // (external sd needs >=2 points), and "pooled" above is identical to
+      // this run's own sigma_R — no pooling benefit either. Trustworthy for
+      // ADC/thermal-noise-limited precision, but blind to anything that only
+      // shows up *between* runs (drift, a bad contact, a one-off glitch).
+      io.print(F("  (n=1: no external cross-check — use --repeat 3+ to also catch between-run drift/outliers)"));
     }
     io.println();
     io.print(F("  R_ref = ")); io.print(rRef, 6); io.print(F(" Ω    cycles="));
